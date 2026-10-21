@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
+import { convert, type Currency } from '@/lib/currency';
 
 // GET /api/transactions - يسترجع كل المعاملات مع فلترة اختيارية
 export async function GET(req: NextRequest) {
@@ -49,11 +50,19 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // تحديث رصيد الحساب
+    // تحديث رصيد الحساب مع التحويل للعملة الأصلية للحساب
     const account = await db.account.findUnique({ where: { id: accountId } });
     if (!account) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
 
-    const delta = type === 'INCOME' ? Number(amount) : -Number(amount);
+    // حوّل المبلغ لعملة الحساب (لو المعاملة بعملة مختلفة)
+    const txCurrency = (currency || account.currency) as Currency;
+    const accountCurrency = account.currency as Currency;
+    const amountInAccountCurrency =
+      txCurrency === accountCurrency
+        ? Number(amount)
+        : convert(Number(amount), txCurrency, accountCurrency);
+
+    const delta = type === 'INCOME' ? amountInAccountCurrency : -amountInAccountCurrency;
     await db.account.update({
       where: { id: accountId },
       data: { balance: account.balance + delta },
@@ -62,8 +71,8 @@ export async function POST(req: NextRequest) {
     const transaction = await db.transaction.create({
       data: {
         type,
-        amount: Number(amount),
-        currency: currency || account.currency,
+        amount: Number(amount),                         // ← المبلغ الأصلي بعملته
+        currency: txCurrency,                            // ← العملة الأصلية
         accountId,
         categoryId,
         date: date ? new Date(date) : new Date(),

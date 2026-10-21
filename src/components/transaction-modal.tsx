@@ -10,7 +10,7 @@ import { toast } from 'sonner';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
-import { formatMoney, type Currency } from '@/lib/currency';
+import { formatMoney, convert, CURRENCY_SYMBOLS, type Currency } from '@/lib/currency';
 import * as LucideIcons from 'lucide-react';
 import { Loader2, Check, ArrowUp, ArrowDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -45,6 +45,7 @@ export function TransactionModal({
 
   const [type, setType] = useState<'EXPENSE' | 'INCOME'>('EXPENSE');
   const [amount, setAmount] = useState('');
+  const [currency, setCurrency] = useState<Currency>(baseCurrency);
   const [accountId, setAccountId] = useState('');
   const [categoryId, setCategoryId] = useState('');
   const [date, setDate] = useState('');
@@ -63,17 +64,25 @@ export function TransactionModal({
       ]).then(([c, a]) => {
         setCategories(c.data);
         setAccounts(a.data);
-        const defaultAcc = a.data.find(x => x.balance === 0) || a.data[0];
         const def = a.data.find(x => (x as any).isDefault) || a.data[0];
-        setAccountId(initial?.accountId || def?.id || defaultAcc?.id || '');
+        const chosenAccId = initial?.accountId || def?.id || a.data[0]?.id || '';
+        setAccountId(chosenAccId);
+        // لو معاملة موجودة، استخدم عملتها الأصلية. لو جديدة، استخدم عملة الحساب المختار
+        if (initial?.currency) {
+          setCurrency(initial.currency);
+        } else {
+          const chosenAcc = a.data.find(x => x.id === chosenAccId);
+          setCurrency((chosenAcc?.currency as Currency) || baseCurrency);
+        }
       });
     }
-  }, [open]);
+  }, [open, baseCurrency]);
 
   useEffect(() => {
     if (initial) {
       setType(initial.type);
       setAmount(initial.amount?.toString() || '');
+      if (initial.currency) setCurrency(initial.currency);
       setAccountId(initial.accountId || '');
       setCategoryId(initial.categoryId || '');
       setDate(initial.date ? initial.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
@@ -86,6 +95,14 @@ export function TransactionModal({
       setNote('');
     }
   }, [initial, open]);
+
+  // لما المستخدم يغير الحساب، حدّث العملة لعملة الحساب (لو معاملة جديدة، مش تعديل)
+  useEffect(() => {
+    if (open && !initial?.id && accountId) {
+      const acc = accounts.find(a => a.id === accountId);
+      if (acc) setCurrency(acc.currency as Currency);
+    }
+  }, [accountId, accounts, open, initial?.id]);
 
   const filteredCategories = categories.filter(c => c.type === type);
 
@@ -111,7 +128,7 @@ export function TransactionModal({
       const body = {
         type,
         amount: amt,
-        currency: baseCurrency,
+        currency,   // ← العملة الأصلية اللي اختارها المستخدم
         accountId,
         categoryId,
         date: new Date(date).toISOString(),
@@ -175,24 +192,55 @@ export function TransactionModal({
           </button>
         </div>
 
-        {/* amount */}
+        {/* amount + currency selector */}
         <div className="space-y-1.5">
           <Label>{t('amount')}</Label>
-          <div className="relative">
-            <Input
-              type="number"
-              inputMode="decimal"
-              step="0.01"
-              value={amount}
-              onChange={e => setAmount(e.target.value)}
-              placeholder="0.00"
-              className="text-2xl font-bold text-center h-14 pe-12"
-              autoFocus
-            />
-            <span className="absolute end-3 top-1/2 -translate-y-1/2 text-sm text-slate-400 font-medium">
-              {baseCurrency}
-            </span>
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <Input
+                type="number"
+                inputMode="decimal"
+                step="0.01"
+                value={amount}
+                onChange={e => setAmount(e.target.value)}
+                placeholder="0.00"
+                className="text-2xl font-bold text-center h-14 pe-12"
+                autoFocus
+              />
+              <span className="absolute end-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 font-medium">
+                {CURRENCY_SYMBOLS[currency][lang]}
+              </span>
+            </div>
+            <Select value={currency} onValueChange={(v: any) => setCurrency(v)}>
+              <SelectTrigger className="w-24 h-14">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(['EGP', 'SAR', 'USD', 'EUR', 'AED'] as Currency[]).map(c => (
+                  <SelectItem key={c} value={c}>
+                    <span className="flex items-center gap-2">
+                      <span className="font-mono text-xs">{c}</span>
+                      <span className="text-slate-400">{CURRENCY_SYMBOLS[c][lang]}</span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
+          {/* إظهار المبلغ المحوّل لعملة الحساب لو مختلف */}
+          {(() => {
+            const acc = accounts.find(a => a.id === accountId);
+            if (acc && acc.currency !== currency && parseFloat(amount) > 0) {
+              const converted = convert(parseFloat(amount), currency, acc.currency as Currency);
+              return (
+                <p className="text-xs text-slate-500 mt-1">
+                  {lang === 'ar' ? 'يعادل' : 'Equivalent'}: {formatMoney(converted, acc.currency as Currency, lang)}
+                  <span className="text-slate-400"> ({t('account')}: {acc.name})</span>
+                </p>
+              );
+            }
+            return null;
+          })()}
         </div>
 
         {/* category */}

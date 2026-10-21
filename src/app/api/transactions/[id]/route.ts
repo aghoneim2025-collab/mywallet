@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
+import { convert, type Currency } from '@/lib/currency';
 
 // GET /api/transactions/:id
 export async function GET(
@@ -30,30 +31,46 @@ export async function PUT(
     const existing = await db.transaction.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    const oldDelta = existing.type === 'INCOME' ? -existing.amount : existing.amount;
-    await db.account.update({
-      where: { id: existing.accountId },
-      data: { balance: { increment: oldDelta } },
-    });
+    // revert old balance (حوّل المبلغ القديم لعملة الحساب القديم)
+    const oldAccount = await db.account.findUnique({ where: { id: existing.accountId } });
+    if (oldAccount) {
+      const oldAmountInAcc =
+        existing.currency === oldAccount.currency
+          ? existing.amount
+          : convert(existing.amount, existing.currency as Currency, oldAccount.currency as Currency);
+      const oldDelta = existing.type === 'INCOME' ? -oldAmountInAcc : oldAmountInAcc;
+      await db.account.update({
+        where: { id: existing.accountId },
+        data: { balance: oldAccount.balance + oldDelta },
+      });
+    }
 
+    // القيم الجديدة
     const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
     const newType = type || existing.type;
     const newAmount = Number(amount ?? existing.amount);
-    const newAccount = accountId || existing.accountId;
+    const newAccount = await db.account.findUnique({ where: { id: accountId || existing.accountId } });
+    if (!newAccount) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
 
-    const newDelta = newType === 'INCOME' ? newAmount : -newAmount;
+    const newTxCurrency = (currency || existing.currency) as Currency;
+    const newAmountInAcc =
+      newTxCurrency === newAccount.currency
+        ? newAmount
+        : convert(newAmount, newTxCurrency, newAccount.currency as Currency);
+
+    const newDelta = newType === 'INCOME' ? newAmountInAcc : -newAmountInAcc;
     await db.account.update({
-      where: { id: newAccount },
-      data: { balance: { increment: newDelta } },
+      where: { id: newAccount.id },
+      data: { balance: newAccount.balance + newDelta },
     });
 
     const updated = await db.transaction.update({
       where: { id },
       data: {
         type: newType,
-        amount: newAmount,
-        currency: currency || existing.currency,
-        accountId: newAccount,
+        amount: newAmount,                       // ← المبلغ الأصلي بعملته الجديدة
+        currency: newTxCurrency,                // ← العملة الأصلية
+        accountId: newAccount.id,
         categoryId: categoryId || existing.categoryId,
         date: date ? new Date(date) : existing.date,
         note: note !== undefined ? note : existing.note,
@@ -78,11 +95,19 @@ export async function DELETE(
     const existing = await db.transaction.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    const delta = existing.type === 'INCOME' ? -existing.amount : existing.amount;
-    await db.account.update({
-      where: { id: existing.accountId },
-      data: { balance: { increment: delta } },
-    });
+    // revert balance (حوّل المبلغ لعملة الحساب)
+    const account = await db.account.findUnique({ where: { id: existing.accountId } });
+    if (account) {
+      const amountInAcc =
+        existing.currency === account.currency
+          ? existing.amount
+          : convert(existing.amount, existing.currency as Currency, account.currency as Currency);
+      const delta = existing.type === 'INCOME' ? -amountInAcc : amountInAcc;
+      await db.account.update({
+        where: { id: existing.accountId },
+        data: { balance: account.balance + delta },
+      });
+    }
 
     await db.transaction.delete({ where: { id } });
     return NextResponse.json({ success: true });
