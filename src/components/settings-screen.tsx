@@ -147,6 +147,52 @@ export function SettingsScreen() {
         </Button>
       </Card>
 
+      {/* Download APK - Native Android App */}
+      <Card className="p-4 border-2 border-blue-200 dark:border-blue-900 bg-gradient-to-br from-blue-50 to-white dark:from-blue-950/30 dark:to-slate-900">
+        <div className="flex items-center gap-3 mb-3">
+          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shrink-0">
+            <Download className="w-5 h-5" />
+          </div>
+          <div className="flex-1">
+            <h2 className="font-semibold text-blue-900 dark:text-blue-100">
+              {lang === 'ar' ? 'تحميل تطبيق Android (APK)' : 'Download Android App (APK)'}
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {lang === 'ar'
+                ? 'حمّل ملف APK وثبّته على موبايلك بدون نشر على Google Play'
+                : 'Download APK file and install on your phone without Google Play'}
+            </p>
+          </div>
+        </div>
+        <div className="text-xs text-slate-500 mb-3 space-y-1">
+          <div className="flex items-center justify-between">
+            <span>{lang === 'ar' ? 'الإصدار' : 'Version'}:</span>
+            <span className="font-mono">1.0.0</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span>{lang === 'ar' ? 'الحجم' : 'Size'}:</span>
+            <span className="font-mono">5.5 MB</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span>{lang === 'ar' ? 'يدعم' : 'Supports'}:</span>
+            <span className="font-mono">Android 7.0+</span>
+          </div>
+        </div>
+        <a
+          href="/MyWallet.apk"
+          download="MyWallet.apk"
+          className="flex items-center justify-center gap-2 w-full h-12 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-95 transition text-white font-semibold text-base shadow-md"
+        >
+          <Download className="w-5 h-5" />
+          {lang === 'ar' ? 'حمّل ملف APK الآن' : 'Download APK Now'}
+        </a>
+        <p className="text-[10px] text-slate-400 mt-2 text-center">
+          {lang === 'ar'
+            ? 'بعد التحميل: افتح الـ File Manager واضغط على الملف لتثبيته'
+            : 'After download: open File Manager and tap the file to install'}
+        </p>
+      </Card>
+
       {/* Data Management */}
       <Card className="p-4">
         <div className="flex items-center gap-3 mb-3">

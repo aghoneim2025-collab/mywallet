@@ -1,0 +1,14 @@
+{
+  "filename": "MyWallet.apk",
+  "version": "1.0.0",
+  "versionCode": 1,
+  "size": 5669666,
+  "sizeMB": "5.5 MB",
+  "package": "com.mywallet.app",
+  "appName": "محفظتي",
+  "minSdk": 24,
+  "targetSdk": 34,
+  "supportedAndroid": "Android 7.0+",
+  "buildDate": "2026-10-21",
+  "url": "/MyWallet.apk"
+}
