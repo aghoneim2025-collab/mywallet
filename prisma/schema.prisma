@@ -1,0 +1,120 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Account (الحسابات: كاش/بنك/محفظة إلكترونية) =====
+model Account {
+  id        String   @id @default(cuid())
+  name      String                       // اسم الحساب (مثال: محفظتي البنكية)
+  type      AccountType                  // نوع الحساب
+  currency  Currency                     // عملة الحساب
+  balance   Float    @default(0)          // الرصيد الافتراضي
+  color     String   @default("#2563EB") // لون الحساب
+  icon      String   @default("wallet")  // أيقونة
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+
+  @@map("accounts")
+}
+
+enum AccountType {
+  CASH        // نقدي
+  BANK        // بنك
+  E_WALLET    // محفظة إلكترونية
+  CARD        // بطاقة ائتمان
+  SAVINGS     // حساب توفير
+}
+
+enum Currency {
+  EGP
+  SAR
+  USD
+  EUR
+  AED
+}
+
+// ===== Category (الفئات: مصروفات + دخل) =====
+model Category {
+  id        String        @id @default(cuid())
+  nameAr    String                     // الاسم بالعربي
+  nameEn    String                     // الاسم بالإنجليزي
+  type      CategoryType               // EXPENSE or INCOME
+  icon      String        @default("tag") // اسم الأيقونة (lucide)
+  color     String        @default("#10B981")
+  isDefault Boolean       @default(false)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  transactions Transaction[]
+  budgets     Budget[]
+
+  @@map("categories")
+}
+
+enum CategoryType {
+  EXPENSE
+  INCOME
+}
+
+// ===== Transaction (المعاملة: مصروف أو دخل) =====
+model Transaction {
+  id          String   @id @default(cuid())
+  type        CategoryType                // EXPENSE or INCOME
+  amount      Float                       // المبلغ بعملة الحساب
+  currency    Currency                    // عملة المعاملة (تطابق الحساب عادة)
+  accountId   String
+  categoryId  String
+  date        DateTime  @default(now())  // تاريخ المعاملة
+  note        String?                     // ملاحظة
+  tags        String?                     // علامات تصنيف (مفصولة بفواصل)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  account     Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@index([categoryId])
+  @@index([date])
+  @@index([type])
+  @@map("transactions")
+}
+
+// ===== Budget (الميزانية الشهرية لكل فئة) =====
+model Budget {
+  id          String   @id @default(cuid())
+  categoryId  String                     // الفئة
+  month       String                     // الشهر بصيغة YYYY-MM
+  limit       Float                       // الحد الأقصى
+  currency    Currency   @default(EGP)   // العملة
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([categoryId, month])
+  @@index([month])
+  @@map("budgets")
+}
+
+// ===== Setting (الإعدادات العامة) =====
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}

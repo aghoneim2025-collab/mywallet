@@ -1,0 +1,43 @@
+{
+  "name": "محفظتي - MyWallet",
+  "short_name": "محفظتي",
+  "description": "تطبيق متكامل لإدارة المصروفات والدخل والميزانية الشهرية مع رسوم بيانية وتقارير دقيقة.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0F172A",
+  "theme_color": "#2563EB",
+  "dir": "rtl",
+  "lang": "ar",
+  "categories": ["finance", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [],
+  "shortcuts": [
+    {
+      "name": "إضافة مصروف",
+      "short_name": "مصروف",
+      "url": "/?action=expense",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "إضافة دخل",
+      "short_name": "دخل",
+      "url": "/?action=income",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}
