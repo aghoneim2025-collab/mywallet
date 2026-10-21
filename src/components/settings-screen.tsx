@@ -11,6 +11,8 @@ import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
 import { toast } from 'sonner';
 import type { Currency } from '@/lib/currency';
+import { CategoriesManager } from '@/components/categories-manager';
+import { DataTools } from '@/components/data-tools';
 
 const CURRENCIES: Currency[] = ['EGP', 'SAR', 'USD', 'EUR', 'AED'];
 
@@ -192,6 +194,12 @@ export function SettingsScreen() {
             : 'After download: open File Manager and tap the file to install'}
         </p>
       </Card>
+
+      {/* Categories Management */}
+      <CategoriesManager />
+
+      {/* Excel Export/Import + Backup */}
+      <DataTools />
 
       {/* Data Management */}
       <Card className="p-4">

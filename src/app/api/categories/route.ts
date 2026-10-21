@@ -8,7 +8,7 @@ export async function GET(req: NextRequest) {
     const type = url.searchParams.get('type');
     const categories = await db.category.findMany({
       where: type ? { type: type as any } : {},
-      orderBy: { type: 'asc' },
+      orderBy: [{ isDefault: 'desc' }, { type: 'asc' }],
     });
     return NextResponse.json({ data: categories });
   } catch (err: any) {
@@ -20,15 +20,38 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { nameAr, nameEn, type, icon, color } = body;
+    const { nameAr, nameEn, type, icon, color, id } = body;
+
     if (!nameAr || !nameEn || !type) {
       return NextResponse.json(
         { error: 'nameAr, nameEn, type are required' },
         { status: 400 }
       );
     }
+
+    // update existing?
+    if (id) {
+      const updated = await db.category.update({
+        where: { id },
+        data: {
+          nameAr,
+          nameEn,
+          type,
+          icon: icon || 'tag',
+          color: color || '#10B981',
+        },
+      });
+      return NextResponse.json({ data: updated });
+    }
+
     const category = await db.category.create({
-      data: { nameAr, nameEn, type, icon: icon || 'tag', color: color || '#10B981' },
+      data: {
+        nameAr,
+        nameEn,
+        type,
+        icon: icon || 'tag',
+        color: color || '#10B981',
+      },
     });
     return NextResponse.json({ data: category });
   } catch (err: any) {
