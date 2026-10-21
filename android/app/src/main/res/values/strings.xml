@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">محفظتي</string>
+    <string name="app_name_en">MyWallet</string>
+    <string name="loading">جاري التحميل...</string>
+    <string name="no_internet">لا يوجد اتصال بالإنترنت</string>
+    <string name="retry">إعادة المحاولة</string>
+    <string name="exit">خروج</string>
+    <string name="back_to_exit">اضغط مرة أخرى للخروج</string>
+</resources>
