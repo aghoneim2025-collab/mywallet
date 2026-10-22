@@ -9,6 +9,7 @@ import { ReportsScreen } from '@/components/reports-screen';
 import { AccountsScreen } from '@/components/accounts-screen';
 import { SettingsScreen } from '@/components/settings-screen';
 import { TransactionModal } from '@/components/transaction-modal';
+import { TransferModal } from '@/components/transfer-modal';
 import { ArrowRight } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 
@@ -18,10 +19,12 @@ export default function Home() {
   const { t } = useT();
   const [activeTab, setActiveTab] = useState<Screen>('dashboard');
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
+  const [transferModal, setTransferModal] = useState(false);
 
   const openAddExpense = () => setTxModal({ open: true, type: 'EXPENSE' });
   const openAddIncome = () => setTxModal({ open: true, type: 'INCOME' });
   const openEditTx = (tx: any) => setTxModal({ open: true, type: tx.type, initial: tx });
+  const openTransfer = () => setTransferModal(true);
 
   const [reloadKey, setReloadKey] = useState(0);
   const handleSaved = () => setReloadKey(k => k + 1);
@@ -62,7 +65,11 @@ export default function Home() {
 
       {/* FAB hidden on accounts sub-screen to avoid conflict */}
       {activeTab !== 'accounts' && (
-        <FAB onAddExpense={openAddExpense} onAddIncome={openAddIncome} />
+        <FAB
+          onAddExpense={openAddExpense}
+          onAddIncome={openAddIncome}
+          onTransfer={openTransfer}
+        />
       )}
 
       <BottomNav active={activeTab === 'accounts' ? 'dashboard' : activeTab} onChange={setActiveTab} />
@@ -71,6 +78,12 @@ export default function Home() {
         open={txModal.open}
         onOpenChange={(o) => setTxModal(m => ({ ...m, open: o }))}
         initial={txModal.initial || { type: txModal.type }}
+        onSaved={handleSaved}
+      />
+
+      <TransferModal
+        open={transferModal}
+        onOpenChange={setTransferModal}
         onSaved={handleSaved}
       />
     </div>

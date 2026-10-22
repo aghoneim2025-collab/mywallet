@@ -36,16 +36,61 @@ export function ReportsScreen() {
   const [stat, setStat] = useState<Stat | null>(null);
   const [loading, setLoading] = useState(true);
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [viewMode, setViewMode] = useState<'monthly' | 'yearly'>('monthly');
+  const [year, setYear] = useState(new Date().getFullYear().toString());
+  const [yearlyData, setYearlyData] = useState<{ month: string; income: number; expense: number; balance: number }[] | null>(null);
 
   const load = async () => {
     setLoading(true);
     try {
-      const s = await api<{ data: Stat }>(`/api/stats?month=${month}&baseCurrency=${baseCurrency}`);
-      setStat(s.data);
+      if (viewMode === 'monthly') {
+        const s = await api<{ data: Stat }>(`/api/stats?month=${month}&baseCurrency=${baseCurrency}`);
+        setStat(s.data);
+      } else {
+        // Yearly: fetch 12 months stats in parallel
+        const months: { month: string; income: number; expense: number; balance: number }[] = [];
+        const promises = [];
+        for (let m = 1; m <= 12; m++) {
+          const mStr = `${year}-${String(m).padStart(2, '0')}`;
+          promises.push(
+            api<{ data: Stat }>(`/api/stats?month=${mStr}&baseCurrency=${baseCurrency}`)
+              .then(s => ({
+                month: mStr,
+                income: s.data.totalIncome,
+                expense: s.data.totalExpense,
+                balance: s.data.balance,
+              }))
+              .catch(() => ({ month: mStr, income: 0, expense: 0, balance: 0 }))
+          );
+        }
+        const results = await Promise.all(promises);
+        setYearlyData(results);
+        // Also set stat to yearly totals
+        const totalIncome = results.reduce((s, r) => s + r.income, 0);
+        const totalExpense = results.reduce((s, r) => s + r.expense, 0);
+        setStat({
+          totalIncome,
+          totalExpense,
+          balance: totalIncome - totalExpense,
+          totalAssets: 0,
+          baseCurrency,
+          expenseCount: 0,
+          incomeCount: 0,
+          byCategory: [],
+          byDay: [],
+          month: year,
+        } as Stat);
+      }
     } finally { setLoading(false); }
   };
 
-  useEffect(() => { load(); }, [month, baseCurrency]);
+  useEffect(() => {
+    if (viewMode === 'monthly') {
+      load();
+    } else {
+      load();
+    }
+  }, [month, baseCurrency, viewMode, year]);
 
   const fmt = (n: number) => formatMoney(n, baseCurrency, lang);
 
@@ -100,18 +145,61 @@ export function ReportsScreen() {
   return (
     <div className="p-4 space-y-5">
       {/* Header */}
-      <header className="flex justify-between items-center">
+      <header className="flex justify-between items-center gap-2">
         <div>
           <h1 className="text-2xl font-bold">{t('reports')}</h1>
-          <p className="text-xs text-slate-500">{month}</p>
+          <p className="text-xs text-slate-500">{viewMode === 'monthly' ? month : year}</p>
         </div>
-        <input
-          type="month"
-          value={month}
-          onChange={e => setMonth(e.target.value)}
-          className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-sm"
-        />
+        <div className="flex gap-1">
+          {/* Toggle monthly/yearly */}
+          <div className="flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1">
+            <button
+              onClick={() => setViewMode('monthly')}
+              className={cn(
+                'px-2 py-1 rounded text-xs font-medium transition',
+                viewMode === 'monthly'
+                  ? 'bg-white dark:bg-slate-900 text-blue-700 dark:text-blue-300 shadow-sm'
+                  : 'text-slate-500'
+              )}
+            >
+              {lang === 'ar' ? 'شهري' : 'Monthly'}
+            </button>
+            <button
+              onClick={() => setViewMode('yearly')}
+              className={cn(
+                'px-2 py-1 rounded text-xs font-medium transition',
+                viewMode === 'yearly'
+                  ? 'bg-white dark:bg-slate-900 text-blue-700 dark:text-blue-300 shadow-sm'
+                  : 'text-slate-500'
+              )}
+            >
+              {lang === 'ar' ? 'سنوي' : 'Yearly'}
+            </button>
+          </div>
+        </div>
       </header>
+
+      {/* Date selector (month or year) */}
+      <div>
+        {viewMode === 'monthly' ? (
+          <input
+            type="month"
+            value={month}
+            onChange={e => setMonth(e.target.value)}
+            className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-sm w-full"
+          />
+        ) : (
+          <select
+            value={year}
+            onChange={e => setYear(e.target.value)}
+            className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-sm w-full"
+          >
+            {Array.from({ length: 15 }, (_, i) => (new Date().getFullYear() - 7 + i).toString()).map(y => (
+              <option key={y} value={y}>{y}</option>
+            ))}
+          </select>
+        )}
+      </div>
 
       {/* Summary cards - 3 columns */}
       <div className="grid grid-cols-3 gap-2">
@@ -154,7 +242,57 @@ export function ReportsScreen() {
         </Card>
       </div>
 
-      {/* Daily trend bar chart */}
+      {/* Yearly chart - shows when viewMode = yearly */}
+      {viewMode === 'yearly' && yearlyData && (
+        <section>
+          <h2 className="text-sm font-semibold mb-2">
+            {lang === 'ar' ? 'الدخل مقابل المصروفات شهرياً' : 'Monthly Income vs Expenses'}
+          </h2>
+          <Card className="p-3">
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart
+                data={yearlyData.map(d => ({
+                  month: d.month.split('-')[1],
+                  income: d.income,
+                  expense: d.expense,
+                }))}
+              >
+                <XAxis dataKey="month" tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fontSize: 9, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={40} />
+                <Tooltip
+                  formatter={(v: number) => fmt(v)}
+                  contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #e2e8f0' }}
+                />
+                <Bar dataKey="income" name={t('income')} fill="#10B981" radius={[4, 4, 0, 0]} maxBarSize={20} />
+                <Bar dataKey="expense" name={t('expense')} fill="#EF4444" radius={[4, 4, 0, 0]} maxBarSize={20} />
+              </BarChart>
+            </ResponsiveContainer>
+          </Card>
+
+          {/* Monthly breakdown table */}
+          <Card className="p-3 mt-2">
+            <div className="grid grid-cols-4 gap-2 text-[10px] font-semibold text-slate-500 mb-2">
+              <span>{lang === 'ar' ? 'الشهر' : 'Month'}</span>
+              <span className="text-end text-emerald-600">{lang === 'ar' ? 'دخل' : 'Income'}</span>
+              <span className="text-end text-red-600">{lang === 'ar' ? 'مصروف' : 'Expense'}</span>
+              <span className="text-end text-blue-600">{lang === 'ar' ? 'صافي' : 'Net'}</span>
+            </div>
+            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+              {yearlyData.map(d => (
+                <div key={d.month} className="grid grid-cols-4 gap-2 py-1.5 text-xs">
+                  <span className="text-slate-700 dark:text-slate-300">{d.month}</span>
+                  <span className="text-end text-emerald-600 dark:text-emerald-400">{fmt(d.income)}</span>
+                  <span className="text-end text-red-600 dark:text-red-400">{fmt(d.expense)}</span>
+                  <span className={cn('text-end font-semibold', d.balance >= 0 ? 'text-blue-600 dark:text-blue-400' : 'text-red-600 dark:text-red-400')}>{fmt(d.balance)}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </section>
+      )}
+
+      {/* Daily trend bar chart - only in monthly mode */}
+      {viewMode === 'monthly' && (
       <section>
         <h2 className="text-sm font-semibold mb-2">{t('incomeVsExpense')}</h2>
         <Card className="p-3">
@@ -172,6 +310,7 @@ export function ReportsScreen() {
           </ResponsiveContainer>
         </Card>
       </section>
+      )}
 
       {/* Pie chart with category breakdown */}
       <section>

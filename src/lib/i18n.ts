@@ -60,6 +60,7 @@ export const translations = {
     // transactions
     expense: 'مصروف',
     income: 'دخل',
+    transfer: 'تحويل',
     addExpense: 'إضافة مصروف',
     addIncome: 'إضافة دخل',
     editTransaction: 'تعديل المعاملة',
@@ -204,6 +205,7 @@ export const translations = {
 
     expense: 'Expense',
     income: 'Income',
+    transfer: 'Transfer',
     addExpense: 'Add Expense',
     addIncome: 'Add Income',
     editTransaction: 'Edit Transaction',

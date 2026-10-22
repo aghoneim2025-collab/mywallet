@@ -23,7 +23,8 @@ model Account {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  transactions Transaction[]
+  transactions      Transaction[]
+  transfersTo       Transaction[] @relation("TransfersTo")
 
   @@map("accounts")
 }
@@ -68,26 +69,31 @@ model Category {
 enum CategoryType {
   EXPENSE
   INCOME
+  TRANSFER   // تحويل بين حسابين (لا يحسب كدخل أو مصروف)
 }
 
-// ===== Transaction (المعاملة: مصروف أو دخل) =====
+// ===== Transaction (المعاملة: مصروف أو دخل أو تحويل) =====
 model Transaction {
-  id          String   @id @default(cuid())
-  type        CategoryType                // EXPENSE or INCOME
-  amount      Float                       // المبلغ بعملة الحساب
-  currency    Currency                    // عملة المعاملة (تطابق الحساب عادة)
-  accountId   String
-  categoryId  String
-  date        DateTime  @default(now())  // تاريخ المعاملة
-  note        String?                     // ملاحظة
-  tags        String?                     // علامات تصنيف (مفصولة بفواصل)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id            String   @id @default(cuid())
+  type          CategoryType                // EXPENSE | INCOME | TRANSFER
+  amount        Float                       // المبلغ بعملة المعاملة
+  currency      Currency                    // عملة المعاملة
+  accountId     String                      // الحساب المصدر (للتحويل: الحساب اللي بيتسحب منه)
+  categoryId    String                      // الفئة (للتحويل: فئة 'تحويلات')
+  toAccountId   String?                     // للتحويل فقط: الحساب الوجهة
+  date          DateTime  @default(now())  // تاريخ المعاملة
+  note          String?                     // ملاحظة
+  tags          String?                     // علامات تصنيف
+  transferPairId String?                    // ID للمعاملة المزدوجة في التحويل (الوجهة)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
-  account     Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  account       Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category      Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  toAccount     Account? @relation("TransfersTo", fields: [toAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@index([accountId])
+  @@index([toAccountId])
   @@index([categoryId])
   @@index([date])
   @@index([type])

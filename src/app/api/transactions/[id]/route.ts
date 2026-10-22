@@ -95,7 +95,40 @@ export async function DELETE(
     const existing = await db.transaction.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    // revert balance (حوّل المبلغ لعملة الحساب)
+    // Handle TRANSFER: reverse balance for both source and destination
+    if (existing.type === 'TRANSFER' as any && existing.toAccountId) {
+      const [sourceAccount, destAccount] = await Promise.all([
+        db.account.findUnique({ where: { id: existing.accountId } }),
+        db.account.findUnique({ where: { id: existing.toAccountId } }),
+      ]);
+
+      if (sourceAccount) {
+        // Reverse source debit (add back the amount)
+        const sourceAmountInCur =
+          existing.currency === sourceAccount.currency
+            ? existing.amount
+            : convert(existing.amount, existing.currency as Currency, sourceAccount.currency as Currency);
+        await db.account.update({
+          where: { id: sourceAccount.id },
+          data: { balance: sourceAccount.balance + sourceAmountInCur },
+        });
+      }
+      if (destAccount) {
+        // Reverse destination credit (subtract the amount)
+        const destAmountInCur =
+          existing.currency === destAccount.currency
+            ? existing.amount
+            : convert(existing.amount, existing.currency as Currency, destAccount.currency as Currency);
+        await db.account.update({
+          where: { id: destAccount.id },
+          data: { balance: destAccount.balance - destAmountInCur },
+        });
+      }
+      await db.transaction.delete({ where: { id } });
+      return NextResponse.json({ success: true });
+    }
+
+    // Normal expense/income: revert balance
     const account = await db.account.findUnique({ where: { id: existing.accountId } });
     if (account) {
       const amountInAcc =

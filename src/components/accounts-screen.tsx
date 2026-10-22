@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Switch } from '@/components/ui/switch';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Plus, Pencil, Trash2, TrendingUp, TrendingDown, Wallet } from 'lucide-react';
+import { Plus, Pencil, Trash2, TrendingUp, TrendingDown, Wallet, Search } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
@@ -72,6 +72,8 @@ export function AccountsScreen() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState<{ open: boolean; data?: Account | null }>({ open: false });
+  const [search, setSearch] = useState('');
+  const [detailAccountId, setDetailAccountId] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -89,10 +91,19 @@ export function AccountsScreen() {
   const convertToBase = (balance: number, fromCurrency: string) =>
     convert(balance, fromCurrency as Currency, baseCurrency);
 
+  // Filter accounts by search
+  const filteredAccounts = accounts.filter(a => {
+    if (!search) return true;
+    const q = search.toLowerCase();
+    return a.name.toLowerCase().includes(q) ||
+      a.currency.toLowerCase().includes(q) ||
+      a.type.toLowerCase().includes(q);
+  });
+
   // Group accounts
   const groupedAccounts = ACCOUNT_GROUPS.map(group => ({
     ...group,
-    accounts: accounts.filter(a => a.type === group.type),
+    accounts: filteredAccounts.filter(a => a.type === group.type),
   })).filter(g => g.accounts.length > 0);
 
   // Calculate totals
@@ -153,6 +164,17 @@ export function AccountsScreen() {
           <Plus className="w-4 h-4" /> {t('add')}
         </Button>
       </header>
+
+      {/* Search box */}
+      <div className="relative">
+        <Search className="absolute start-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+        <Input
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder={lang === 'ar' ? 'بحث بالاسم أو العملة...' : 'Search by name or currency...'}
+          className="ps-9"
+        />
+      </div>
 
       {/* Summary Card: Assets / Liabilities / Net */}
       <div className="grid grid-cols-3 gap-2">
@@ -224,7 +246,7 @@ export function AccountsScreen() {
                 return (
                   <div key={a.id} className="flex items-center gap-3 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
                     <button
-                      onClick={() => setModal({ open: true, data: a })}
+                      onClick={() => setDetailAccountId(a.id)}
                       className="flex items-center gap-3 flex-1 min-w-0 text-start"
                     >
                       <div
@@ -259,6 +281,13 @@ export function AccountsScreen() {
                       )}
                     </div>
                     <button
+                      onClick={(e) => { e.stopPropagation(); setModal({ open: true, data: a }); }}
+                      className="p-1.5 text-slate-300 hover:text-blue-600 shrink-0"
+                      aria-label={t('edit')}
+                    >
+                      <Pencil className="w-4 h-4" />
+                    </button>
+                    <button
                       onClick={() => handleDelete(a.id)}
                       className="p-1.5 text-slate-300 hover:text-red-500 shrink-0"
                       aria-label={t('delete')}
@@ -290,7 +319,172 @@ export function AccountsScreen() {
         initial={modal.data}
         onSave={handleSave}
       />
+
+      {/* Account detail dialog */}
+      {detailAccountId && (
+        <AccountDetailModal
+          accountId={detailAccountId}
+          onClose={() => setDetailAccountId(null)}
+          onEditTx={() => {/* TODO: implement edit from detail */}}
+        />
+      )}
     </div>
+  );
+}
+
+/** Account detail view - shows account info + recent transactions */
+function AccountDetailModal({
+  accountId,
+  onClose,
+  onEditTx,
+}: {
+  accountId: string;
+  onClose: () => void;
+  onEditTx?: (tx: any) => void;
+}) {
+  const { t, lang } = useT();
+  const baseCurrency = useSettings(s => s.baseCurrency);
+  const [account, setAccount] = useState<Account | null>(null);
+  const [transactions, setTransactions] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([
+      api<{ data: Account[] }>('/api/accounts'),
+      api<{ data: any[] }>(`/api/transactions?accountId=${accountId}&limit=200`),
+    ]).then(([accs, txs]) => {
+      const acc = accs.data.find(a => a.id === accountId) || null;
+      setAccount(acc);
+      setTransactions(txs.data);
+    }).finally(() => setLoading(false));
+  }, [accountId]);
+
+  const fmt = (n: number, cur: any = baseCurrency) => formatMoney(n, cur, lang);
+  const convertToBase = (balance: number, fromCurrency: string) =>
+    convert(balance, fromCurrency as Currency, baseCurrency);
+
+  // Calculate totals for this account
+  const totalIncome = transactions
+    .filter(t => t.type === 'INCOME')
+    .reduce((s, t) => s + convertToBase(t.amount, t.currency), 0);
+  const totalExpense = transactions
+    .filter(t => t.type === 'EXPENSE')
+    .reduce((s, t) => s + convertToBase(t.amount, t.currency), 0);
+  const totalTransfers = transactions
+    .filter(t => t.type === 'TRANSFER')
+    .reduce((s, t) => s + convertToBase(t.amount, t.currency), 0);
+
+  return (
+    <Dialog open={true} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            {account && (
+              <>
+                <div
+                  className="w-8 h-8 rounded-lg flex items-center justify-center text-white"
+                  style={{ background: account.color }}
+                >
+                  {(() => {
+                    const I = getIcon(account.icon);
+                    return <I className="w-4 h-4" />;
+                  })()}
+                </div>
+                {account.name}
+              </>
+            )}
+          </DialogTitle>
+        </DialogHeader>
+
+        {loading ? (
+          <div className="py-8 text-center">
+            <Skeleton className="h-32 w-full" />
+          </div>
+        ) : account ? (
+          <>
+            {/* Account balance */}
+            <Card className="p-5 bg-gradient-to-br from-blue-600 to-blue-700 text-white border-0">
+              <p className="text-xs text-blue-100">{lang === 'ar' ? 'الرصيد الحالي' : 'Current Balance'}</p>
+              <p className="text-3xl font-bold mt-1">
+                {formatMoney(account.balance, account.currency as Currency, lang)}
+              </p>
+              {account.currency !== baseCurrency && (
+                <p className="text-xs text-blue-200 mt-1">
+                  ≈ {fmt(convertToBase(account.balance, account.currency))}
+                </p>
+              )}
+            </Card>
+
+            {/* Mini summary */}
+            <div className="grid grid-cols-3 gap-2 mt-2">
+              <div className="p-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 text-center">
+                <p className="text-[10px] text-emerald-700 dark:text-emerald-400">{lang === 'ar' ? 'دخل' : 'Income'}</p>
+                <p className="text-xs font-bold text-emerald-700 dark:text-emerald-300 truncate">{fmt(totalIncome)}</p>
+              </div>
+              <div className="p-2 rounded-lg bg-red-50 dark:bg-red-950/30 text-center">
+                <p className="text-[10px] text-red-700 dark:text-red-400">{lang === 'ar' ? 'مصروف' : 'Expense'}</p>
+                <p className="text-xs font-bold text-red-700 dark:text-red-300 truncate">{fmt(totalExpense)}</p>
+              </div>
+              <div className="p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 text-center">
+                <p className="text-[10px] text-slate-700 dark:text-slate-300">{lang === 'ar' ? 'تحويل' : 'Transfer'}</p>
+                <p className="text-xs font-bold text-slate-700 dark:text-slate-300 truncate">{fmt(totalTransfers)}</p>
+              </div>
+            </div>
+
+            {/* Transactions list */}
+            <div className="mt-4">
+              <h3 className="text-sm font-semibold mb-2">
+                {transactions.length} {lang === 'ar' ? 'معاملة' : 'transactions'}
+              </h3>
+              <div className="max-h-72 overflow-y-auto -mx-2">
+                {transactions.length === 0 ? (
+                  <p className="text-center text-sm text-slate-400 py-4">{t('noTransactionsYet')}</p>
+                ) : (
+                  transactions.slice(0, 50).map(tx => {
+                    const Icon = getIcon(tx.category?.icon || 'tag');
+                    const isIncome = tx.type === 'INCOME';
+                    const isTransfer = tx.type === 'TRANSFER';
+                    return (
+                      <div key={tx.id} className="flex items-center gap-3 p-2 hover:bg-slate-50 dark:hover:bg-slate-800/50 rounded-lg transition">
+                        <div
+                          className="w-8 h-8 rounded-full flex items-center justify-center text-white shrink-0"
+                          style={{ background: isTransfer ? '#64748B' : tx.category?.color || '#64748B' }}
+                        >
+                          <Icon className="w-4 h-4" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium truncate">
+                            {isTransfer
+                              ? (lang === 'ar' ? 'تحويل' : 'Transfer')
+                              : (lang === 'ar' ? tx.category?.nameAr : tx.category?.nameEn)}
+                          </p>
+                          <p className="text-[10px] text-slate-400 truncate">
+                            {new Date(tx.date).toLocaleDateString(lang === 'ar' ? 'ar-EG' : 'en-US', { day: 'numeric', month: 'short', year: 'numeric' })}
+                            {tx.note ? ` • ${tx.note}` : ''}
+                          </p>
+                        </div>
+                        <span className={cn(
+                          'text-xs font-semibold shrink-0',
+                          isIncome
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : isTransfer
+                              ? 'text-slate-600 dark:text-slate-300'
+                              : 'text-red-600 dark:text-red-400'
+                        )}>
+                          {isIncome ? '+' : isTransfer ? '⇄ ' : '-'}{fmt(tx.amount, tx.currency)}
+                        </span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </>
+        ) : (
+          <p className="text-center text-sm text-slate-400 py-4">{lang === 'ar' ? 'الحساب غير موجود' : 'Account not found'}</p>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 

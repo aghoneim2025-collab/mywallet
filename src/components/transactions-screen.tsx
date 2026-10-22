@@ -20,8 +20,10 @@ interface TxItem {
   currency: string;
   date: string;
   note: string | null;
+  toAccountId?: string | null;
   category: { id: string; nameAr: string; nameEn: string; color: string; icon: string; type: string };
   account: { id: string; name: string; color: string; icon: string; currency: string };
+  toAccount?: { id: string; name: string; color: string; icon: string; currency: string } | null;
 }
 
 interface Category { id: string; nameAr: string; nameEn: string; type: string; color: string; icon: string; }
@@ -34,8 +36,11 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [typeFilter, setTypeFilter] = useState<'ALL' | 'EXPENSE' | 'INCOME'>('ALL');
+  const [typeFilter, setTypeFilter] = useState<'ALL' | 'EXPENSE' | 'INCOME' | 'TRANSFER'>('ALL');
   const [categoryFilter, setCategoryFilter] = useState<string>('ALL');
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [showDateFilter, setShowDateFilter] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -57,11 +62,24 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
       if (categoryFilter !== 'ALL' && tx.category.id !== categoryFilter) return false;
       if (search) {
         const cat = lang === 'ar' ? tx.category.nameAr : tx.category.nameEn;
-        if (!cat.includes(search) && !(tx.note || '').includes(search)) return false;
+        const accName = tx.account?.name || '';
+        const toAccName = tx.toAccount?.name || '';
+        if (!cat.includes(search) &&
+            !accName.includes(search) &&
+            !toAccName.includes(search) &&
+            !(tx.note || '').includes(search)) return false;
+      }
+      if (fromDate) {
+        const txDate = new Date(tx.date).toISOString().slice(0, 10);
+        if (txDate < fromDate) return false;
+      }
+      if (toDate) {
+        const txDate = new Date(tx.date).toISOString().slice(0, 10);
+        if (txDate > toDate) return false;
       }
       return true;
     });
-  }, [items, search, typeFilter, categoryFilter, lang]);
+  }, [items, search, typeFilter, categoryFilter, fromDate, toDate, lang]);
 
   // group by day
   const grouped = useMemo(() => {
@@ -109,18 +127,55 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
         <p className="text-sm text-slate-500">{filtered.length} {t('transactions')}</p>
       </header>
 
-      {/* Search */}
-      <div className="relative">
-        <Search className="absolute start-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-        <Input
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder={t('search')}
-          className="ps-9"
-        />
+      {/* Search + Date toggle */}
+      <div className="flex gap-2">
+        <div className="relative flex-1">
+          <Search className="absolute start-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+          <Input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder={t('search')}
+            className="ps-9"
+          />
+        </div>
+        <button
+          onClick={() => setShowDateFilter(!showDateFilter)}
+          className={cn(
+            'px-3 rounded-lg border-2 transition flex items-center gap-1',
+            showDateFilter || fromDate || toDate
+              ? 'border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300'
+              : 'border-slate-200 dark:border-slate-800 text-slate-500'
+          )}
+          aria-label={lang === 'ar' ? 'فلتر التاريخ' : 'Date filter'}
+        >
+          <Filter className="w-4 h-4" />
+          <span className="text-xs font-medium">{lang === 'ar' ? 'تاريخ' : 'Date'}</span>
+        </button>
       </div>
 
-      {/* Filters */}
+      {/* Date filter (collapsible) */}
+      {showDateFilter && (
+        <div className="grid grid-cols-2 gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl">
+          <div className="space-y-1">
+            <label className="text-[10px] text-slate-500 font-medium">{lang === 'ar' ? 'من تاريخ' : 'From'}</label>
+            <Input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} className="h-9 text-sm" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] text-slate-500 font-medium">{lang === 'ar' ? 'إلى تاريخ' : 'To'}</label>
+            <Input type="date" value={toDate} onChange={e => setToDate(e.target.value)} className="h-9 text-sm" />
+          </div>
+          {(fromDate || toDate) && (
+            <button
+              onClick={() => { setFromDate(''); setToDate(''); }}
+              className="col-span-2 text-xs text-red-600 hover:underline mt-1"
+            >
+              {lang === 'ar' ? 'مسح فلتر التاريخ' : 'Clear date filter'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Type + Category filters */}
       <div className="grid grid-cols-2 gap-2">
         <Select value={typeFilter} onValueChange={(v: any) => setTypeFilter(v)}>
           <SelectTrigger><SelectValue placeholder={t('type')} /></SelectTrigger>
@@ -128,6 +183,7 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
             <SelectItem value="ALL">{t('all')}</SelectItem>
             <SelectItem value="EXPENSE">{t('expense')}</SelectItem>
             <SelectItem value="INCOME">{t('income')}</SelectItem>
+            <SelectItem value="TRANSFER">{t('transfer')}</SelectItem>
           </SelectContent>
         </Select>
         <Select value={categoryFilter} onValueChange={setCategoryFilter}>
@@ -191,25 +247,38 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
                   {txs.map(tx => {
                     const Icon = getIcon(tx.category.icon);
                     const isIncome = tx.type === 'INCOME';
+                    const isTransfer = tx.type === 'TRANSFER';
+                    const transferLabel = isTransfer && tx.toAccount
+                      ? `${tx.account.name} → ${tx.toAccount.name}`
+                      : tx.account.name;
                     return (
                       <div key={tx.id} className="flex items-center gap-3 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
                         <button
                           onClick={() => onEditTx(tx)}
                           className="flex items-center gap-3 flex-1 min-w-0 text-start"
                         >
-                          <div className="w-10 h-10 rounded-full flex items-center justify-center text-white shrink-0" style={{ background: tx.category.color }}>
+                          <div className="w-10 h-10 rounded-full flex items-center justify-center text-white shrink-0" style={{ background: isTransfer ? '#64748B' : tx.category.color }}>
                             <Icon className="w-5 h-5" />
                           </div>
                           <div className="flex-1 min-w-0">
                             <p className="font-medium text-sm truncate">
-                              {lang === 'ar' ? tx.category.nameAr : tx.category.nameEn}
+                              {isTransfer
+                                ? (lang === 'ar' ? 'تحويل' : 'Transfer')
+                                : (lang === 'ar' ? tx.category.nameAr : tx.category.nameEn)}
                             </p>
                             <p className="text-xs text-slate-400 truncate">
-                              {tx.account.name}{tx.note ? ` • ${tx.note}` : ''}
+                              {transferLabel}{tx.note ? ` • ${tx.note}` : ''}
                             </p>
                           </div>
-                          <div className={cn('font-semibold text-sm shrink-0', isIncome ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400')}>
-                            {isIncome ? '+' : '-'}{fmt(tx.amount, tx.currency)}
+                          <div className={cn(
+                            'font-semibold text-sm shrink-0',
+                            isIncome
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : isTransfer
+                                ? 'text-slate-600 dark:text-slate-300'
+                                : 'text-red-600 dark:text-red-400'
+                          )}>
+                            {isIncome ? '+' : isTransfer ? '⇄ ' : '-'}{fmt(tx.amount, tx.currency)}
                           </div>
                         </button>
                         <button

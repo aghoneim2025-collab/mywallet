@@ -40,9 +40,11 @@ export async function GET(req: NextRequest) {
 
     const expenses = transactions.filter(t => t.type === 'EXPENSE');
     const incomes = transactions.filter(t => t.type === 'INCOME');
+    const transfers = transactions.filter(t => t.type === 'TRANSFER' as any);
 
     const totalExpense = expenses.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
     const totalIncome = incomes.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
+    const totalTransfers = transfers.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
     const balance = totalIncome - totalExpense;
 
     // total assets = sum of account balances converted to base
@@ -80,11 +82,13 @@ export async function GET(req: NextRequest) {
       data: {
         totalExpense,
         totalIncome,
+        totalTransfers,
         balance,
         totalAssets,
         baseCurrency,
         expenseCount: expenses.length,
         incomeCount: incomes.length,
+        transferCount: transfers.length,
         byCategory: Object.values(byCategoryMap).sort((a: any, b: any) => b.total - a.total),
         byDay,
         month: month || start.toISOString().slice(0, 7),

@@ -1,5 +1,5 @@
 'use client';
-import { Plus, ArrowDownCircle, ArrowUpCircle } from 'lucide-react';
+import { Plus, ArrowDownCircle, ArrowUpCircle, ArrowLeftRight } from 'lucide-react';
 import { useState } from 'react';
 import { useT } from '@/hooks/use-t';
 import { cn } from '@/lib/utils';
@@ -7,9 +7,10 @@ import { cn } from '@/lib/utils';
 interface FABProps {
   onAddExpense: () => void;
   onAddIncome: () => void;
+  onTransfer: () => void;
 }
 
-export function FAB({ onAddExpense, onAddIncome }: FABProps) {
+export function FAB({ onAddExpense, onAddIncome, onTransfer }: FABProps) {
   const [open, setOpen] = useState(false);
   const { t } = useT();
 
@@ -33,20 +34,21 @@ export function FAB({ onAddExpense, onAddIncome }: FABProps) {
           )}
         >
           <button
-            onClick={() => {
-              setOpen(false);
-              onAddIncome();
-            }}
+            onClick={() => { setOpen(false); onTransfer(); }}
+            className="flex items-center gap-2 bg-slate-700 hover:bg-slate-800 text-white px-4 py-2.5 rounded-full shadow-lg active:scale-95 transition-all"
+          >
+            <ArrowLeftRight className="w-5 h-5" />
+            <span className="text-sm font-semibold">{t('transfer') || (document.documentElement.lang === 'ar' ? 'تحويل' : 'Transfer')}</span>
+          </button>
+          <button
+            onClick={() => { setOpen(false); onAddIncome(); }}
             className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white px-4 py-2.5 rounded-full shadow-lg active:scale-95 transition-all"
           >
             <ArrowUpCircle className="w-5 h-5" />
             <span className="text-sm font-semibold">{t('addIncome')}</span>
           </button>
           <button
-            onClick={() => {
-              setOpen(false);
-              onAddExpense();
-            }}
+            onClick={() => { setOpen(false); onAddExpense(); }}
             className="flex items-center gap-2 bg-red-500 hover:bg-red-600 text-white px-4 py-2.5 rounded-full shadow-lg active:scale-95 transition-all"
           >
             <ArrowDownCircle className="w-5 h-5" />
