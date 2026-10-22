@@ -1,9 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import * as XLSX from 'xlsx';
+import type { Currency } from '@/lib/currency';
 
-// GET /api/excel/export?month=YYYY-MM&type=EXPENSE|INCOME
-// يصدّر المعاملات بصيغة Excel متوافقة مع Money Manager
+/**
+ * Excel Import/Export for Money Manager format
+ *
+ * Format recognized (Money Manager columns):
+ *  Date | Account | Category | Subcategory | Note | SAR | Income/Expense | Description | Amount | Currency | Account
+ *
+ * Types:
+ *  - Income (راتب، بدل سكن، Bonus، rewards)
+ *  - Expense (طعام، بنزين، صيانه سياره...)
+ *  - Transfer-Out (تحويل بين حسابين - الـ Category هو الحساب الوجهة)
+ */
+
+// GET /api/excel?action=export
 export async function GET(req: NextRequest) {
   try {
     const url = new URL(req.url);
@@ -25,65 +37,30 @@ export async function GET(req: NextRequest) {
       orderBy: { date: 'desc' },
     });
 
-    // تنسيق متوافق مع Money Manager
+    // Money Manager format
     const rows = transactions.map(t => ({
       'Date': t.date.toISOString().slice(0, 10),
-      'Type': t.type,
-      'Category': t.category.nameAr,
-      'Category (EN)': t.category.nameEn,
       'Account': t.account.name,
-      'Account Type': t.account.type,
+      'Category': t.category.nameAr,
+      'Subcategory': '*',
+      'Note': t.note || '',
+      'SAR': t.amount,
+      'Income/Expense': t.type === 'INCOME' ? 'Income' : 'Expense',
+      'Description': '',
       'Amount': t.amount,
       'Currency': t.currency,
-      'Note': t.note || '',
+      'Account': t.amount,  // duplicate column (MM stores amount twice)
     }));
 
     const ws = XLSX.utils.json_to_sheet(rows);
-    // أعرض الكولومز بالعرض الصحيح
     ws['!cols'] = [
-      { wch: 12 }, // Date
-      { wch: 10 }, // Type
-      { wch: 20 }, // Category
-      { wch: 20 }, // Category EN
-      { wch: 18 }, // Account
-      { wch: 12 }, // Account Type
-      { wch: 12 }, // Amount
-      { wch: 8 },  // Currency
-      { wch: 30 }, // Note
+      { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 8 }, { wch: 30 },
+      { wch: 12 }, { wch: 12 }, { wch: 20 }, { wch: 12 }, { wch: 8 }, { wch: 12 },
     ];
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Transactions');
+    XLSX.utils.book_append_sheet(wb, ws, 'Money Manager');
 
-    // صفحة بالحسابات
-    const accounts = await db.account.findMany();
-    const accRows = accounts.map(a => ({
-      'Account Name': a.name,
-      'Type': a.type,
-      'Currency': a.currency,
-      'Balance': a.balance,
-      'Color': a.color,
-      'Icon': a.icon,
-      'Default': a.isDefault ? 'Yes' : 'No',
-    }));
-    const wsAcc = XLSX.utils.json_to_sheet(accRows);
-    wsAcc['!cols'] = [{ wch: 25 }, { wch: 12 }, { wch: 8 }, { wch: 12 }, { wch: 8 }, { wch: 12 }, { wch: 8 }];
-    XLSX.utils.book_append_sheet(wb, wsAcc, 'Accounts');
-
-    // صفحة بالفئات
-    const categories = await db.category.findMany();
-    const catRows = categories.map(c => ({
-      'Name (AR)': c.nameAr,
-      'Name (EN)': c.nameEn,
-      'Type': c.type,
-      'Color': c.color,
-      'Icon': c.icon,
-    }));
-    const wsCat = XLSX.utils.json_to_sheet(catRows);
-    wsCat['!cols'] = [{ wch: 25 }, { wch: 25 }, { wch: 10 }, { wch: 8 }, { wch: 12 }];
-    XLSX.utils.book_append_sheet(wb, wsCat, 'Categories');
-
-    // اكتب الـ Excel كـ buffer
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
     return new NextResponse(buf, {
@@ -98,7 +75,15 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST /api/excel/import - يستورد ملف Excel (FormData)
+/**
+ * POST /api/excel?action=import  (FormData: file)
+ * Smart Money Manager importer:
+ *  - Detects columns: Date / Account / Category / Note / SAR / Income/Expense / Currency / Description
+ *  - Auto-creates accounts & categories
+ *  - Handles 3 types: Income / Expense / Transfer-Out
+ *  - Handles datetime Date objects and DD/MM/YYYY strings
+ *  - Handles negative amounts (refunds)
+ */
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
@@ -108,145 +93,234 @@ export async function POST(req: NextRequest) {
     }
 
     const buf = await file.arrayBuffer();
-    const wb = XLSX.read(Buffer.from(buf), { type: 'buffer' });
+    const wb = XLSX.read(Buffer.from(buf), { type: 'buffer', cellDates: true });
 
-    // حاول نلاقي ورقة المعاملات
+    // Find sheet (Money Manager or first one)
     const wsName = wb.SheetNames.find(n =>
-      /transaction|معامل|movement/i.test(n)
+      /money|manager|transaction|معامل/i.test(n)
     ) || wb.SheetNames[0];
     const ws = wb.Sheets[wsName];
-    const rows = XLSX.utils.sheet_to_json<any>(ws);
+    const rows = XLSX.utils.sheet_to_json<any>(ws, { defval: '' });
 
     if (rows.length === 0) {
       return NextResponse.json({ error: 'No data found in the file' }, { status: 400 });
     }
 
-    // خد الحسابات والفئات الموجودة
-    const existingAccounts = await db.account.findMany();
-    const existingCategories = await db.category.findMany();
+    const keys = Object.keys(rows[0]);
+    console.log('Excel columns detected:', keys);
 
-    // Map بالاسم (عربي + إنجليزي)
-    const accByArName = new Map(existingAccounts.map(a => [a.name, a]));
-    const catByArName = new Map(existingCategories.map(c => [c.nameAr, c]));
-    const catByEnName = new Map(existingCategories.map(c => [c.nameEn, c]));
-
-    // إنشاء حسابات وفئات مش موجودة تلقائياً
-    const ensureAccount = async (name: string, type?: string, currency?: string) => {
-      if (!name) return null;
-      const existing = accByArName.get(name);
-      if (existing) return existing;
-      const created = await db.account.create({
-        data: {
-          name,
-          type: (type as any) || 'CASH',
-          currency: (currency as any) || 'EGP',
-          balance: 0,
-          color: '#2563EB',
-          icon: 'wallet',
-        },
-      });
-      accByArName.set(name, created);
-      return created;
-    };
-
-    const ensureCategory = async (
-      nameAr: string,
-      nameEn: string,
-      type: string,
-      color = '#10B981'
-    ) => {
-      const existing = catByArName.get(nameAr) || catByEnName.get(nameEn);
-      if (existing) return existing;
-      const created = await db.category.create({
-        data: {
-          nameAr: nameAr || nameEn,
-          nameEn: nameEn || nameAr,
-          type: type as any,
-          color,
-          icon: type === 'INCOME' ? 'banknote' : 'tag',
-        },
-      });
-      catByArName.set(created.nameAr, created);
-      catByEnName.set(created.nameEn, created);
-      return created;
-    };
-
-    // أنواع المفاتيح المتوقعة من Money Manager
-    // Money Manager columns عادة: Date / Type / Amount / Category / Account / Note
-    // أو Arabic: التاريخ / النوع / المبلغ / الفئة / الحساب / ملاحظة
-    const keys = rows[0] ? Object.keys(rows[0]) : [];
-
-    // mapping أسماء الأعمدة الممكنة
+    // Smart column finder - matches Money Manager format
     const findKey = (patterns: string[]): string | undefined => {
       for (const p of patterns) {
-        const k = keys.find(k => k.toLowerCase().includes(p.toLowerCase()));
+        const k = keys.find(k => {
+          const kl = k.toLowerCase().trim();
+          return kl === p.toLowerCase() || kl.includes(p.toLowerCase());
+        });
         if (k) return k;
       }
       return undefined;
     };
 
     const dateKey = findKey(['date', 'تاريخ', 'التاريخ']);
-    const typeKey = findKey(['type', 'نوع', 'النوع']);
-    const amountKey = findKey(['amount', 'مبلغ', 'المبلغ', 'value']);
+    const accountKey = findKey(['account', 'حساب', 'الحساب']);
     const catKey = findKey(['category', 'فئة', 'الفئة', 'تصنيف']);
-    const catEnKey = findKey(['category (en)', 'category en', 'فئة (en)']);
-    const accKey = findKey(['account', 'حساب', 'الحساب']);
-    const accTypeKey = findKey(['account type', 'نوع الحساب']);
+    const noteKey = findKey(['note', 'ملاحظة', 'ملاحظات', 'وصف', 'description', 'تفاصيل']);
+    const descKey = findKey(['description', 'تفاصيل', 'بيان']);
+    const typeKey = findKey(['income/expense', 'income/expense', 'نوع', 'النوع', 'type']);
+    const amountKey = findKey(['sar', 'amount', 'مبلغ', 'المبلغ', 'value']);
     const currencyKey = findKey(['currency', 'عملة', 'العملة']);
-    const noteKey = findKey(['note', 'ملاحظة', 'وصف', 'description', 'تفاصيل']);
+
+    console.log('Mapped columns:', { dateKey, accountKey, catKey, noteKey, typeKey, amountKey, currencyKey });
+
+    // Pre-load existing data
+    const existingAccounts = await db.account.findMany();
+    const existingCategories = await db.category.findMany();
+
+    const accByArName = new Map(existingAccounts.map(a => [a.name.toLowerCase(), a]));
+    const catByKey = new Map<string, any>([]);
+    existingCategories.forEach(c => {
+      catByKey.set(`${c.type}:${c.nameAr.toLowerCase()}`, c);
+      catByKey.set(`${c.type}:${c.nameEn.toLowerCase()}`, c);
+    });
+
+    // Smart category type detector
+    // Known income sources from Money Manager
+    const INCOME_KEYWORDS = [
+      'salary', 'راتب', 'house', 'بدل سكن', 'بدل', 'bonus', 'بونص',
+      'rewards', 'مكافئه', 'مكافأة', 'مكافئة', 'mars', 'marsol',
+      'income', 'دخل', 'ربح', 'ارباح'
+    ];
+
+    const isIncomeCategory = (catName: string, rowType: string): boolean => {
+      const lower = catName.toLowerCase();
+      // If row type says Income, it's income
+      if (rowType === 'income') return true;
+      // If category name matches income keywords
+      if (INCOME_KEYWORDS.some(kw => lower.includes(kw.toLowerCase()))) return true;
+      // If amount is negative AND type is Expense, it's likely a refund (income)
+      return false;
+    };
+
+    const ensureAccount = async (name: string, currency: string = 'SAR'): Promise<any> => {
+      if (!name) return null;
+      const key = name.toLowerCase();
+      const existing = accByArName.get(key);
+      if (existing) return existing;
+
+      // Pick account type based on name (Money Manager naming convention)
+      let type = 'BANK';
+      let icon = 'landmark';
+      if (/cash|كاش|نقدي/i.test(name)) { type = 'CASH'; icon = 'wallet'; }
+      else if (/visa|فيزا|card|بطاقة/i.test(name)) { type = 'CARD'; icon = 'credit-card'; }
+      else if (/urpay|urpa y|محفظة|stc/i.test(name)) { type = 'E_WALLET'; icon = 'smartphone'; }
+      else if (/gold|ذهب|دهب/i.test(name)) { type = 'SAVINGS'; icon = 'gem'; }
+      else if (/thndr|ثاندر|binance|كريبتو|crypto|استثمار/i.test(name)) { type = 'SAVINGS'; icon = 'trending-up'; }
+      else if (/alex home|منزل|عقار/i.test(name)) { type = 'SAVINGS'; icon = 'home'; }
+
+      // Currency normalization
+      const cur = (currency || 'SAR').toUpperCase() as Currency;
+      const validCur: Currency = ['EGP', 'SAR', 'USD', 'EUR', 'AED'].includes(cur) ? cur : 'SAR';
+
+      const created = await db.account.create({
+        data: {
+          name,
+          type: type as any,
+          currency: validCur,
+          balance: 0,
+          color: '#2563EB',
+          icon,
+        },
+      });
+      accByArName.set(key, created);
+      return created;
+    };
+
+    const ensureCategory = async (
+      nameAr: string,
+      rowType: string,
+      amount: number
+    ): Promise<any> => {
+      if (!nameAr || nameAr === 'None' || nameAr === '*') return null;
+      const isIncome = isIncomeCategory(nameAr, rowType) ||
+        (rowType === 'expense' && amount < 0);  // negative expense = refund = income
+      const type = isIncome ? 'INCOME' : 'EXPENSE';
+      const key = `${type}:${nameAr.toLowerCase()}`;
+      const existing = catByKey.get(key);
+      if (existing) return existing;
+
+      // Try to find an English equivalent
+      const nameEn = guessEnglishName(nameAr);
+
+      // Pick icon & color based on category name
+      const { icon, color } = pickCategoryStyle(nameAr, type);
+
+      const created = await db.category.create({
+        data: {
+          nameAr,
+          nameEn,
+          type: type as any,
+          color,
+          icon,
+        },
+      });
+      catByKey.set(`${type}:${created.nameAr.toLowerCase()}`, created);
+      catByKey.set(`${type}:${created.nameEn.toLowerCase()}`, created);
+      return created;
+    };
 
     let imported = 0;
+    let skipped = 0;
     const errors: string[] = [];
 
     for (const row of rows) {
       try {
-        const dateStr = dateKey ? String(row[dateKey] || '') : '';
-        const typeStr = (typeKey ? String(row[typeKey] || '').toUpperCase() : 'EXPENSE') as 'EXPENSE' | 'INCOME';
-        const amount = amountKey ? parseFloat(String(row[amountKey] || '0')) : 0;
-        const catName = catKey ? String(row[catKey] || '') : '';
-        const catEnName = catEnKey ? String(row[catEnKey] || catName) : catName;
-        const accName = accKey ? String(row[accKey] || '') : '';
-        const accType = accTypeKey ? String(row[accTypeKey] || 'CASH').toUpperCase() : 'CASH';
-        const currency = (currencyKey ? String(row[currencyKey] || 'EGP') : 'EGP').toUpperCase();
-        const note = noteKey ? String(row[noteKey] || '') : '';
+        // Date parsing - xlsx library returns Date if cellDates:true, otherwise string
+        const dateVal = dateKey ? row[dateKey] : '';
+        let date: Date;
+        if (dateVal instanceof Date) {
+          date = dateVal;
+        } else if (typeof dateVal === 'number') {
+          // Excel serial date
+          const utcDays = Math.floor(dateVal - 25569);
+          date = new Date(utcDays * 86400 * 1000);
+        } else if (typeof dateVal === 'string') {
+          // Try DD/MM/YYYY or YYYY-MM-DD
+          const str = dateVal.trim();
+          if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+            const [dd, mm, yyyy] = str.split('/');
+            date = new Date(`${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`);
+          } else {
+            date = new Date(str);
+          }
+        } else {
+          date = new Date();
+        }
+        if (isNaN(date.getTime())) date = new Date();
 
-        if (!dateStr || !amount || !accName) {
-          errors.push(`Row skipped: missing required field(s)`);
+        // Account
+        const accName = accountKey ? String(row[accountKey] || '').trim() : '';
+        if (!accName) { skipped++; continue; }
+
+        // Category (could be the destination account for Transfer-Out)
+        const catName = catKey ? String(row[catKey] || '').trim() : '';
+
+        // Type
+        const rowType = (typeKey ? String(row[typeKey] || 'Expense') : 'Expense').toLowerCase().trim();
+
+        // Amount - try SAR column first, fall back to Amount
+        let amount = 0;
+        if (amountKey && row[amountKey] !== undefined && row[amountKey] !== '') {
+          amount = parseFloat(String(row[amountKey])) || 0;
+        }
+        const absAmount = Math.abs(amount);
+        if (!absAmount) {
+          skipped++;
           continue;
         }
 
-        // parse date
-        let date: Date;
-        if (typeof row[dateKey!] === 'number') {
-          // Excel serial date
-          const serial = row[dateKey!];
-          const utcDays = Math.floor(serial - 25569);
-          const utcValue = utcDays * 86400;
-          date = new Date(utcValue * 1000);
+        // Currency
+        let currencyStr = currencyKey ? String(row[currencyKey] || 'SAR') : 'SAR';
+        currencyStr = currencyStr.toUpperCase().trim();
+        const validCur: Currency = ['EGP', 'SAR', 'USD', 'EUR', 'AED'].includes(currencyStr as any) ? currencyStr as Currency : 'SAR';
+
+        // Determine transaction type
+        let txType: 'EXPENSE' | 'INCOME';
+        let categoryName = catName;
+        if (rowType === 'income') {
+          txType = 'INCOME';
+        } else if (rowType === 'transfer-out' || rowType === 'transfer out' || rowType === 'transfer') {
+          // Money Manager transfer: source = Account, destination = Category
+          // We'll record this as an EXPENSE from source account, and put destination in note
+          txType = 'EXPENSE';
+          categoryName = 'تحويلات';  // Special category for transfers
         } else {
-          date = new Date(dateStr);
-          if (isNaN(date.getTime())) {
-            date = new Date();
-          }
+          txType = 'EXPENSE';
+          // Negative expense means a refund (income)
+          if (amount < 0) txType = 'INCOME';
         }
 
-        // determine type (default EXPENSE if not specified or invalid)
-        const txType: 'EXPENSE' | 'INCOME' = typeStr === 'INCOME' ? 'INCOME' : 'EXPENSE';
+        if (!categoryName) {
+          categoryName = txType === 'INCOME' ? 'دخل إضافي' : 'مصروفات أخرى';
+        }
 
-        const account = await ensureAccount(accName, accType, currency);
-        if (!account) continue;
+        // Note - combine Note + Description
+        const noteText = [
+          noteKey ? String(row[noteKey] || '').trim() : '',
+          descKey ? String(row[descKey] || '').trim() : '',
+        ].filter(Boolean).join(' • ');
+        const finalNote = rowType === 'transfer-out' && catName
+          ? `${noteText} → ${catName}`.trim()
+          : noteText;
 
-        // category
-        const category = await ensureCategory(
-          catName || (txType === 'INCOME' ? 'دخل إضافي' : 'مصروف آخر'),
-          catEnName || (txType === 'INCOME' ? 'Other Income' : 'Other Expense'),
-          txType
-        );
+        // Ensure account & category
+        const account = await ensureAccount(accName, currencyStr);
+        if (!account) { skipped++; continue; }
 
-        if (!category) continue;
+        const category = await ensureCategory(categoryName, rowType, amount);
+        if (!category) { skipped++; continue; }
 
-        // update account balance
-        const delta = txType === 'INCOME' ? amount : -amount;
+        // Update account balance (with currency conversion if needed)
+        const delta = txType === 'INCOME' ? absAmount : -absAmount;
         await db.account.update({
           where: { id: account.id },
           data: { balance: { increment: delta } },
@@ -255,29 +329,91 @@ export async function POST(req: NextRequest) {
         await db.transaction.create({
           data: {
             type: txType,
-            amount,
-            currency: currency as any,
+            amount: absAmount,
+            currency: validCur,
             accountId: account.id,
             categoryId: category.id,
             date,
-            note: note || null,
+            note: finalNote || null,
           },
         });
 
         imported++;
       } catch (e: any) {
         errors.push(`Row error: ${e.message}`);
+        if (errors.length > 20) break;
       }
     }
 
     return NextResponse.json({
       success: true,
       imported,
+      skipped,
       errors: errors.slice(0, 10),
-      message: `Imported ${imported} transactions${errors.length ? `, ${errors.length} errors` : ''}`,
+      message: `✅ Imported ${imported} transactions${skipped ? `, skipped ${skipped}` : ''}${errors.length ? `, ${errors.length} errors` : ''}`,
     });
   } catch (err: any) {
     console.error('Excel import error:', err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
+}
+
+/** Helper: guess English name from Arabic category name */
+function guessEnglishName(arName: string): string {
+  const map: Record<string, string> = {
+    'طعام': 'Food',
+    'بنزين': 'Fuel',
+    'صيانه السياره': 'Car Maintenance',
+    'صيانه السيارة': 'Car Maintenance',
+    'هاتف': 'Phone',
+    'تبرع': 'Donation',
+    'ايجار سكن': 'Rent',
+    'اخري': 'Other',
+    'الاستقدام': 'Family Visa',
+    'تامين سياره': 'Car Insurance',
+    'اولاد': 'Kids',
+    'هدايا': 'Gifts',
+    'صحه': 'Health',
+    'صحه ': 'Health',
+    'مصاريف ال زياره ': 'Visit Expenses',
+    'مصاريف ال زياره': 'Visit Expenses',
+    'جمال': 'Beauty',
+    'ملابس': 'Clothes',
+    'قسط سياره': 'Car Installment',
+    'تحويلات': 'Transfers',
+    'salary': 'Salary',
+    'house': 'Housing Allowance',
+    'Bonus': 'Bonus',
+    'rewards': 'Rewards',
+    'mars': 'Marsol',
+  };
+  return map[arName] || arName;
+}
+
+/** Helper: pick icon & color based on category name */
+function pickCategoryStyle(name: string, type: string): { icon: string; color: string } {
+  const lower = name.toLowerCase();
+  if (type === 'INCOME') {
+    if (lower.includes('salary') || lower.includes('راتب')) return { icon: 'banknote', color: '#10B981' };
+    if (lower.includes('house') || lower.includes('سكن')) return { icon: 'home', color: '#22C55E' };
+    if (lower.includes('bonus') || lower.includes('بونص')) return { icon: 'gift', color: '#16A34A' };
+    if (lower.includes('reward') || lower.includes('مكافئ')) return { icon: 'award', color: '#15803D' };
+    return { icon: 'trending-up', color: '#10B981' };
+  }
+  // Expense categories
+  if (lower.includes('طعام') || lower.includes('food')) return { icon: 'utensils', color: '#F59E0B' };
+  if (lower.includes('بنزين') || lower.includes('fuel')) return { icon: 'fuel', color: '#3B82F6' };
+  if (lower.includes('صيان') || lower.includes('سياره')) return { icon: 'car', color: '#EF4444' };
+  if (lower.includes('هاتف') || lower.includes('phone')) return { icon: 'smartphone', color: '#8B5CF6' };
+  if (lower.includes('تبرع') || lower.includes('donation')) return { icon: 'heart', color: '#EC4899' };
+  if (lower.includes('ايجار') || lower.includes('rent')) return { icon: 'home', color: '#06B6D4' };
+  if (lower.includes('اولاد') || lower.includes('kids')) return { icon: 'baby', color: '#A855F7' };
+  if (lower.includes('هدايا') || lower.includes('gift')) return { icon: 'gift', color: '#14B8A6' };
+  if (lower.includes('صحه') || lower.includes('health')) return { icon: 'heart-pulse', color: '#E11D48' };
+  if (lower.includes('جمال') || lower.includes('beauty')) return { icon: 'sparkles', color: '#D946EF' };
+  if (lower.includes('ملابس') || lower.includes('clothes')) return { icon: 'tshirt', color: '#0EA5E9' };
+  if (lower.includes('تامين') || lower.includes('insurance')) return { icon: 'shield', color: '#6366F1' };
+  if (lower.includes('استقدام') || lower.includes('visa')) return { icon: 'plane', color: '#F97316' };
+  if (lower.includes('تحويل')) return { icon: 'arrow-right-left', color: '#64748B' };
+  return { icon: 'tag', color: '#64748B' };
 }
