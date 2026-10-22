@@ -1,7 +1,7 @@
 {
   "filename": "MyWallet.apk",
-  "version": "1.0.0",
-  "versionCode": 1,
+  "version": "1.0.8",
+  "versionCode": 8,
   "size": 5669666,
   "sizeMB": "5.5 MB",
   "package": "com.mywallet.app",
@@ -9,6 +9,14 @@
   "minSdk": 24,
   "targetSdk": 34,
   "supportedAndroid": "Android 7.0+",
-  "buildDate": "2026-10-21",
-  "url": "/MyWallet.apk"
+  "buildDate": "2026-10-22",
+  "url": "/MyWallet.apk",
+  "changes": [
+    "شاشة حسابات مجمعة حسب النوع (كاش/بنوك/محافظ/بطاقات/توفير/استثمار/خارجية/قروض)",
+    "ملخص أصول/خصوم/صافي في أعلى شاشة الحسابات",
+    "تحويل تلقائي لرصيد كل حساب للعملة الأساسية + الرصيد الأصلي",
+    "شاشة تقارير محسّنة بـ Pie Chart + Legend بنسب مئوية",
+    "ملخص شهري في شاشة المعاملات (دخل/مصروف/صافي)",
+    "8 أنواع حسابات: CASH, BANK, E_WALLET, CARD, SAVINGS, INVESTMENT, LOAN, EXTERNAL"
+  ]
 }

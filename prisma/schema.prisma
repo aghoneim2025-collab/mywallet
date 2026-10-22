@@ -29,11 +29,14 @@ model Account {
 }
 
 enum AccountType {
-  CASH        // نقدي
-  BANK        // بنك
-  E_WALLET    // محفظة إلكترونية
-  CARD        // بطاقة ائتمان
-  SAVINGS     // حساب توفير
+  CASH         // نقدي
+  BANK         // بنك
+  E_WALLET     // محفظة إلكترونية
+  CARD         // بطاقة ائتمان
+  SAVINGS      // حساب توفير
+  INVESTMENT   // استثمار (ذهب، كريبتو، أسهم، صناديق)
+  LOAN         // قرض / سلفة
+  EXTERNAL     // حساب خارجي (متابعة فقط - زي عقار، حساب شخص تاني)
 }
 
 enum Currency {

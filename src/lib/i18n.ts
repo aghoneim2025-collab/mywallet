@@ -43,6 +43,9 @@ export const translations = {
 
     // dashboard
     totalBalance: 'إجمالي الرصيد',
+    assets: 'الأصول',
+    liabilities: 'الخصوم',
+    net: 'الصافي',
     monthlyIncome: 'الدخل الشهري',
     monthlyExpenses: 'المصروفات الشهرية',
     monthlyBalance: 'صافي الشهر',
@@ -185,6 +188,9 @@ export const translations = {
     required: 'Required',
 
     totalBalance: 'Total Balance',
+    assets: 'Assets',
+    liabilities: 'Liabilities',
+    net: 'Net',
     monthlyIncome: 'Monthly Income',
     monthlyExpenses: 'Monthly Expenses',
     monthlyBalance: 'Net This Month',

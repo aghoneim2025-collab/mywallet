@@ -8,7 +8,7 @@ import { Search, Filter, Trash2, Pencil } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
-import { formatMoney } from '@/lib/currency';
+import { formatMoney, convert, type Currency } from '@/lib/currency';
 import { cn } from '@/lib/utils';
 import { getIcon } from '@/lib/icons';
 import { useToast } from '@/hooks/use-toast';
@@ -142,6 +142,29 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
           </SelectContent>
         </Select>
       </div>
+
+      {/* Monthly summary card */}
+      {(() => {
+        const totalInc = filtered.filter(t => t.type === 'INCOME').reduce((s, t) => s + convert(t.amount, t.currency as Currency, baseCurrency as Currency), 0);
+        const totalExp = filtered.filter(t => t.type === 'EXPENSE').reduce((s, t) => s + convert(t.amount, t.currency as Currency, baseCurrency as Currency), 0);
+        const net = totalInc - totalExp;
+        return (
+          <div className="grid grid-cols-3 gap-2">
+            <Card className="p-3 bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900 text-center">
+              <p className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-400">{t('income')}</p>
+              <p className="text-sm font-bold text-emerald-700 dark:text-emerald-300 truncate">{fmt(totalInc, baseCurrency)}</p>
+            </Card>
+            <Card className="p-3 bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-900 text-center">
+              <p className="text-[10px] font-semibold text-red-700 dark:text-red-400">{t('expense')}</p>
+              <p className="text-sm font-bold text-red-700 dark:text-red-300 truncate">{fmt(totalExp, baseCurrency)}</p>
+            </Card>
+            <Card className="p-3 bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-900 text-center">
+              <p className="text-[10px] font-semibold text-blue-700 dark:text-blue-400">{lang === 'ar' ? 'الصافي' : 'Net'}</p>
+              <p className={cn("text-sm font-bold truncate", net >= 0 ? "text-blue-700 dark:text-blue-300" : "text-red-700 dark:text-red-300")}>{fmt(net, baseCurrency)}</p>
+            </Card>
+          </div>
+        );
+      })()}
 
       {/* List */}
       {grouped.length === 0 ? (

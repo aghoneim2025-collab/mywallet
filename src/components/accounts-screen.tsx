@@ -8,13 +8,15 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Switch } from '@/components/ui/switch';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Plus, Pencil, Wallet, Trash2 } from 'lucide-react';
+import { Plus, Pencil, Trash2, TrendingUp, TrendingDown, Wallet } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
-import { formatMoney, type Currency } from '@/lib/currency';
+import { convert, formatMoney, type Currency } from '@/lib/currency';
+import { DynamicIcon } from '@/lib/icons';
 import { getIcon } from '@/lib/icons';
 import { toast } from 'sonner';
+import { cn } from '@/lib/utils';
 
 interface Account {
   id: string;
@@ -27,14 +29,33 @@ interface Account {
   isDefault: boolean;
 }
 
-const ICONS = ['wallet', 'credit-card', 'landmark', 'smartphone', 'piggy-bank', 'banknote'];
-const COLORS = ['#2563EB', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#06B6D4'];
+// Group order and metadata
+const ACCOUNT_GROUPS: { type: string; arLabel: string; enLabel: string; icon: string; isAsset: boolean }[] = [
+  { type: 'CASH', arLabel: 'كاش', enLabel: 'Cash', icon: 'wallet', isAsset: true },
+  { type: 'BANK', arLabel: 'بنوك', enLabel: 'Banks', icon: 'landmark', isAsset: true },
+  { type: 'E_WALLET', arLabel: 'محافظ إلكترونية', enLabel: 'E-Wallets', icon: 'smartphone', isAsset: true },
+  { type: 'CARD', arLabel: 'بطاقات ائتمان', enLabel: 'Cards', icon: 'credit-card', isAsset: true },
+  { type: 'SAVINGS', arLabel: 'حسابات توفير', enLabel: 'Savings', icon: 'piggy-bank', isAsset: true },
+  { type: 'INVESTMENT', arLabel: 'استثمارات', enLabel: 'Investments', icon: 'trending-up', isAsset: true },
+  { type: 'EXTERNAL', arLabel: 'حسابات خارجية', enLabel: 'External', icon: 'external-link', isAsset: true },
+  { type: 'LOAN', arLabel: 'قروض وسلف', enLabel: 'Loans', icon: 'hand-coins', isAsset: false },
+];
+
+const ICONS = ['wallet', 'credit-card', 'landmark', 'smartphone', 'piggy-bank', 'banknote',
+  'trending-up', 'gem', 'bitcoin', 'diamond', 'home', 'car', 'plane', 'gift',
+  'shield', 'briefcase', 'building-2', 'coin', 'dollar-sign', 'euro', 'pound-sterling'];
+const COLORS = ['#2563EB', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#06B6D4',
+  '#EC4899', '#14B8A6', '#F97316', '#84CC16', '#A855F7', '#0EA5E9'];
+
 const TYPES = [
   { value: 'CASH', labelAr: 'نقدي', labelEn: 'Cash' },
   { value: 'BANK', labelAr: 'بنك', labelEn: 'Bank' },
   { value: 'E_WALLET', labelAr: 'محفظة إلكترونية', labelEn: 'E-Wallet' },
   { value: 'CARD', labelAr: 'بطاقة ائتمان', labelEn: 'Credit Card' },
   { value: 'SAVINGS', labelAr: 'حساب توفير', labelEn: 'Savings' },
+  { value: 'INVESTMENT', labelAr: 'استثمار', labelEn: 'Investment' },
+  { value: 'LOAN', labelAr: 'قرض/سلفة', labelEn: 'Loan' },
+  { value: 'EXTERNAL', labelAr: 'حساب خارجي', labelEn: 'External' },
 ];
 
 const CURRENCIES: { value: Currency; label: string }[] = [
@@ -52,33 +73,46 @@ export function AccountsScreen() {
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState<{ open: boolean; data?: Account | null }>({ open: false });
 
-  const fmt = (n: number, cur: string) => formatMoney(n, cur as any, lang);
-
   const load = async () => {
     setLoading(true);
     try {
       const r = await api<{ data: Account[] }>('/api/accounts');
       setAccounts(r.data);
+    } catch (e: any) {
+      toast.error(e.message);
     } finally { setLoading(false); }
   };
 
   useEffect(() => { load(); }, []);
 
-  const totalBalance = accounts.reduce((s, a) => s + a.balance, 0);
+  // Convert balance to display currency
+  const convertToBase = (balance: number, fromCurrency: string) =>
+    convert(balance, fromCurrency as Currency, baseCurrency);
+
+  // Group accounts
+  const groupedAccounts = ACCOUNT_GROUPS.map(group => ({
+    ...group,
+    accounts: accounts.filter(a => a.type === group.type),
+  })).filter(g => g.accounts.length > 0);
+
+  // Calculate totals
+  const totalAssets = accounts
+    .filter(a => !['LOAN'].includes(a.type))
+    .reduce((s, a) => s + convertToBase(a.balance, a.currency), 0);
+  const totalLiabilities = accounts
+    .filter(a => a.type === 'LOAN' && a.balance < 0)
+    .reduce((s, a) => s + Math.abs(convertToBase(a.balance, a.currency)), 0);
+  const net = totalAssets - totalLiabilities;
+
+  const fmt = (n: number, cur: Currency = baseCurrency) => formatMoney(n, cur, lang);
 
   const handleSave = async (data: any) => {
     try {
       if (data.id) {
-        await api(`/api/accounts/${data.id}`, {
-          method: 'PUT',
-          body: JSON.stringify(data),
-        });
+        await api(`/api/accounts/${data.id}`, { method: 'PUT', body: JSON.stringify(data) });
         toast.success(lang === 'ar' ? 'تم التعديل' : 'Updated');
       } else {
-        await api('/api/accounts', {
-          method: 'POST',
-          body: JSON.stringify(data),
-        });
+        await api('/api/accounts', { method: 'POST', body: JSON.stringify(data) });
         toast.success(lang === 'ar' ? 'تم الإضافة' : 'Created');
       }
       setModal({ open: false });
@@ -100,61 +134,154 @@ export function AccountsScreen() {
   };
 
   if (loading) {
-    return <div className="p-4 space-y-3">
-      {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-20 w-full rounded-xl" />)}
-    </div>;
+    return (
+      <div className="p-4 space-y-3">
+        <Skeleton className="h-32 w-full rounded-2xl" />
+        {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-20 w-full rounded-xl" />)}
+      </div>
+    );
   }
 
   return (
-    <div className="p-4 space-y-5">
+    <div className="p-4 space-y-5 pb-4">
       <header className="flex justify-between items-center">
         <div>
           <h1 className="text-2xl font-bold">{t('accounts')}</h1>
-          <p className="text-sm text-slate-500">{accounts.length} {t('accounts')}</p>
+          <p className="text-xs text-slate-500">{accounts.length} {t('accounts')}</p>
         </div>
-        <Button onClick={() => setModal({ open: true })} size="sm" className="rounded-full">
+        <Button onClick={() => setModal({ open: true })} size="sm" className="rounded-full bg-blue-600 hover:bg-blue-700">
           <Plus className="w-4 h-4" /> {t('add')}
         </Button>
       </header>
 
-      {/* Total */}
-      <Card className="p-5 bg-gradient-to-br from-blue-600 to-blue-700 text-white border-0">
-        <p className="text-sm text-blue-100">{t('totalBalance')}</p>
-        <p className="text-3xl font-bold mt-1">{fmt(totalBalance, baseCurrency)}</p>
-      </Card>
-
-      {/* Accounts list */}
-      <div className="space-y-3">
-        {accounts.map(a => {
-          const Icon = getIcon(a.icon);
-          const type = TYPES.find(t => t.value === a.type);
-          return (
-            <Card key={a.id} className="p-4 flex items-center gap-3">
-              <div className="w-12 h-12 rounded-xl flex items-center justify-center text-white shrink-0" style={{ background: a.color }}>
-                <Icon className="w-6 h-6" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <p className="font-semibold text-sm">{a.name}</p>
-                  {a.isDefault && <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">{t('default')}</span>}
-                </div>
-                <p className="text-xs text-slate-400">{type ? (lang === 'ar' ? type.labelAr : type.labelEn) : a.type} • {a.currency}</p>
-              </div>
-              <div className="text-end shrink-0">
-                <p className="font-bold text-sm">{fmt(a.balance, a.currency)}</p>
-              </div>
-              <div className="flex gap-1 shrink-0">
-                <button onClick={() => setModal({ open: true, data: a })} className="p-1.5 text-slate-400 hover:text-blue-600">
-                  <Pencil className="w-4 h-4" />
-                </button>
-                <button onClick={() => handleDelete(a.id)} className="p-1.5 text-slate-400 hover:text-red-500">
-                  <Trash2 className="w-4 h-4" />
-                </button>
-              </div>
-            </Card>
-          );
-        })}
+      {/* Summary Card: Assets / Liabilities / Net */}
+      <div className="grid grid-cols-3 gap-2">
+        <Card className="p-3 bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900">
+          <div className="flex items-center gap-1.5 mb-1">
+            <TrendingUp className="w-3.5 h-3.5 text-emerald-600" />
+            <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-400">
+              {lang === 'ar' ? 'الأصول' : 'Assets'}
+            </span>
+          </div>
+          <p className="text-sm font-bold text-emerald-700 dark:text-emerald-300 truncate">{fmt(totalAssets)}</p>
+        </Card>
+        <Card className="p-3 bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-900">
+          <div className="flex items-center gap-1.5 mb-1">
+            <TrendingDown className="w-3.5 h-3.5 text-red-600" />
+            <span className="text-[10px] font-semibold text-red-700 dark:text-red-400">
+              {lang === 'ar' ? 'الخصوم' : 'Liabilities'}
+            </span>
+          </div>
+          <p className="text-sm font-bold text-red-700 dark:text-red-300 truncate">{fmt(totalLiabilities)}</p>
+        </Card>
+        <Card className="p-3 bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-900">
+          <div className="flex items-center gap-1.5 mb-1">
+            <Wallet className="w-3.5 h-3.5 text-blue-600" />
+            <span className="text-[10px] font-semibold text-blue-700 dark:text-blue-400">
+              {lang === 'ar' ? 'الصافي' : 'Net'}
+            </span>
+          </div>
+          <p className={cn("text-sm font-bold truncate", net >= 0 ? "text-blue-700 dark:text-blue-300" : "text-red-700 dark:text-red-300")}>
+            {fmt(net)}
+          </p>
+        </Card>
       </div>
+
+      {/* Grouped accounts */}
+      {groupedAccounts.map(group => {
+        const groupTotal = group.accounts.reduce(
+          (s, a) => s + convertToBase(a.balance, a.currency),
+          0
+        );
+        const GroupIcon = getIcon(group.icon);
+        return (
+          <div key={group.type} className="space-y-2">
+            {/* Group header */}
+            <div className="flex items-center justify-between px-1">
+              <div className="flex items-center gap-2">
+                <div className={cn(
+                  "w-7 h-7 rounded-lg flex items-center justify-center text-white",
+                  group.isAsset ? "bg-blue-600" : "bg-red-600"
+                )}>
+                  <GroupIcon className="w-4 h-4" />
+                </div>
+                <h3 className="text-sm font-semibold">{lang === 'ar' ? group.arLabel : group.enLabel}</h3>
+                <span className="text-xs text-slate-400">({group.accounts.length})</span>
+              </div>
+              <span className={cn(
+                "text-xs font-semibold",
+                groupTotal >= 0 ? "text-slate-600 dark:text-slate-300" : "text-red-600 dark:text-red-400"
+              )}>
+                {fmt(groupTotal)}
+              </span>
+            </div>
+
+            {/* Accounts in this group */}
+            <Card className="divide-y divide-slate-100 dark:divide-slate-800 overflow-hidden">
+              {group.accounts.map(a => {
+                const Icon = getIcon(a.icon);
+                const isNegative = a.balance < 0;
+                return (
+                  <div key={a.id} className="flex items-center gap-3 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
+                    <button
+                      onClick={() => setModal({ open: true, data: a })}
+                      className="flex items-center gap-3 flex-1 min-w-0 text-start"
+                    >
+                      <div
+                        className="w-10 h-10 rounded-xl flex items-center justify-center text-white shrink-0"
+                        style={{ background: a.color }}
+                      >
+                        <Icon className="w-5 h-5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <p className="font-medium text-sm truncate">{a.name}</p>
+                          {a.isDefault && (
+                            <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full shrink-0">
+                              {t('default')}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-400">
+                          {a.currency} • {TYPES.find(t => t.value === a.type)?.[lang === 'ar' ? 'labelAr' : 'labelEn']}
+                        </p>
+                      </div>
+                    </button>
+                    <div className="text-end shrink-0">
+                      <p className={cn(
+                        "font-bold text-sm",
+                        isNegative ? "text-red-600 dark:text-red-400" : "text-slate-900 dark:text-slate-100"
+                      )}>
+                        {formatMoney(a.balance, a.currency as Currency, lang)}
+                      </p>
+                      {a.currency !== baseCurrency && (
+                        <p className="text-[10px] text-slate-400">≈ {fmt(convertToBase(a.balance, a.currency))}</p>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => handleDelete(a.id)}
+                      className="p-1.5 text-slate-300 hover:text-red-500 shrink-0"
+                      aria-label={t('delete')}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                );
+              })}
+            </Card>
+          </div>
+        );
+      })}
+
+      {/* Empty state */}
+      {accounts.length === 0 && (
+        <Card className="p-8 text-center">
+          <Wallet className="w-12 h-12 mx-auto text-slate-300 mb-2" />
+          <p className="text-sm text-slate-500">
+            {lang === 'ar' ? 'لا توجد حسابات بعد. اضغط زر + لإضافة حساب جديد.' : 'No accounts yet. Tap + to add one.'}
+          </p>
+        </Card>
+      )}
 
       <AccountModal
         key={modal.data?.id || 'new'}
@@ -168,10 +295,7 @@ export function AccountsScreen() {
 }
 
 function AccountModal({
-  open,
-  onOpenChange,
-  initial,
-  onSave,
+  open, onOpenChange, initial, onSave,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
@@ -179,17 +303,19 @@ function AccountModal({
   onSave: (data: any) => void;
 }) {
   const { t, lang } = useT();
-  // initialized once per mount (component remounts via key when `initial` changes)
   const [name, setName] = useState(initial?.name || '');
   const [type, setType] = useState(initial?.type || 'CASH');
-  const [currency, setCurrency] = useState<Currency>(initial ? (initial.currency as Currency) : 'EGP');
+  const [currency, setCurrency] = useState<Currency>(initial?.currency as Currency || 'EGP');
   const [balance, setBalance] = useState(initial ? initial.balance.toString() : '');
   const [color, setColor] = useState(initial?.color || COLORS[0]);
-  const [icon, setIcon] = useState(initial?.icon || ICONS[0]);
+  const [icon, setIcon] = useState(initial?.icon || 'wallet');
   const [isDefault, setIsDefault] = useState(initial?.isDefault || false);
 
   const submit = () => {
-    if (!name || !type || !currency) return;
+    if (!name || !type || !currency) {
+      toast.error(lang === 'ar' ? 'أدخل الاسم والنوع والعملة' : 'Enter name, type, currency');
+      return;
+    }
     onSave({
       id: initial?.id,
       name, type, currency,
@@ -205,20 +331,30 @@ function AccountModal({
           <DialogTitle>{initial ? t('editAccount') : t('addAccount')}</DialogTitle>
         </DialogHeader>
         <div className="space-y-3 max-h-[70vh] overflow-y-auto">
+          <div className="flex justify-center py-2">
+            <div
+              className="w-16 h-16 rounded-2xl flex items-center justify-center text-white"
+              style={{ background: color }}
+            >
+              <DynamicIcon name={icon} className="w-7 h-7" />
+            </div>
+          </div>
+
           <div className="space-y-1.5">
             <Label>{t('account')}</Label>
             <Input value={name} onChange={e => setName(e.target.value)} placeholder="..." />
           </div>
-          <div className="space-y-1.5">
-            <Label>{t('type')}</Label>
-            <Select value={type} onValueChange={setType}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {TYPES.map(t => <SelectItem key={t.value} value={t.value}>{lang === 'ar' ? t.labelAr : t.labelEn}</SelectItem>)}
-              </SelectContent>
-            </Select>
-          </div>
+
           <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-1.5">
+              <Label>{t('type')}</Label>
+              <Select value={type} onValueChange={setType}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {TYPES.map(t => <SelectItem key={t.value} value={t.value}>{lang === 'ar' ? t.labelAr : t.labelEn}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
             <div className="space-y-1.5">
               <Label>{t('currency')}</Label>
               <Select value={currency} onValueChange={(v: any) => setCurrency(v)}>
@@ -228,35 +364,48 @@ function AccountModal({
                 </SelectContent>
               </Select>
             </div>
-            <div className="space-y-1.5">
-              <Label>{t('balance')}</Label>
-              <Input type="number" inputMode="decimal" value={balance} onChange={e => setBalance(e.target.value)} placeholder="0.00" />
-            </div>
           </div>
+
           <div className="space-y-1.5">
-            <Label>Color</Label>
+            <Label>{t('balance')}</Label>
+            <Input type="number" inputMode="decimal" value={balance} onChange={e => setBalance(e.target.value)} placeholder="0.00" />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>{lang === 'ar' ? 'اللون' : 'Color'}</Label>
             <div className="flex gap-2 flex-wrap">
               {COLORS.map(c => (
                 <button
                   key={c}
                   onClick={() => setColor(c)}
-                  className="w-8 h-8 rounded-full border-2 transition"
-                  style={{ background: c, borderColor: color === c ? '#1e293b' : 'transparent', outline: color === c ? `2px solid ${c}` : 'none' }}
+                  className={cn(
+                    'w-8 h-8 rounded-full border-2 transition',
+                    color === c ? 'border-slate-900 dark:border-white scale-110' : 'border-transparent'
+                  )}
+                  style={{ background: c }}
                 />
               ))}
             </div>
           </div>
+
           <div className="space-y-1.5">
-            <Label>Icon</Label>
-            <div className="flex gap-2 flex-wrap">
+            <Label>{lang === 'ar' ? 'الأيقونة' : 'Icon'}</Label>
+            <div className="grid grid-cols-8 gap-1.5 max-h-44 overflow-y-auto p-1 border border-slate-200 dark:border-slate-800 rounded-lg">
               {ICONS.map(i => {
                 const I = getIcon(i);
+                const sel = icon === i;
                 return (
                   <button
                     key={i}
+                    type="button"
                     onClick={() => setIcon(i)}
-                    className="w-9 h-9 rounded-lg flex items-center justify-center border-2 transition"
-                    style={{ borderColor: icon === i ? color : 'transparent', background: icon === i ? `${color}20` : 'transparent', color }}
+                    className={cn(
+                      'aspect-square rounded-lg flex items-center justify-center transition border-2',
+                      sel
+                        ? 'border-blue-500 bg-blue-50 dark:bg-blue-950'
+                        : 'border-transparent hover:bg-slate-100 dark:hover:bg-slate-800'
+                    )}
+                    style={sel ? { color } : undefined}
                   >
                     <I className="w-4 h-4" />
                   </button>
@@ -264,6 +413,7 @@ function AccountModal({
               })}
             </div>
           </div>
+
           <div className="flex items-center justify-between bg-slate-50 dark:bg-slate-800 p-3 rounded-xl">
             <Label htmlFor="default-toggle" className="cursor-pointer">{t('makeDefault')}</Label>
             <Switch id="default-toggle" checked={isDefault} onCheckedChange={setIsDefault} />
@@ -271,7 +421,7 @@ function AccountModal({
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>{t('cancel')}</Button>
-          <Button onClick={submit}>{t('save')}</Button>
+          <Button onClick={submit} className="bg-blue-600 hover:bg-blue-700">{t('save')}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
