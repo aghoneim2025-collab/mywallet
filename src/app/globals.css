@@ -125,6 +125,61 @@
   }
 }
 
+/* #10: Enhanced Dark Mode */
+.dark {
+  --background: oklch(0.12 0.01 250);
+  --foreground: oklch(0.95 0 0);
+  --card: oklch(0.16 0.01 250);
+  --card-foreground: oklch(0.95 0 0);
+  --popover: oklch(0.16 0.01 250);
+  --popover-foreground: oklch(0.95 0 0);
+  --primary: oklch(0.65 0.18 255);
+  --primary-foreground: oklch(0.98 0 0);
+  --secondary: oklch(0.22 0.01 250);
+  --secondary-foreground: oklch(0.95 0 0);
+  --muted: oklch(0.22 0.01 250);
+  --muted-foreground: oklch(0.65 0.01 250);
+  --accent: oklch(0.22 0.01 250);
+  --accent-foreground: oklch(0.95 0 0);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(1 0 0 / 12%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.55 0.18 255);
+}
+
+/* Dark mode: better contrast for cards */
+.dark .bg-white { background-color: rgb(22 28 45) !important; }
+.dark .bg-slate-50 { background-color: rgb(15 20 35) !important; }
+.dark .bg-slate-100 { background-color: rgb(20 25 40) !important; }
+.dark .border-slate-200 { border-color: rgb(30 35 55) !important; }
+
+/* #14: Swipe to delete animation */
+.swipe-container {
+  position: relative;
+  overflow: hidden;
+}
+.swipe-bg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  background: linear-gradient(90deg, transparent 50%, #EF4444 100%);
+  color: white;
+  padding-inline-end: 1.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.swipe-content {
+  position: relative;
+  background: white;
+  transition: transform 0.2s ease;
+  touch-action: pan-y;
+}
+.dark .swipe-content {
+  background: rgb(22 28 45);
+}
+
 /* تحسين شكل scrollbar على الموبايل */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

@@ -3,14 +3,15 @@ import { useEffect, useState } from 'react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Download, TrendingUp, TrendingDown, Wallet, ChevronRight } from 'lucide-react';
+import { Download, TrendingUp, TrendingDown, Wallet, FileText, ArrowRight } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api, downloadFile } from '@/lib/api';
-import { formatMoney, convert, type Currency } from '@/lib/currency';
+import { formatMoney, convert, compactNumber, type Currency } from '@/lib/currency';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell,
 } from 'recharts';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { getIcon } from '@/lib/icons';
@@ -39,13 +40,28 @@ export function ReportsScreen() {
   const [viewMode, setViewMode] = useState<'monthly' | 'yearly'>('monthly');
   const [year, setYear] = useState(new Date().getFullYear().toString());
   const [yearlyData, setYearlyData] = useState<{ month: string; income: number; expense: number; balance: number }[] | null>(null);
+  const [detailCategoryId, setDetailCategoryId] = useState<string | null>(null);
+  const [lastMonthStat, setLastMonthStat] = useState<Stat | null>(null);
 
   const load = async () => {
     setLoading(true);
     try {
       if (viewMode === 'monthly') {
-        const s = await api<{ data: Stat }>(`/api/stats?month=${month}&baseCurrency=${baseCurrency}`);
+        const [s, lastM] = await Promise.all([
+          api<{ data: Stat }>(`/api/stats?month=${month}&baseCurrency=${baseCurrency}`),
+          // Fetch last month for comparison
+          (async () => {
+            const lastMonthDate = new Date(month + '-01');
+            lastMonthDate.setMonth(lastMonthDate.getMonth() - 1);
+            const lastMonthStr = lastMonthDate.toISOString().slice(0, 7);
+            try {
+              const r = await api<{ data: Stat }>(`/api/stats?month=${lastMonthStr}&baseCurrency=${baseCurrency}`);
+              return r.data;
+            } catch { return null; }
+          })(),
+        ]);
         setStat(s.data);
+        setLastMonthStat(lastM);
       } else {
         // Yearly: fetch 12 months stats in parallel
         const months: { month: string; income: number; expense: number; balance: number }[] = [];
@@ -98,6 +114,45 @@ export function ReportsScreen() {
     try {
       await downloadFile(`/api/excel?action=export&month=${month}`, `mywallet-${month}.xlsx`);
       toast.success(lang === 'ar' ? 'تم تصدير Excel' : 'Excel exported');
+    } catch (e: any) {
+      toast.error(e.message);
+    }
+  };
+
+  // #6: PDF Export
+  const handleExportPDF = async () => {
+    try {
+      const { jsPDF } = await import('jspdf');
+      const autoTable = (await import('jspdf-autotable')).default;
+      const doc = new jsPDF();
+
+      // Title
+      doc.setFontSize(20);
+      doc.text(`MyWallet Report - ${month}`, 14, 20);
+      doc.setFontSize(12);
+      doc.text(`Base Currency: ${baseCurrency}`, 14, 30);
+
+      // Summary
+      doc.text(`Income:    ${fmt(stat.totalIncome)}`, 14, 45);
+      doc.text(`Expense:   ${fmt(stat.totalExpense)}`, 14, 52);
+      doc.text(`Balance:   ${fmt(stat.balance)}`, 14, 59);
+
+      // Categories table
+      autoTable(doc, {
+        startY: 70,
+        head: [['Category', 'Count', 'Amount', '%']],
+        body: sortedCategories.map(c => [
+          lang === 'ar' ? c.category.nameAr : c.category.nameEn,
+          String(c.count),
+          fmt(c.total),
+          ((c.total / stat.totalExpense) * 100).toFixed(1) + '%',
+        ]),
+        theme: 'striped',
+        headStyles: { fillColor: [37, 99, 235] },
+      });
+
+      doc.save(`mywallet-report-${month}.pdf`);
+      toast.success(lang === 'ar' ? 'تم تصدير PDF' : 'PDF exported');
     } catch (e: any) {
       toast.error(e.message);
     }
@@ -291,6 +346,61 @@ export function ReportsScreen() {
         </section>
       )}
 
+      {/* #5: Monthly comparison - this month vs last month */}
+      {viewMode === 'monthly' && lastMonthStat && (
+        <section>
+          <h2 className="text-sm font-semibold mb-2">
+            {lang === 'ar' ? 'مقارنة بالشهر الماضي' : 'vs Last Month'}
+          </h2>
+          <Card className="p-3">
+            <div className="grid grid-cols-3 gap-2 text-center">
+              {/* Income comparison */}
+              <div>
+                <p className="text-[10px] text-slate-500">{t('income')}</p>
+                <p className="text-xs font-bold text-emerald-600">{fmt(stat.totalIncome)}</p>
+                {(() => {
+                  const diff = stat.totalIncome - lastMonthStat.totalIncome;
+                  const pct = lastMonthStat.totalIncome > 0 ? (diff / lastMonthStat.totalIncome) * 100 : 0;
+                  return (
+                    <p className={cn('text-[10px] font-medium', diff >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                      {diff >= 0 ? '↑' : '↓'} {Math.abs(pct).toFixed(0)}%
+                    </p>
+                  );
+                })()}
+              </div>
+              {/* Expense comparison */}
+              <div>
+                <p className="text-[10px] text-slate-500">{t('expense')}</p>
+                <p className="text-xs font-bold text-red-600">{fmt(stat.totalExpense)}</p>
+                {(() => {
+                  const diff = stat.totalExpense - lastMonthStat.totalExpense;
+                  const pct = lastMonthStat.totalExpense > 0 ? (diff / lastMonthStat.totalExpense) * 100 : 0;
+                  return (
+                    <p className={cn('text-[10px] font-medium', diff <= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                      {diff <= 0 ? '↓' : '↑'} {Math.abs(pct).toFixed(0)}%
+                    </p>
+                  );
+                })()}
+              </div>
+              {/* Balance comparison */}
+              <div>
+                <p className="text-[10px] text-slate-500">{lang === 'ar' ? 'الصافي' : 'Net'}</p>
+                <p className={cn('text-xs font-bold', stat.balance >= 0 ? 'text-blue-600' : 'text-red-600')}>{fmt(stat.balance)}</p>
+                {(() => {
+                  const diff = stat.balance - lastMonthStat.balance;
+                  const pct = lastMonthStat.balance !== 0 ? (diff / Math.abs(lastMonthStat.balance)) * 100 : 0;
+                  return (
+                    <p className={cn('text-[10px] font-medium', diff >= 0 ? 'text-emerald-600' : 'text-red-600')}>
+                      {diff >= 0 ? '↑' : '↓'} {Math.abs(pct).toFixed(0)}%
+                    </p>
+                  );
+                })()}
+              </div>
+            </div>
+          </Card>
+        </section>
+      )}
+
       {/* Daily trend bar chart - only in monthly mode */}
       {viewMode === 'monthly' && (
       <section>
@@ -387,7 +497,7 @@ export function ReportsScreen() {
               const Icon = getIcon(c.category.icon);
               const pct = stat.totalExpense > 0 ? (c.total / stat.totalExpense) * 100 : 0;
               return (
-                <Card key={i} className="p-3">
+                <Card key={i} className="p-3 cursor-pointer hover:shadow-md transition" onClick={() => setDetailCategoryId(c.category.id)}>
                   <div className="flex items-center gap-3">
                     <div
                       className="w-9 h-9 rounded-full flex items-center justify-center text-white shrink-0"
@@ -421,15 +531,103 @@ export function ReportsScreen() {
       </section>
 
       {/* Export */}
-      <section>
+      <section className="grid grid-cols-2 gap-2">
         <Button
           onClick={handleExportCSV}
           variant="outline"
-          className="w-full h-12 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100"
+          className="h-12 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100"
         >
-          <Download className="w-5 h-5" /> {lang === 'ar' ? 'تصدير Excel لهذا الشهر' : 'Export Excel for this month'}
+          <Download className="w-5 h-5" /> Excel
+        </Button>
+        <Button
+          onClick={handleExportPDF}
+          variant="outline"
+          className="h-12 rounded-xl bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-900 text-red-700 dark:text-red-300 hover:bg-red-100"
+        >
+          <FileText className="w-5 h-5" /> PDF
         </Button>
       </section>
+
+      {/* Category Detail Modal */}
+      {detailCategoryId && (
+        <CategoryDetailModal
+          categoryId={detailCategoryId}
+          month={month}
+          onClose={() => setDetailCategoryId(null)}
+        />
+      )}
     </div>
+  );
+}
+
+/** #4: Category Detail Modal - shows all transactions for a category in a given month */
+function CategoryDetailModal({
+  categoryId, month, onClose,
+}: {
+  categoryId: string;
+  month: string;
+  onClose: () => void;
+}) {
+  const { t, lang } = useT();
+  const baseCurrency = useSettings(s => s.baseCurrency);
+  const [txs, setTxs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const start = `${month}-01`;
+    const end = new Date(start);
+    end.setMonth(end.getMonth() + 1);
+    api<{ data: any[] }>(`/api/transactions?categoryId=${categoryId}&from=${start}&to=${end.toISOString()}&limit=500`)
+      .then(r => setTxs(r.data))
+      .finally(() => setLoading(false));
+  }, [categoryId, month]);
+
+  const fmt = (n: number, cur: any = baseCurrency) => formatMoney(n, cur, lang);
+  const total = txs.reduce((s, t) => s + convert(t.amount, t.currency as Currency, baseCurrency), 0);
+
+  return (
+    <Dialog open={true} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>
+            {txs[0] ? (lang === 'ar' ? txs[0].category.nameAr : txs[0].category.nameEn) : (lang === 'ar' ? 'تفاصيل الفئة' : 'Category Details')}
+          </DialogTitle>
+        </DialogHeader>
+        {loading ? (
+          <Skeleton className="h-40 w-full" />
+        ) : (
+          <>
+            <Card className="p-4 bg-blue-600 text-white border-0">
+              <p className="text-xs text-blue-100">{lang === 'ar' ? 'إجمالي الإنفاق' : 'Total Spending'}</p>
+              <p className="text-2xl font-bold">{fmt(total)}</p>
+              <p className="text-xs text-blue-200 mt-1">{txs.length} {lang === 'ar' ? 'معاملة' : 'transactions'}</p>
+            </Card>
+            <div className="mt-3 space-y-1.5 max-h-72 overflow-y-auto">
+              {txs.map(tx => {
+                const Icon = getIcon(tx.category?.icon || 'tag');
+                const isIncome = tx.type === 'INCOME';
+                return (
+                  <div key={tx.id} className="flex items-center gap-2 p-2 hover:bg-slate-50 dark:hover:bg-slate-800/50 rounded-lg">
+                    <div className="w-8 h-8 rounded-full flex items-center justify-center text-white shrink-0" style={{ background: tx.category?.color || '#64748B' }}>
+                      <Icon className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium truncate">{tx.account?.name}</p>
+                      <p className="text-[10px] text-slate-400 truncate">
+                        {new Date(tx.date).toLocaleDateString(lang === 'ar' ? 'ar-EG' : 'en-US', { day: 'numeric', month: 'short' })}
+                        {tx.note ? ` • ${tx.note}` : ''}
+                      </p>
+                    </div>
+                    <span className={cn('text-xs font-semibold shrink-0', isIncome ? 'text-emerald-600' : 'text-red-600')}>
+                      {isIncome ? '+' : '-'}{fmt(tx.amount, tx.currency)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

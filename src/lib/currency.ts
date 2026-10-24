@@ -1,17 +1,47 @@
-// نظام العملات المتعدد مع تحويل ثابت (تقريبي)
-// لتحويل أي مبلغ لعملة أخرى، نحوله أولاً لـ EGP ثم للعملة الهدف
+// نظام العملات المتعدد مع تحويل
+// أسعار الصرف قابلة للتحديث عبر الإعدادات (#9)
 
 export type Currency = 'EGP' | 'SAR' | 'USD' | 'EUR' | 'AED';
 
 // سعر الصرف مقابل EGP (1 وحدة من العملة = كم EGP)
-// هذه تقديرية ويجب تحديثها دورياً
-export const EXCHANGE_RATES: Record<Currency, number> = {
+// القيم الافتراضية - يمكن تحديثها من الإعدادات
+export const DEFAULT_EXCHANGE_RATES: Record<Currency, number> = {
   EGP: 1,
   SAR: 13.0,
   USD: 48.5,
   EUR: 52.0,
   AED: 13.2,
 };
+
+// الأسعار الحالية - تتحدث من localStorage أو الإعدادات
+export let EXCHANGE_RATES: Record<Currency, number> = { ...DEFAULT_EXCHANGE_RATES };
+
+// تحديث الأسعار من الإعدادات
+export function updateExchangeRates(rates: Partial<Record<Currency, number>>) {
+  EXCHANGE_RATES = { ...EXCHANGE_RATES, ...rates };
+}
+
+// تحميل الأسعار من localStorage (client-side)
+export function loadExchangeRates(): Record<Currency, number> {
+  if (typeof window !== 'undefined') {
+    try {
+      const saved = localStorage.getItem('mw-exchange-rates');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        EXCHANGE_RATES = { ...DEFAULT_EXCHANGE_RATES, ...parsed };
+      }
+    } catch {}
+  }
+  return EXCHANGE_RATES;
+}
+
+// حفظ الأسعار في localStorage
+export function saveExchangeRates(rates: Record<Currency, number>) {
+  EXCHANGE_RATES = rates;
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('mw-exchange-rates', JSON.stringify(rates));
+  }
+}
 
 export const CURRENCY_SYMBOLS: Record<Currency, { ar: string; en: string }> = {
   EGP: { ar: 'ج.م', en: 'E£' },

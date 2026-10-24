@@ -4,11 +4,11 @@ import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Search, Filter, Trash2, Pencil } from 'lucide-react';
+import { Search, Filter, Trash2, Pencil, ArrowDownUp, Calendar } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
-import { formatMoney, convert, type Currency } from '@/lib/currency';
+import { formatMoney, convert, compactNumber, type Currency } from '@/lib/currency';
 import { cn } from '@/lib/utils';
 import { getIcon } from '@/lib/icons';
 import { useToast } from '@/hooks/use-toast';
@@ -41,6 +41,7 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
   const [fromDate, setFromDate] = useState('');
   const [toDate, setToDate] = useState('');
   const [showDateFilter, setShowDateFilter] = useState(false);
+  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
 
   const load = async () => {
     setLoading(true);
@@ -61,13 +62,20 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
       if (typeFilter !== 'ALL' && tx.type !== typeFilter) return false;
       if (categoryFilter !== 'ALL' && tx.category.id !== categoryFilter) return false;
       if (search) {
+        const q = search.toLowerCase().trim();
         const cat = lang === 'ar' ? tx.category.nameAr : tx.category.nameEn;
+        const catOther = lang === 'ar' ? tx.category.nameEn : tx.category.nameAr;
         const accName = tx.account?.name || '';
         const toAccName = tx.toAccount?.name || '';
-        if (!cat.includes(search) &&
-            !accName.includes(search) &&
-            !toAccName.includes(search) &&
-            !(tx.note || '').includes(search)) return false;
+        const amountStr = String(tx.amount);
+        const noteStr = tx.note || '';
+        // Smart search: matches name OR amount OR note
+        if (!cat.toLowerCase().includes(q) &&
+            !catOther.toLowerCase().includes(q) &&
+            !accName.toLowerCase().includes(q) &&
+            !toAccName.toLowerCase().includes(q) &&
+            !amountStr.includes(q) &&
+            !noteStr.toLowerCase().includes(q)) return false;
       }
       if (fromDate) {
         const txDate = new Date(tx.date).toISOString().slice(0, 10);
@@ -81,7 +89,7 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
     });
   }, [items, search, typeFilter, categoryFilter, fromDate, toDate, lang]);
 
-  // group by day
+  // group by day - sorted by toggle
   const grouped = useMemo(() => {
     const m = new Map<string, TxItem[]>();
     filtered.forEach(tx => {
@@ -90,8 +98,43 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
       if (!m.has(key)) m.set(key, []);
       m.get(key)!.push(tx);
     });
-    return Array.from(m.entries()).sort((a, b) => b[0].localeCompare(a[0]));
-  }, [filtered]);
+    const entries = Array.from(m.entries());
+    // Sort by toggle: desc = newest first, asc = oldest first
+    if (sortOrder === 'desc') {
+      entries.sort((a, b) => b[0].localeCompare(a[0]));
+    } else {
+      entries.sort((a, b) => a[0].localeCompare(b[0]));
+    }
+    return entries;
+  }, [filtered, sortOrder]);
+
+  // Quick summary: today / this week / this month
+  const quickSummary = useMemo(() => {
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const weekAgo = new Date(now);
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    let todayExp = 0, weekExp = 0, monthExp = 0;
+    let todayInc = 0, weekInc = 0, monthInc = 0;
+
+    filtered.forEach(tx => {
+      const txDate = new Date(tx.date).toISOString().slice(0, 10);
+      const amt = convert(tx.amount, tx.currency as Currency, baseCurrency as Currency);
+      if (tx.type === 'EXPENSE') {
+        if (txDate === todayStr) todayExp += amt;
+        if (txDate >= weekAgo.toISOString().slice(0, 10)) weekExp += amt;
+        if (txDate >= monthStart.toISOString().slice(0, 10)) monthExp += amt;
+      } else if (tx.type === 'INCOME') {
+        if (txDate === todayStr) todayInc += amt;
+        if (txDate >= weekAgo.toISOString().slice(0, 10)) weekInc += amt;
+        if (txDate >= monthStart.toISOString().slice(0, 10)) monthInc += amt;
+      }
+    });
+
+    return { todayExp, weekExp, monthExp, todayInc, weekInc, monthInc };
+  }, [filtered, baseCurrency]);
 
   const handleDelete = async (tx: TxItem) => {
     if (!confirm(lang === 'ar' ? `حذف المعاملة؟` : 'Delete transaction?')) return;
@@ -127,17 +170,25 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
         <p className="text-sm text-slate-500">{filtered.length} {t('transactions')}</p>
       </header>
 
-      {/* Search + Date toggle */}
+      {/* Search + Date toggle + Sort */}
       <div className="flex gap-2">
         <div className="relative flex-1">
           <Search className="absolute start-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
           <Input
             value={search}
             onChange={e => setSearch(e.target.value)}
-            placeholder={t('search')}
+            placeholder={lang === 'ar' ? 'بحث بالاسم أو المبلغ...' : 'Search by name or amount...'}
             className="ps-9"
           />
         </div>
+        <button
+          onClick={() => setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc')}
+          className="px-3 rounded-lg border-2 border-slate-200 dark:border-slate-800 text-slate-500 flex items-center gap-1"
+          aria-label={lang === 'ar' ? 'ترتيب' : 'Sort'}
+        >
+          <ArrowDownUp className={cn('w-4 h-4 transition', sortOrder === 'asc' && 'rotate-180')} />
+          <span className="text-xs font-medium">{sortOrder === 'desc' ? (lang === 'ar' ? 'الأحدث' : 'Newest') : (lang === 'ar' ? 'الأقدم' : 'Oldest')}</span>
+        </button>
         <button
           onClick={() => setShowDateFilter(!showDateFilter)}
           className={cn(
@@ -197,6 +248,25 @@ export function TransactionsScreen({ onEditTx }: { onEditTx: (tx: TxItem) => voi
             ))}
           </SelectContent>
         </Select>
+      </div>
+
+      {/* Quick summary: Today / This week / This month */}
+      <div className="grid grid-cols-3 gap-2">
+        <Card className="p-2.5 bg-slate-50 dark:bg-slate-800/50 text-center">
+          <p className="text-[10px] text-slate-500 font-medium">{lang === 'ar' ? 'اليوم' : 'Today'}</p>
+          <p className="text-xs font-bold text-red-600 dark:text-red-400 truncate">{compactNumber(quickSummary.todayExp, lang)}</p>
+          <p className="text-[10px] text-emerald-600">{compactNumber(quickSummary.todayInc, lang)}+</p>
+        </Card>
+        <Card className="p-2.5 bg-slate-50 dark:bg-slate-800/50 text-center">
+          <p className="text-[10px] text-slate-500 font-medium">{lang === 'ar' ? 'الأسبوع' : 'Week'}</p>
+          <p className="text-xs font-bold text-red-600 dark:text-red-400 truncate">{compactNumber(quickSummary.weekExp, lang)}</p>
+          <p className="text-[10px] text-emerald-600">{compactNumber(quickSummary.weekInc, lang)}+</p>
+        </Card>
+        <Card className="p-2.5 bg-slate-50 dark:bg-slate-800/50 text-center">
+          <p className="text-[10px] text-slate-500 font-medium">{lang === 'ar' ? 'الشهر' : 'Month'}</p>
+          <p className="text-xs font-bold text-red-600 dark:text-red-400 truncate">{compactNumber(quickSummary.monthExp, lang)}</p>
+          <p className="text-[10px] text-emerald-600">{compactNumber(quickSummary.monthInc, lang)}+</p>
+        </Card>
       </div>
 
       {/* Monthly summary card */}
