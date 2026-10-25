@@ -16,7 +16,7 @@ import { DataTools } from '@/components/data-tools';
 
 const CURRENCIES: Currency[] = ['EGP', 'SAR', 'USD', 'EUR', 'AED'];
 
-export function SettingsScreen() {
+export function SettingsScreen({ onLogout }: { onLogout?: () => void }) {
   const { t, lang } = useT();
   const { lang: curLang, setLang, baseCurrency, setBaseCurrency, theme, setTheme } = useSettings();
   const [notifications, setNotifications] = useState(true);
@@ -225,6 +225,22 @@ export function SettingsScreen() {
           <p>Next.js 16 + PWA + Prisma</p>
         </div>
       </Card>
+
+      {/* Logout */}
+      {onLogout && (
+        <Card className="p-4">
+          <Button
+            variant="outline"
+            onClick={async () => {
+              await fetch('/api/auth/logout', { method: 'POST' });
+              onLogout();
+            }}
+            className="w-full h-12 text-red-600 border-red-200 hover:bg-red-50"
+          >
+            {lang === 'ar' ? 'تسجيل الخروج' : 'Logout'}
+          </Button>
+        </Card>
+      )}
 
       <div className="h-4" />
     </div>

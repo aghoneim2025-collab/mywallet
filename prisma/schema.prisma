@@ -10,21 +10,40 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ===== Account (الحسابات: كاش/بنك/محفظة إلكترونية) =====
+// ===== User (المستخدم - تسجيل دخول) =====
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  accounts      Account[]
+  categories    Category[]
+  transactions  Transaction[]
+  budgets       Budget[]
+
+  @@map("users")
+}
+
+// ===== Account (الحسابات) =====
 model Account {
   id        String   @id @default(cuid())
-  name      String                       // اسم الحساب (مثال: محفظتي البنكية)
-  type      AccountType                  // نوع الحساب
-  currency  Currency                     // عملة الحساب
-  balance   Float    @default(0)          // الرصيد الافتراضي
-  color     String   @default("#2563EB") // لون الحساب
-  icon      String   @default("wallet")  // أيقونة
+  name      String
+  type      AccountType
+  currency  Currency
+  balance   Float    @default(0)
+  color     String   @default("#2563EB")
+  icon      String   @default("wallet")
   isDefault Boolean  @default(false)
+  userId    String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  transactions      Transaction[]
-  transfersTo       Transaction[] @relation("TransfersTo")
+  user          User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions  Transaction[]
+  transfersTo   Transaction[] @relation("TransfersTo")
 
   @@map("accounts")
 }
@@ -51,15 +70,17 @@ enum Currency {
 // ===== Category (الفئات: مصروفات + دخل) =====
 model Category {
   id        String        @id @default(cuid())
-  nameAr    String                     // الاسم بالعربي
-  nameEn    String                     // الاسم بالإنجليزي
-  type      CategoryType               // EXPENSE or INCOME
-  icon      String        @default("tag") // اسم الأيقونة (lucide)
+  nameAr    String
+  nameEn    String
+  type      CategoryType
+  icon      String        @default("tag")
   color     String        @default("#10B981")
   isDefault Boolean       @default(false)
+  userId    String?
   createdAt DateTime      @default(now())
   updatedAt DateTime      @updatedAt
 
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
   transactions Transaction[]
   budgets     Budget[]
 
@@ -75,45 +96,51 @@ enum CategoryType {
 // ===== Transaction (المعاملة: مصروف أو دخل أو تحويل) =====
 model Transaction {
   id            String   @id @default(cuid())
-  type          CategoryType                // EXPENSE | INCOME | TRANSFER
-  amount        Float                       // المبلغ بعملة المعاملة
-  currency      Currency                    // عملة المعاملة
-  accountId     String                      // الحساب المصدر (للتحويل: الحساب اللي بيتسحب منه)
-  categoryId    String                      // الفئة (للتحويل: فئة 'تحويلات')
-  toAccountId   String?                     // للتحويل فقط: الحساب الوجهة
-  date          DateTime  @default(now())  // تاريخ المعاملة
-  note          String?                     // ملاحظة
-  tags          String?                     // علامات تصنيف
-  transferPairId String?                    // ID للمعاملة المزدوجة في التحويل (الوجهة)
+  type          CategoryType
+  amount        Float
+  currency      Currency
+  accountId     String
+  categoryId    String
+  toAccountId   String?
+  date          DateTime  @default(now())
+  note          String?
+  tags          String?
+  transferPairId String?
+  userId        String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  account       Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  category      Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
-  toAccount     Account? @relation("TransfersTo", fields: [toAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user         User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account      Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category     Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  toAccount    Account?  @relation("TransfersTo", fields: [toAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@index([accountId])
   @@index([toAccountId])
   @@index([categoryId])
   @@index([date])
   @@index([type])
+  @@index([userId])
   @@map("transactions")
 }
 
 // ===== Budget (الميزانية الشهرية لكل فئة) =====
 model Budget {
   id          String   @id @default(cuid())
-  categoryId  String                     // الفئة
-  month       String                     // الشهر بصيغة YYYY-MM
-  limit       Float                       // الحد الأقصى
-  currency    Currency   @default(EGP)   // العملة
+  categoryId  String
+  month       String
+  limit       Float
+  currency    Currency   @default(EGP)
+  userId      String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  user        User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category    Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
 
   @@unique([categoryId, month])
   @@index([month])
+  @@index([userId])
   @@map("budgets")
 }
 
