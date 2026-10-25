@@ -347,3 +347,78 @@ Stage Summary:
 - Production build still passes (next build).
 - New ZIP uses staging directory approach (allowlist, not denylist).
 - Placeholder AUTH_SECRET in .env.example is now structurally invalid.
+
+---
+Task ID: P0.9-node-env-503-zip-allowlist
+Agent: main
+Task: Address ChatGPT's P0.8 review critical concerns:
+  (1) AUTH_SECRET validation only fires when NODE_ENV === 'production'
+      → other envs (test, staging, undefined) silently use DEV_SECRET
+  (2) .env.example sets NODE_ENV=development → encourages wrong prod setup
+  (3) token.substring(0,16) in logs exposes userId payload
+  (4) DB outage in /session returns 200 with null data → frontend clears token
+      (false "session ended")
+  (5) ZIP copies whole dirs (src/, prisma/, scripts/) → exclusion patterns
+      don't catch arbitrary .env.staging, .env.production, etc.
+  (6) Cleanup still opportunistic (acknowledged limitation)
+
+Work Log:
+- src/lib/auth.ts:
+  - Changed `isProduction` check to `isProd = (nodeEnv === 'production' || !isDev)`
+    → only 'development' allows DEV_SECRET; 'test', 'staging', undefined → strict
+  - Added DbUnavailableError class (distinguishes DB outage from auth failure)
+  - Added AuthInvalidError class (for genuine auth failures: bad/expired/revoked)
+  - isTokenRevoked(): throws DbUnavailableError on DB failure (instead of return true)
+  - requireAuthAsync(): throws AuthInvalidError on auth failure, lets DbUnavailableError
+    propagate (callers can distinguish and return appropriate status)
+- src/app/api/auth/session/route.ts:
+  - Catches DbUnavailableError → returns 503 with { data: null, error: '...' }
+  - On 200-with-null-data → real session ended
+  - Frontend can distinguish the two and only clear token on real session end
+- src/app/api/auth/logout/route.ts:
+  - Logs token HASH (truncated to 12 chars of SHA-256 hex), not token substring
+  - The hash is one-way; no userId payload is recoverable from it
+- src/app/page.tsx:
+  - useEffect: on 503, don't clear stored token (DB may be temporarily down)
+  - On 200 with null data → clear token (real session end)
+- .env.example:
+  - Removed NODE_ENV=development (NODE_ENV should be set by deployment env, not .env)
+  - Added explanation comment about why NODE_ENV is intentionally not set
+- scripts/build-source-zip.sh (rewrote with file-level allowlist):
+  - Walks src/, prisma/, scripts/ with find -type f, applies basename checks
+  - Catches ALL .env* variants (staging, production, etc.) via case statement
+  - Also rejects: *.pem, *.key, *.p12, *.pfx, id_rsa, etc.
+  - Pre-zip scan: find any .env* except .env.example
+  - Pre-zip scan: grep for `AUTH_SECRET=[a-f0-9]{64}` pattern (real secret)
+  - Post-zip verification: walk ZIP listing, confirm no .env* except .env.example
+
+Verified by direct script test (scripts/test-p09.ts):
+  - getUserIdFromRequestAsync BEFORE revoke → userId ✅
+  - getUserIdFromRequestAsync AFTER revoke → null ✅
+  - DB stores SHA-256 hash ✅
+  - revokeToken THROWS on FK violation (P2003) ✅
+  - AuthInvalidError class works (instanceof checks) ✅
+  - DbUnavailableError class works (cause preserved) ✅
+
+Verified by e2e test (server + curl):
+  - POST /api/auth/register → 200 + token
+  - GET /api/auth/session (Bearer, BEFORE logout) → 200 + user data ✅
+  - GET /api/transactions (Bearer, BEFORE logout) → 200 ✅
+  - POST /api/auth/logout (Bearer) → 200 { success: true }
+  - Dev log shows: "logout: revoked 1 token(s) with hashes: [ '0d3643955a06' ]" ✅
+    (logged hash, NOT token substring — no userId exposed)
+  - GET /api/transactions (Bearer, AFTER logout) → 401 ✅ (revoked!)
+
+Generated P0.9 timestamped files:
+- /home/z/my-project/public/source-code-P0.9-20261025-134733.zip (187K)
+- /home/z/my-project/public/source-code.txt (200K, banner updated)
+- /home/z/my-project/public/source-code.zip (refreshed)
+
+Stage Summary:
+- AUTH_SECRET validation now fires for any NODE_ENV that's not exactly 'development'.
+- DB outages are now distinguishable from auth failures via DbUnavailableError.
+- /api/auth/session returns 503 on DB outage (frontend keeps token, retries).
+- Logout logs the token HASH (truncated), not the token substring (which exposed userId).
+- ZIP uses file-level allowlist (no directory copying) + case-statement filter
+  that catches ALL .env* variants + post-zip verification.
+- .env.example no longer sets NODE_ENV (it's a deployment-time config).

@@ -20,18 +20,32 @@ export default function Home() {
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
   const [transferModal, setTransferModal] = useState(false);
 
-  // Check auth on mount - try stored Bearer token first, fall back to cookie
+  // Check auth on mount - try stored Bearer token first, fall back to cookie.
+  // P0.9: distinguish 503 (DB outage) from 200-with-null-data (session ended).
+  // On 503, we DON'T clear the stored token — the token may be perfectly
+  // valid, the DB is just temporarily unreachable. The user can retry
+  // later without re-logging in. On 200 with null data, the session
+  // has actually ended (token revoked or invalid) → clear it.
   useEffect(() => {
     const stored = getStoredToken();
     const fetchOpts: RequestInit = stored
       ? { headers: { Authorization: `Bearer ${stored}` } }
       : {};
     fetch('/api/auth/session', fetchOpts)
-      .then(r => r.json())
+      .then(async r => {
+        // P0.9: 503 = DB outage. Don't clear token. Show "service down" UI.
+        if (r.status === 503) {
+          console.warn('Session check: 503 (DB unavailable). Keeping token; user can retry.');
+          // Don't set authed — leave user on loading state, they can refresh.
+          return null;
+        }
+        return r.json();
+      })
       .then(d => {
+        if (!d) return;  // 503 case
         if (d.data) setAuthed(true);
         else {
-          // Session has no data — clear any stale token
+          // Session has no data — clear any stale token.
           setStoredToken(null);
         }
       })

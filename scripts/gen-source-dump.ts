@@ -45,9 +45,9 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.6 Hashed Token Storage + .env Leak Fix) ===
-=== Fixed: tokens stored as SHA-256 hash in DB; .env removed from ZIPs ===
-=== VERSION: P0.6 (token hashing + secret rotation) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.9 Stricter NODE_ENV + DB Outage 503 + ZIP Allowlist) ===
+=== Fixed: NODE_ENV strict check, DB outage returns 503, ZIP uses file-level allowlist ===
+=== VERSION: P0.9 (NODE_ENV strict + 503 + ZIP allowlist) ===
 === BUILD: ${new Date().toISOString()} ===
 
 URGENT SECURITY NOTE:

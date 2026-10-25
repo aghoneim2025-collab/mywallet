@@ -17,26 +17,25 @@ import { createHmac, timingSafeEqual, createHash } from 'crypto';
 import { db } from './db';
 
 const TOKEN_SECRET = process.env.AUTH_SECRET;
-const isProduction = process.env.NODE_ENV === 'production';
+// P0.9: only allow DEV_SECRET when NODE_ENV is EXACTLY 'development'.
+// Previously checked `isProduction` (NODE_ENV === 'production'), which meant
+// that 'test', 'staging', or undefined NODE_ENV would silently fall back
+// to the publicly-known DEV_SECRET. Now: any NODE_ENV other than
+// 'development' or 'production' is treated as production-grade strict.
+const nodeEnv = process.env.NODE_ENV;
+const isDev = nodeEnv === 'development';
+const isProd = nodeEnv === 'production' || (!isDev);  // treat unknown as prod
+// Keep backward-compat name for existing imports:
+const isProduction = isProd;
 
 // P0.4: Stable, deterministic dev secret so all workers share the same key.
 const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +
-  'do-not-use-in-prod-' + (process.env.NODE_ENV || 'development');
+  'do-not-use-in-prod-' + (nodeEnv || 'development');
 
-// P0.8: known-bad placeholder values from .env.example. If someone copies
-// the example file to .env without filling in a real secret, the app
-// would silently use a publicly-known placeholder value. This check
-// rejects those values explicitly, even if they happen to meet the
-// 32-char minimum (e.g., a long descriptive placeholder).
+// P0.8: known-bad placeholder values from .env.example.
 const FORBIDDEN_SECRETS = new Set([
-  'REPLACE_ME',
-  'replace-me',
-  'replace_me',
-  'changeme',
-  'change-me',
-  'placeholder',
-  'todo',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+  'REPLACE_ME', 'replace-me', 'replace_me', 'changeme', 'change-me',
+  'placeholder', 'todo', 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
   'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-do-not-use-in-prod-development',
 ]);
 
@@ -51,18 +50,42 @@ function isPlaceholderSecret(s: string | undefined): boolean {
   return false;
 }
 
-// Eagerly validate at module load time so the process fails fast.
+// P0.9: error class to distinguish DB outages from auth failures.
+// Thrown by isTokenRevoked when the DB lookup fails. Callers should
+// catch this and return 503 (Service Unavailable), NOT 401 — the user's
+// token may be perfectly valid, the DB is just temporarily unreachable.
+export class DbUnavailableError extends Error {
+  constructor(message: string, public cause?: unknown) {
+    super(message);
+    this.name = 'DbUnavailableError';
+  }
+}
+
+// P0.9: errors that mean the user's auth is genuinely invalid (revoked,
+// bad signature, expired). Distinct from DB outages.
+export class AuthInvalidError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthInvalidError';
+  }
+}
+
+// Eagerly validate at module load time.
 // P0.8: rejects placeholder values even if they meet length requirement.
-if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32 || isPlaceholderSecret(TOKEN_SECRET))) {
+// P0.9: applies whenever NODE_ENV is NOT 'development' (covers prod,
+// test, staging, undefined, etc.). Only 'development' allows DEV_SECRET.
+if (isProd && (!TOKEN_SECRET || TOKEN_SECRET.length < 32 || isPlaceholderSecret(TOKEN_SECRET))) {
   throw new Error(
-    'AUTH_SECRET must be set to a random string of at least 32 characters in production. ' +
+    'AUTH_SECRET must be set to a random string of at least 32 characters when NODE_ENV is not "development". ' +
+    'Current NODE_ENV: ' + JSON.stringify(nodeEnv) + '. ' +
     'Generate one with: openssl rand -hex 32. ' +
-    (isPlaceholderSecret(TOKEN_SECRET) ? 'Placeholder values are not allowed in production.' : '')
+    (isPlaceholderSecret(TOKEN_SECRET) ? 'Placeholder values are not allowed.' : '')
   );
 }
 
 function getSecret(): string {
-  if (isProduction) return TOKEN_SECRET!;
+  if (isProd) return TOKEN_SECRET!;
+  // Dev mode: use AUTH_SECRET if set + non-placeholder, else DEV_SECRET.
   return TOKEN_SECRET && TOKEN_SECRET.length >= 32 && !isPlaceholderSecret(TOKEN_SECRET)
     ? TOKEN_SECRET
     : DEV_SECRET;
@@ -166,11 +189,23 @@ export function verifyTokenSignature(token: string): { userId: string; exp: numb
   }
 }
 
-// P0.8: fail-closed on DB errors. If the DB lookup fails, treat the token as
-// REVOKED (return true), not as "not revoked". A transient DB outage should
-// not let a stolen token through. The trade-off: legitimate users may see
-// transient 401s when the DB is down. For a financial app, denying access
-// during a DB outage is safer than allowing a revoked token through.
+// P0.8/P0.9: fail-closed BUT distinguish DB outage from revoked token.
+// - If DB lookup throws → throw DbUnavailableError. Callers should
+//   return 503 (Service Unavailable), NOT 401. The user's token may be
+//   perfectly valid; the DB is just temporarily unreachable.
+// - If DB lookup succeeds and finds the token in the blacklist → return true.
+// - If DB lookup succeeds and doesn't find it → return false + cache negatively.
+//
+// Why throw instead of return true: returning true silently makes it
+// impossible for callers (session route, requireAuthAsync) to distinguish
+// "token is revoked" from "DB is down". With a throw, callers can:
+//   - /api/auth/session: catch → return 503, frontend keeps token, retries
+//   - requireAuthAsync: catch → return 503 (not 401), so the user knows
+//     to retry rather than re-login
+//
+// This is still "fail-closed" in the security sense: a DB outage blocks
+// access rather than allowing a stolen token through. But it's also
+// honest about WHY access is blocked.
 async function isTokenRevoked(token: string): Promise<boolean> {
   const tokenHash = hashToken(token);
   if (revokedTokenSet.has(tokenHash)) return true;
@@ -178,22 +213,22 @@ async function isTokenRevoked(token: string): Promise<boolean> {
   if (negCacheEntry && (Date.now() - negCacheEntry) < NEG_CACHE_TTL_MS) {
     return false;
   }
-  // P0.8: fail-closed. DB errors → treat as revoked (deny request).
-  // Previously this was fail-open (return false), which let revoked tokens
-  // through during DB outages. For a financial app, fail-closed is safer.
+  // P0.9: throw DbUnavailableError on DB failure. Callers distinguish this
+  // from "token is revoked" and can return 503 instead of 401.
+  let found;
   try {
-    const found = await db.revokedToken.findUnique({ where: { token: tokenHash }, select: { id: true } });
-    if (found) {
-      revokedTokenSet.add(tokenHash);
-      notRevokedCache.delete(tokenHash);
-      return true;
-    }
-    notRevokedCache.set(tokenHash, Date.now());
-    return false;
+    found = await db.revokedToken.findUnique({ where: { token: tokenHash }, select: { id: true } });
   } catch (e) {
-    console.error('isTokenRevoked: DB lookup failed, failing closed (revoked=true):', e);
+    console.error('isTokenRevoked: DB lookup failed, throwing DbUnavailableError:', e);
+    throw new DbUnavailableError('Token revocation check failed: database unavailable', e);
+  }
+  if (found) {
+    revokedTokenSet.add(tokenHash);
+    notRevokedCache.delete(tokenHash);
     return true;
   }
+  notRevokedCache.set(tokenHash, Date.now());
+  return false;
 }
 
 // P0.8: Revoke a token. THROWS on DB error (does not swallow).
@@ -263,18 +298,21 @@ export function verifyToken(token: string): { userId: string } | null {
 }
 
 // P0.5: Async version that also checks the revocation blacklist.
-// This is what requireAuth should use for full security.
+// P0.9: throws DbUnavailableError when DB lookup fails (caller should
+// return 503, not 401). Returns null when token is missing/invalid/revoked.
 export async function getUserIdFromRequestAsync(req: Request): Promise<string | null> {
   const token = extractToken(req);
   if (!token) return null;
   const verified = verifyTokenSignature(token);
-  if (!verified) return null;
+  if (!verified) return null;  // bad signature, expired, or malformed
+  // P0.9: isTokenRevoked throws DbUnavailableError on DB failure.
+  // We let it propagate so callers can distinguish auth-invalid from
+  // service-unavailable.
   if (await isTokenRevoked(token)) return null;
   return verified.userId;
 }
 
 // Synchronous version (kept for backwards compat, but does NOT check blacklist).
-// Prefer getUserIdFromRequestAsync in any route that mutates data.
 export function getUserIdFromRequest(req: Request): string | null {
   const token = extractToken(req);
   if (!token) return null;
@@ -283,9 +321,12 @@ export function getUserIdFromRequest(req: Request): string | null {
 }
 
 // P0.5: Async requireAuth that checks blacklist.
+// P0.9: throws DbUnavailableError on DB failure. Callers should catch
+// and return 503 (Service Unavailable) — the user's token may be valid,
+// the DB is just down.
 export async function requireAuthAsync(req: Request): Promise<string> {
   const userId = await getUserIdFromRequestAsync(req);
-  if (!userId) throw new Error('Unauthorized');
+  if (!userId) throw new AuthInvalidError('Unauthorized');
   return userId;
 }
 

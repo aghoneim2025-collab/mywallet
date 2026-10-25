@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import {
   revokeToken,
   verifyTokenSignature,
+  hashToken,
   maybeCleanupExpiredRevokedTokens,
 } from '@/lib/auth';
 
@@ -13,12 +14,14 @@ import {
 // P0.8 fixes:
 //   - Returns 500 if revocation FAILS. Caller (UI) must know if logout
 //     didn't actually invalidate the token, so the user can retry.
-//     Previously returned 200 unconditionally → false sense of security.
 //   - Revokes BOTH Bearer token AND cookie token (if both present and
-//     different). Previously only the Bearer was revoked, so a stolen
-//     copy kept in a cookie (different signature) would remain valid.
-//   - revokeToken() throws on DB error (does not swallow), so we can
-//     detect and report failure.
+//     different). Previously only the Bearer was revoked.
+//   - revokeToken() throws on DB error (does not swallow).
+//
+// P0.9 fix:
+//   - Logs the token HASH (not the token substring) — the substring could
+//     expose the userId payload. The hash is one-way and contains no
+//     recoverable user data.
 //
 // Cleanup runs every 10 logouts OR if 1+ hour since last cleanup
 // (opportunistic — not a true cron; see notes in auth.ts).
@@ -33,15 +36,21 @@ export async function POST(req: NextRequest) {
 
   let revocationFailed = false;
   let revocationError: string | undefined;
+  // P0.9: log the token HASH (no recoverable user data), not the token
+  // substring (which contains the userId payload).
+  const revokedHashes: string[] = [];
 
   for (const token of tokensToRevoke) {
     const verified = verifyTokenSignature(token);
     if (!verified) continue; // invalid token, nothing to revoke
+    const tokenHash = hashToken(token);
     try {
       await revokeToken(token, verified.userId);
+      revokedHashes.push(tokenHash.substring(0, 12));  // truncated hash for logging
     } catch (e: any) {
       // P0.8: don't swallow — record the failure so we can return error
-      console.error('revokeToken failed for token', token.substring(0, 16) + '...:', e?.message);
+      // P0.9: log the hash, not the token substring
+      console.error('revokeToken failed for hash', tokenHash.substring(0, 12) + '...:', e?.message);
       revocationFailed = true;
       revocationError = e?.message || 'Unknown revocation error';
     }
@@ -49,6 +58,11 @@ export async function POST(req: NextRequest) {
 
   // Opportunistic cleanup (fire-and-forget; failure doesn't affect logout).
   maybeCleanupExpiredRevokedTokens().catch(() => {});
+
+  // Log how many tokens were successfully revoked (by hash, not by token).
+  if (revokedHashes.length > 0) {
+    console.log('logout: revoked', revokedHashes.length, 'token(s) with hashes:', revokedHashes);
+  }
 
   // Always clear the auth cookie — even if revocation failed, the user
   // can still log out from this browser session.
@@ -62,16 +76,12 @@ export async function POST(req: NextRequest) {
   return response;
 }
 
-// Extract Bearer token from Authorization header (returns null if absent).
 function extractBearerToken(req: Request): string | null {
   const authHeader = req.headers.get('authorization');
-  if (authHeader?.startsWith('Bearer ')) {
-    return authHeader.slice(7);
-  }
+  if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7);
   return null;
 }
 
-// Extract auth-token from Cookie header (returns null if absent).
 function extractCookieToken(req: Request): string | null {
   const cookie = req.headers.get('cookie') || '';
   const tokenMatch = cookie.match(/auth-token=([^;]+)/);
