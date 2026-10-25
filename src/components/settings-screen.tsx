@@ -48,12 +48,13 @@ export function SettingsScreen() {
   const handleReset = async () => {
     if (!confirm(t('confirmReset'))) return;
     try {
-      // delete all transactions, budgets via API
-      const txs = await api<{ data: any[] }>('/api/transactions?limit=9999');
-      for (const tx of txs.data) {
-        await api(`/api/transactions/${tx.id}`, { method: 'DELETE' });
-      }
-      toast.success(lang === 'ar' ? 'تم الحذف' : 'Reset done');
+      const res = await fetch('/api/reset', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success(lang === 'ar'
+        ? `تم حذف ${data.deleted.transactions} معاملة و ${data.deleted.budgets} ميزانية`
+        : `Deleted ${data.deleted.transactions} txns, ${data.deleted.budgets} budgets`);
+      setTimeout(() => window.location.reload(), 1500);
     } catch (e: any) {
       toast.error(e.message);
     }
