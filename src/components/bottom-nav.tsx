@@ -1,14 +1,14 @@
 'use client';
-import { Home, ArrowLeftRight, Wallet, BarChart3, Settings } from 'lucide-react';
+import { Home, Tag, Wallet, BarChart3, Settings } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { cn } from '@/lib/utils';
 import { useMediaQuery } from '@/hooks/use-media-query';
 
-export type TabKey = 'dashboard' | 'transactions' | 'accounts' | 'reports' | 'settings';
+export type TabKey = 'home' | 'categories' | 'accounts' | 'reports' | 'settings';
 
 const tabs: { key: TabKey; icon: React.ElementType }[] = [
-  { key: 'dashboard', icon: Home },
-  { key: 'transactions', icon: ArrowLeftRight },
+  { key: 'home', icon: Home },
+  { key: 'categories', icon: Tag },
   { key: 'accounts', icon: Wallet },
   { key: 'reports', icon: BarChart3 },
   { key: 'settings', icon: Settings },
@@ -22,11 +22,10 @@ export function BottomNav({
   onChange: (tab: TabKey) => void;
 }) {
   const { t } = useT();
-  const isDesktop = useMediaQuery('(min-width: 768px)');
 
   const labels: Record<TabKey, string> = {
-    dashboard: t('dashboard'),
-    transactions: t('transactions'),
+    home: t('dashboard'),
+    categories: t('categories') || 'الفئات',
     accounts: t('accounts'),
     reports: t('reports'),
     settings: t('settings'),

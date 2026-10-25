@@ -10,6 +10,7 @@ export const translations = {
     // navigation
     dashboard: 'الرئيسية',
     transactions: 'المعاملات',
+    categories: 'الفئات',
     budget: 'الميزانية',
     reports: 'التقارير',
     accounts: 'الحسابات',
@@ -158,6 +159,7 @@ export const translations = {
 
     dashboard: 'Home',
     transactions: 'Transactions',
+    categories: 'Categories',
     budget: 'Budget',
     reports: 'Reports',
     accounts: 'Accounts',

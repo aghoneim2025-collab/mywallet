@@ -2,19 +2,19 @@
 import { useState } from 'react';
 import { BottomNav, type TabKey } from '@/components/bottom-nav';
 import { FAB } from '@/components/fab';
-import { Dashboard } from '@/components/dashboard';
-import { TransactionsScreen } from '@/components/transactions-screen';
-import { BudgetScreen } from '@/components/budget-screen';
-import { ReportsScreen } from '@/components/reports-screen';
+import { HomeScreen } from '@/components/home-screen';
+import { CategoriesScreen } from '@/components/categories-screen';
 import { AccountsScreen } from '@/components/accounts-screen';
+import { ReportsScreen } from '@/components/reports-screen';
 import { SettingsScreen } from '@/components/settings-screen';
+import { BudgetScreen } from '@/components/budget-screen';
 import { TransactionModal } from '@/components/transaction-modal';
 import { TransferModal } from '@/components/transfer-modal';
 import { useT } from '@/hooks/use-t';
 
 export default function Home() {
   const { t } = useT();
-  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [activeTab, setActiveTab] = useState<TabKey>('home');
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
   const [transferModal, setTransferModal] = useState(false);
 
@@ -29,17 +29,15 @@ export default function Home() {
   return (
     <div className="flex flex-col min-h-screen">
       <main className="flex-1 pb-24">
-        {activeTab === 'dashboard' && (
-          <Dashboard
-            key={`d-${reloadKey}`}
-            onAddExpense={openAddExpense}
-            onAddIncome={openAddIncome}
+        {activeTab === 'home' && (
+          <HomeScreen
+            key={`h-${reloadKey}`}
             onEditTx={openEditTx}
             onOpenAccounts={() => setActiveTab('accounts')}
           />
         )}
-        {activeTab === 'transactions' && (
-          <TransactionsScreen key={`t-${reloadKey}`} onEditTx={openEditTx} />
+        {activeTab === 'categories' && (
+          <CategoriesScreen key={`c-${reloadKey}`} />
         )}
         {activeTab === 'accounts' && (
           <AccountsScreen key={`a-${reloadKey}`} />
