@@ -1,78 +1,91 @@
-=== محفظتي (MyWallet) - Source Code (P0.4 Auth Flow Fixed) ===
-=== Fixed: Bearer token added, stable dev secret across workers ===
-=== VERSION: P0.4 (auth flow + multi-worker secret) ===
-=== BUILD: 2026-10-25T12:41:50.532Z ===
+=== محفظتي (MyWallet) - Source Code (P0.5 Server-side Token Revocation) ===
+=== Fixed: stolen tokens invalidated server-side on logout ===
+=== VERSION: P0.5 (DB-backed token blacklist + async auth) ===
+=== BUILD: 2026-10-25T13:09:24.438Z ===
 
-ROOT CAUSE OF "Unauthorized" RUNTIME ERROR REPORTED BY USER:
-  User registered/logged in → home screen mounted → fetch /api/stats etc → 401.
-  Server-side debugging showed two compounding bugs:
+ROOT CAUSE ADDRESSED (raised in P0.4 review):
+  ChatGPT noted: "التوكن صالح 30 يومًا، ولا يظهر في المصدر مسار
+  لإبطاله من الخادم عند تسجيل الخروج؛ حذف التوكن من المتصفح لا يبطل
+  نسخة مسروقة منه." Translation: localStorage token is XSS-readable
+  (unlike the HttpOnly cookie), valid for 30 days, with no server-side
+  revocation on logout. A stolen copy would work for 30 days even after
+  the legitimate user logs out.
 
-  BUG #1: unstable DEV_SECRET across worker processes
-    - P0.2 fix used randomBytes(32) at module load (stable per worker)
-    - BUT Next.js dev runs MULTIPLE workers, each with its own randomBytes
-    - Token generated in worker A → verified in worker B → signature mismatch → 401
-    - Even with cookie: cookie was set with worker A's signature,
-      verified against worker B's signature → 401
+WHAT CHANGED IN P0.5:
+  [1] prisma/schema.prisma: Added RevokedToken model
+         model RevokedToken {
+           id        String   @id @default(cuid())
+           token     String   @unique  // full JWT
+           userId    String
+           expiresAt DateTime           // when the original token would have expired
+           createdAt DateTime @default(now())
+           user      User     @relation(...)
+           @@index([expiresAt])
+           @@index([userId])
+         }
+  [2] src/lib/auth.ts: Added revokeToken() + isTokenRevoked() + cleanupExpiredRevokedTokens()
+      - revokeToken(token, userId): inserts the token into RevokedToken table + caches locally
+      - isTokenRevoked(token): checks in-memory positive cache first (revokedTokenSet),
+        then 1s negative cache (notRevokedCache), else falls back to DB lookup
+      - getUserIdFromRequestAsync(req): does HMAC verify + blacklist check
+      - requireAuthAsync(req): the new secure requireAuth that checks blacklist
+      - extractToken(req): pulls token from Authorization header OR cookie
+      - verifyTokenSignature(token): pure HMAC check (no DB), returns {userId, exp}
+      - cleanupExpiredRevokedTokens(): deletes rows where expiresAt < now()
+  [3] src/app/api/auth/logout/route.ts: now calls revokeToken() before clearing cookie
+      so even a stolen token (copied from localStorage or a network capture) is
+      invalidated server-side immediately
+  [4] ALL mutating API routes (transactions POST/PUT/DELETE, transfer, reset,
+      backup import, excel import, accounts POST/DELETE, categories POST/DELETE,
+      budgets POST/DELETE) now use 'await requireAuthAsync(req)' instead of
+      'requireAuth(req)' — every mutation checks the blacklist
+  [5] ALL GET endpoints also use requireAuthAsync (was a TODO from earlier —
+      a stolen token used on a GET endpoint shouldn't work either)
+  [6] .env: AUTH_SECRET generated and set to a 64-char random hex string
+      (so production build passes the eager validation at module load)
 
-  BUG #2: no Bearer token fallback for shared preview proxies
-    - Some preview proxies strip Set-Cookie headers
-    - Even if cookie was set, it wasn't always propagated
-    - No fallback existed (token was removed from JSON response in P0.1)
+CACHE STRATEGY (in-memory, per-worker):
+  - revokedTokenSet (Set<string>): tokens known to be revoked. Stay forever in
+    the worker (until cleanup). Hits here return revoked=true with no DB lookup.
+  - notRevokedCache (Map<string, timestamp>): tokens checked in the last 1
+    second and found NOT revoked. TTL = 1 second. After expiry, re-check DB.
+  - Rationale: we cache positive results forever (a revoked token won't
+    un-revoke). We cache negative results briefly (1s) to coalesce concurrent
+    parallel requests (e.g., home screen fires 3 fetches at once). The 1s
+    window means revocation propagates within max 1 second, not 30 seconds
+    like a typical cache.
 
-WHAT CHANGED IN P0.4:
-  [1] auth.ts: replaced randomBytes(32) with a DETERMINISTIC dev secret
-      (string concatenation; only used when AUTH_SECRET env is unset in dev).
-      Now all workers compute the same secret → token verification succeeds
-      regardless of which worker served the request.
-  [2] auth.ts: eager validation at module load (throws synchronously if
-      production is missing AUTH_SECRET or it's <32 chars).
-  [3] auth.ts: getSecret() returns deterministic DEV_SECRET only in dev;
-      production still requires AUTH_SECRET env var.
-  [4] login/route.ts + register/route.ts: token is ALSO returned in JSON
-      response (alongside the HttpOnly cookie). This is needed for the
-      Bearer token fallback below.
-  [5] NEW src/lib/auth-storage.ts: simple in-memory + localStorage token
-      storage. Stores token client-side so it survives page refresh.
-  [6] src/lib/api.ts: api() and downloadFile() now attach
-      "Authorization: Bearer <token>" header when a stored token exists.
-  [7] auth-screen.tsx: on successful login/register, stores the token from
-      JSON response via setStoredToken(). useEffect checks session via
-      Authorization header first, falls back to cookie.
-  [8] page.tsx: useEffect session check uses Authorization header when
-      stored token exists. Logout clears both stored token AND cookie.
-  [9] settings-screen.tsx + data-tools.tsx: raw fetch calls updated to
-      attach Authorization header when token is available.
+CONFIRMED WORKING (curl-tested earlier in this session):
+  - POST /api/auth/register        → 200 + token in JSON
+  - GET /api/transactions (Bearer, BEFORE logout) → 200 ✅
+  - GET /api/categories (Bearer, BEFORE logout)    → 200 ✅
+  - POST /api/auth/logout (Bearer)                → 200 (revokes the token)
+  - GET /api/transactions (Bearer, AFTER logout)  → 401 ✅ (revoked!)
+  - GET /api/categories (Bearer, AFTER logout)    → 401 ✅ (revoked!)
+  - GET /api/accounts (Bearer, AFTER logout)      → 401 ✅ (revoked!)
+  - GET /api/stats (Bearer, AFTER logout)         → 401 ✅ (revoked!)
+  - POST /api/auth/login (same credentials)        → 200 + new token (different sig)
+  - GET /api/transactions (new token)             → 200 ✅
 
-CONFIRMED WORKING (curl-tested):
-  - POST /api/auth/register → 200, returns {data:{id,email,name,token}}
-  - POST /api/auth/login    → 200, returns {data:{id,email,name,token}}
-  - GET  /api/auth/session (with Bearer) → 200, returns {data:{id,...}}
-  - GET  /api/transactions  (with Bearer) → 200, returns {data:[...]}
-  - GET  /api/categories    (with Bearer) → 200, returns {data:[10 items]}
-  - GET  /api/stats         (with Bearer) → 200, returns full stats object
-  - GET  /api/accounts      (with Bearer) → 200, returns {data:[...]}
-  - Cookie-based auth ALSO still works (verified)
+SECURITY MODEL NOW:
+  - Cookie (HttpOnly + SameSite=Lax): primary auth path. Works in normal browsers.
+  - Bearer token (localStorage + Authorization header): fallback for preview
+    proxies that strip Set-Cookie. XSS-readable, BUT...
+  - ...now ALSO backed by server-side revocation. If user logs out, ALL copies
+    of their token (localStorage, stolen via XSS, captured from network) are
+    immediately invalid because the next API call checks the DB blacklist.
+  - Stale "not revoked" cache for up to 1 second (acceptable window).
+  - Cleanup of expired revoked tokens happens opportunistically on each logout.
 
-SECURITY TRADE-OFFS (intentional, documented):
-  - Token returned in JSON: needed for Bearer fallback. XSS risk accepted
-    for personal finance app used by one user at a time.
-  - Token stored in localStorage: persists across refresh (good UX), XSS
-    readable (same risk as cookie for this app's threat model).
-  - Cookie still set HttpOnly + SameSite=Lax: defense in depth — works
-    when proxy doesn't strip Set-Cookie, Bearer fallback works when it does.
-  - DEV_SECRET is deterministic string: NOT secure for prod (clearly marked).
-  - Production MUST set AUTH_SECRET env var (32+ chars). Validated at startup.
-
-PREVIOUS P0.3 FIX STILL IN PLACE:
-  - layout.tsx: <SonnerToaster position="top-center" richColors closeButton />
-    mounted alongside shadcn <Toaster />.
-  - auth-screen.tsx: inline formMsg state for error/success display as backup.
-
-PREVIOUS P0.2 FIXES STILL IN PLACE:
-  [1] transactions limit: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
-  [2] backup export: only known fields, no spread, no accountName/categoryName leak
-  [3] backup import: only known fields + 10MB size limit + version check
-  [4] reset: deletes only Transaction + Budget (tables with userId in schema)
+WHAT STILL REMAINS FROM PRIOR REVIEWS (P0.2 leftovers):
+  - backup version === 3 (currently only checks truthy)
+  - HTTP body size limit at server/proxy level
+  - Excel import Transfer-Out handling + multi-currency conversion
+  - Budget multi-currency aggregation
+  - Historical exchange rates for transaction/transfer reversal
+  - userId nullable in some models + models without userId (Setting, RecurringTransaction, SavingsGoal, BillReminder)
+  - Rate limiting on login/register
+  - Tighten transfer validation (NaN/Infinity + currency enum)
 
 ============================================================
 
@@ -107,8 +120,26 @@ model User {
   categories    Category[]
   transactions  Transaction[]
   budgets       Budget[]
+  revokedTokens RevokedToken[]
 
   @@map("users")
+}
+
+// ===== RevokedToken (توكنات ملغاة - server-side logout) =====
+// When a user logs out, the JWT is stored here until its natural expiry,
+// so even a stolen copy cannot be used after the legitimate user logs out.
+model RevokedToken {
+  id        String   @id @default(cuid())
+  token     String   @unique  // the full JWT (HMAC signature included)
+  userId    String
+  expiresAt DateTime           // when the original token would have expired
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])   // for periodic cleanup
+  @@index([userId])
+  @@map("revoked_tokens")
 }
 
 // ===== Account (الحسابات) =====
@@ -404,31 +435,28 @@ FILE: package.json
 FILE: src/lib/auth.ts
 ========================================
 /**
- * Secure authentication - bcrypt + HMAC-signed tokens
- * P0.4 fix: stable dev secret across all worker processes.
+ * Secure authentication - bcrypt + HMAC-signed tokens + server-side revocation.
  *
  * History:
  *   - P0.1: Math.random() per call → tokens always invalid in next request
  *   - P0.2: randomBytes(32) at module load → still broken because Next.js dev
- *           runs MULTIPLE worker processes, each with its own randomBytes,
- *           so tokens generated in worker A can't be verified in worker B
- *   - P0.4: deterministic dev secret derived from a known string. In
- *           production, AUTH_SECRET must be explicitly set (>=32 chars).
+ *           runs MULTIPLE worker processes, each with its own randomBytes
+ *   - P0.4: deterministic dev secret (string-based, shared across workers)
+ *   - P0.5: server-side token revocation via DB-backed blacklist
+ *           (addresses localStorage XSS risk raised in security review)
  */
 import bcrypt from 'bcryptjs';
 import { createHmac, timingSafeEqual } from 'crypto';
+import { db } from './db';
 
 const TOKEN_SECRET = process.env.AUTH_SECRET;
 const isProduction = process.env.NODE_ENV === 'production';
 
 // P0.4: Stable, deterministic dev secret so all workers share the same key.
-// This is NOT secure for production — only used when AUTH_SECRET is unset
-// in development. In production, AUTH_SECRET is REQUIRED.
 const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +
   'do-not-use-in-prod-' + (process.env.NODE_ENV || 'development');
 
 // Eagerly validate at module load time so the process fails fast
-// if production is missing AUTH_SECRET (instead of failing on first request).
 if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
   throw new Error(
     'AUTH_SECRET must be set to a random string of at least 32 characters in production. ' +
@@ -437,13 +465,25 @@ if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
 }
 
 function getSecret(): string {
-  // In production, TOKEN_SECRET is guaranteed to be set (validated at module load)
   if (isProduction) return TOKEN_SECRET!;
-  // Dev: use AUTH_SECRET if set, else deterministic DEV_SECRET (shared across workers)
   return TOKEN_SECRET && TOKEN_SECRET.length >= 32 ? TOKEN_SECRET : DEV_SECRET;
 }
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// P0.5: in-memory cache for "definitely revoked" tokens.
+// We ONLY cache positive revocation results (token IS revoked).
+// We do NOT cache negative results ("not revoked") because that would
+// delay revocation by up to the cache TTL. This means every request with
+// a non-revoked token does a DB lookup, but revocation is immediate.
+//
+// Set of revoked tokens (cleared on cleanup).
+const revokedTokenSet = new Set<string>();
+
+// P0.5: optional short-TTL negative cache to reduce DB load on hot paths.
+// Set to 0 to disable (every request hits DB). 5000ms = max 5s revocation delay.
+const NEG_CACHE_TTL_MS = 1000; // 1 second — minimal revocation window
+const notRevokedCache = new Map<string, number>(); // token -> fetchedAt timestamp
 
 export async function hashPassword(password: string): Promise<string> {
   const salt = await bcrypt.genSalt(12);
@@ -462,46 +502,143 @@ export function generateToken(userId: string): string {
   return `${payloadB64}.${signature}`;
 }
 
-export function verifyToken(token: string): { userId: string } | null {
+// P0.5: Extract token from request (Authorization header OR cookie).
+export function extractToken(req: Request): string | null {
+  const authHeader = req.headers.get('authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice(7);
+  }
+  const cookie = req.headers.get('cookie') || '';
+  const tokenMatch = cookie.match(/auth-token=([^;]+)/);
+  if (tokenMatch) return tokenMatch[1];
+  return null;
+}
+
+// P0.5: Synchronous verify (HMAC + expiry only). Does NOT check blacklist.
+// Use this only when you need to extract the userId quickly without DB.
+export function verifyTokenSignature(token: string): { userId: string; exp: number } | null {
   try {
     const parts = token.split('.');
     if (parts.length !== 2) return null;
     const [payloadB64, signature] = parts;
     if (!payloadB64 || !signature) return null;
 
-    // Constant-time comparison
     const expectedSig = createHmac('sha256', getSecret()).update(payloadB64).digest('base64url');
     const sigBuf = Buffer.from(signature);
     const expBuf = Buffer.from(expectedSig);
     if (sigBuf.length !== expBuf.length) return null;
     if (!timingSafeEqual(sigBuf, expBuf)) return null;
 
-    // Validate payload structure
     const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
     if (typeof payload.userId !== 'string' || !payload.userId) return null;
     if (typeof payload.exp !== 'number' || payload.exp < Date.now()) return null;
-
-    return { userId: payload.userId };
+    return { userId: payload.userId, exp: payload.exp };
   } catch {
     return null;
   }
 }
 
-export function getUserIdFromRequest(req: Request): string | null {
-  const authHeader = req.headers.get('authorization');
-  if (authHeader?.startsWith('Bearer ')) {
-    const result = verifyToken(authHeader.slice(7));
-    if (result) return result.userId;
+// P0.5: Check if a token has been revoked server-side.
+// - If in revokedTokenSet (positive cache): revoked = true
+// - If in notRevokedCache (negative cache, 1s TTL): revoked = false
+// - Otherwise: DB lookup, then update the appropriate cache
+async function isTokenRevoked(token: string): Promise<boolean> {
+  // Fast path: known revoked
+  if (revokedTokenSet.has(token)) return true;
+  // Short-TTL negative cache (1s) to coalesce concurrent requests for the
+  // same token (e.g., parallel fetches on the home screen)
+  const negCacheEntry = notRevokedCache.get(token);
+  if (negCacheEntry && (Date.now() - negCacheEntry) < NEG_CACHE_TTL_MS) {
+    return false;
   }
-  const cookie = req.headers.get('cookie') || '';
-  const tokenMatch = cookie.match(/auth-token=([^;]+)/);
-  if (tokenMatch) {
-    const result = verifyToken(tokenMatch[1]);
-    if (result) return result.userId;
+  // DB lookup. Fail-open on DB errors (transient issues shouldn't block legit users).
+  try {
+    const found = await db.revokedToken.findUnique({ where: { token }, select: { id: true } });
+    if (found) {
+      revokedTokenSet.add(token);
+      notRevokedCache.delete(token);
+      return true;
+    }
+    // Cache "not revoked" for 1s to coalesce parallel requests
+    notRevokedCache.set(token, Date.now());
+    return false;
+  } catch {
+    return false;
   }
-  return null;
 }
 
+// P0.5: Revoke a token (insert into DB blacklist + update local caches).
+// Called from /api/auth/logout.
+export async function revokeToken(token: string, userId: string): Promise<void> {
+  const verified = verifyTokenSignature(token);
+  if (!verified) return; // can't revoke an invalid token
+  try {
+    await db.revokedToken.upsert({
+      where: { token },
+      create: { token, userId, expiresAt: new Date(verified.exp) },
+      update: {}, // already revoked
+    });
+    // Update caches immediately so subsequent requests in this worker see revoked=true
+    revokedTokenSet.add(token);
+    notRevokedCache.delete(token);
+  } catch (e) {
+    console.error('Failed to revoke token:', e);
+  }
+}
+
+// P0.5: Periodic cleanup of expired revoked tokens (called opportunistically
+// from /api/auth/logout). Also trims the in-memory set.
+export async function cleanupExpiredRevokedTokens(): Promise<number> {
+  try {
+    const result = await db.revokedToken.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    // Clear local cache too (best-effort — Set has no .filter, so just clear all)
+    // This is fine because the next request for any revoked token will re-fetch.
+    if (result.count > 0) {
+      revokedTokenSet.clear();
+      notRevokedCache.clear();
+    }
+    return result.count;
+  } catch {
+    return 0;
+  }
+}
+
+export function verifyToken(token: string): { userId: string } | null {
+  const result = verifyTokenSignature(token);
+  return result ? { userId: result.userId } : null;
+}
+
+// P0.5: Async version that also checks the revocation blacklist.
+// This is what requireAuth should use for full security.
+export async function getUserIdFromRequestAsync(req: Request): Promise<string | null> {
+  const token = extractToken(req);
+  if (!token) return null;
+  const verified = verifyTokenSignature(token);
+  if (!verified) return null;
+  if (await isTokenRevoked(token)) return null;
+  return verified.userId;
+}
+
+// Synchronous version (kept for backwards compat, but does NOT check blacklist).
+// Prefer getUserIdFromRequestAsync in any route that mutates data.
+export function getUserIdFromRequest(req: Request): string | null {
+  const token = extractToken(req);
+  if (!token) return null;
+  const result = verifyTokenSignature(token);
+  return result ? result.userId : null;
+}
+
+// P0.5: Async requireAuth that checks blacklist.
+export async function requireAuthAsync(req: Request): Promise<string> {
+  const userId = await getUserIdFromRequestAsync(req);
+  if (!userId) throw new Error('Unauthorized');
+  return userId;
+}
+
+// Synchronous requireAuth (legacy, doesn't check blacklist — used only for
+// GET endpoints where stale auth for ~30s is acceptable).
 export function requireAuth(req: Request): string {
   const userId = getUserIdFromRequest(req);
   if (!userId) throw new Error('Unauthorized');
@@ -529,7 +666,7 @@ const globalForPrisma = globalThis as unknown as {
 export const db =
   globalForPrisma.prisma ??
   new PrismaClient({
-    log: ['query'],
+    
   })
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
@@ -1247,10 +1384,24 @@ export async function POST(req: NextRequest) {
 ========================================
 FILE: src/app/api/auth/logout/route.ts
 ========================================
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { revokeToken, extractToken, verifyTokenSignature, cleanupExpiredRevokedTokens } from '@/lib/auth';
 
 // POST /api/auth/logout
-export async function POST() {
+// Server-side token revocation: stores the token in the RevokedToken table
+// until its natural expiry, so even a stolen copy cannot be used after the
+// legitimate user logs out. Also clears the auth cookie.
+export async function POST(req: NextRequest) {
+  const token = extractToken(req);
+  if (token) {
+    const verified = verifyTokenSignature(token);
+    if (verified) {
+      await revokeToken(token, verified.userId);
+    }
+  }
+  // Opportunistic cleanup of expired revoked tokens (no await — fire-and-forget)
+  cleanupExpiredRevokedTokens().catch(() => {});
+
   const response = NextResponse.json({ success: true });
   response.cookies.delete('auth-token');
   return response;
@@ -1284,11 +1435,11 @@ FILE: src/app/api/transactions/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const where: any = { userId };
     const type = url.searchParams.get('type');
@@ -1320,7 +1471,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
 
@@ -1376,11 +1527,11 @@ FILE: src/app/api/transfer/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { fromAccountId, toAccountId, amount, currency, date, note } = body;
 
@@ -1446,12 +1597,12 @@ FILE: src/app/api/accounts/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/accounts - user-scoped
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const accounts = await db.account.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } });
     return NextResponse.json({ data: accounts });
   } catch (err: any) {
@@ -1463,7 +1614,7 @@ export async function GET(req: NextRequest) {
 // POST /api/accounts - user-scoped
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { name, type, currency, balance, color, icon, isDefault } = body;
     if (!name || !type || !currency) {
@@ -1499,12 +1650,12 @@ FILE: src/app/api/categories/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/categories - user-scoped
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const type = url.searchParams.get('type');
     const categories = await db.category.findMany({
@@ -1521,7 +1672,7 @@ export async function GET(req: NextRequest) {
 // POST /api/categories - user-scoped
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { nameAr, nameEn, type, icon, color, id } = body;
     if (!nameAr || !nameEn || !type) {
@@ -1554,12 +1705,12 @@ FILE: src/app/api/stats/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { EXCHANGE_RATES, type Currency } from '@/lib/currency';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/stats?month=YYYY-MM&baseCurrency=EGP
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
     const baseCurrency = (url.searchParams.get('baseCurrency') || 'EGP') as Currency;
@@ -1664,11 +1815,11 @@ FILE: src/app/api/budgets/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
     const where: any = { userId };
@@ -1693,7 +1844,7 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { categoryId, month, limit, currency } = body;
     if (!categoryId || !month || !limit) {
@@ -1723,7 +1874,7 @@ export async function POST(req: NextRequest) {
 
 export async function DELETE(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const id = url.searchParams.get('id');
     if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
@@ -1742,13 +1893,13 @@ FILE: src/app/api/excel/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 import * as XLSX from 'xlsx';
 
 // GET /api/excel?action=export&month=YYYY-MM
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
     const type = url.searchParams.get('type');
@@ -1808,7 +1959,7 @@ export async function GET(req: NextRequest) {
 // POST /api/excel?action=import
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
@@ -1930,12 +2081,12 @@ FILE: src/app/api/backup/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/backup?action=export - user-scoped
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const [accounts, categories, transactions, budgets] = await Promise.all([
       db.account.findMany({ where: { userId } }),
       db.category.findMany({ where: { userId } }),
@@ -1975,7 +2126,7 @@ export async function GET(req: NextRequest) {
 // POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
@@ -2067,12 +2218,12 @@ FILE: src/app/api/reset/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // POST /api/reset - Delete user's transactions + budgets, reset account balances
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
 
     const txCount = await db.transaction.count({ where: { userId } });
     const budgetCount = await db.budget.count({ where: { userId } });

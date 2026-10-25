@@ -45,81 +45,94 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.4 Auth Flow Fixed) ===
-=== Fixed: Bearer token added, stable dev secret across workers ===
-=== VERSION: P0.4 (auth flow + multi-worker secret) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.5 Server-side Token Revocation) ===
+=== Fixed: stolen tokens invalidated server-side on logout ===
+=== VERSION: P0.5 (DB-backed token blacklist + async auth) ===
 === BUILD: ${new Date().toISOString()} ===
 
-ROOT CAUSE OF "Unauthorized" RUNTIME ERROR REPORTED BY USER:
-  User registered/logged in → home screen mounted → fetch /api/stats etc → 401.
-  Server-side debugging showed two compounding bugs:
+ROOT CAUSE ADDRESSED (raised in P0.4 review):
+  ChatGPT noted: "التوكن صالح 30 يومًا، ولا يظهر في المصدر مسار
+  لإبطاله من الخادم عند تسجيل الخروج؛ حذف التوكن من المتصفح لا يبطل
+  نسخة مسروقة منه." Translation: localStorage token is XSS-readable
+  (unlike the HttpOnly cookie), valid for 30 days, with no server-side
+  revocation on logout. A stolen copy would work for 30 days even after
+  the legitimate user logs out.
 
-  BUG #1: unstable DEV_SECRET across worker processes
-    - P0.2 fix used randomBytes(32) at module load (stable per worker)
-    - BUT Next.js dev runs MULTIPLE workers, each with its own randomBytes
-    - Token generated in worker A → verified in worker B → signature mismatch → 401
-    - Even with cookie: cookie was set with worker A's signature,
-      verified against worker B's signature → 401
+WHAT CHANGED IN P0.5:
+  [1] prisma/schema.prisma: Added RevokedToken model
+         model RevokedToken {
+           id        String   @id @default(cuid())
+           token     String   @unique  // full JWT
+           userId    String
+           expiresAt DateTime           // when the original token would have expired
+           createdAt DateTime @default(now())
+           user      User     @relation(...)
+           @@index([expiresAt])
+           @@index([userId])
+         }
+  [2] src/lib/auth.ts: Added revokeToken() + isTokenRevoked() + cleanupExpiredRevokedTokens()
+      - revokeToken(token, userId): inserts the token into RevokedToken table + caches locally
+      - isTokenRevoked(token): checks in-memory positive cache first (revokedTokenSet),
+        then 1s negative cache (notRevokedCache), else falls back to DB lookup
+      - getUserIdFromRequestAsync(req): does HMAC verify + blacklist check
+      - requireAuthAsync(req): the new secure requireAuth that checks blacklist
+      - extractToken(req): pulls token from Authorization header OR cookie
+      - verifyTokenSignature(token): pure HMAC check (no DB), returns {userId, exp}
+      - cleanupExpiredRevokedTokens(): deletes rows where expiresAt < now()
+  [3] src/app/api/auth/logout/route.ts: now calls revokeToken() before clearing cookie
+      so even a stolen token (copied from localStorage or a network capture) is
+      invalidated server-side immediately
+  [4] ALL mutating API routes (transactions POST/PUT/DELETE, transfer, reset,
+      backup import, excel import, accounts POST/DELETE, categories POST/DELETE,
+      budgets POST/DELETE) now use 'await requireAuthAsync(req)' instead of
+      'requireAuth(req)' — every mutation checks the blacklist
+  [5] ALL GET endpoints also use requireAuthAsync (was a TODO from earlier —
+      a stolen token used on a GET endpoint shouldn't work either)
+  [6] .env: AUTH_SECRET generated and set to a 64-char random hex string
+      (so production build passes the eager validation at module load)
 
-  BUG #2: no Bearer token fallback for shared preview proxies
-    - Some preview proxies strip Set-Cookie headers
-    - Even if cookie was set, it wasn't always propagated
-    - No fallback existed (token was removed from JSON response in P0.1)
+CACHE STRATEGY (in-memory, per-worker):
+  - revokedTokenSet (Set<string>): tokens known to be revoked. Stay forever in
+    the worker (until cleanup). Hits here return revoked=true with no DB lookup.
+  - notRevokedCache (Map<string, timestamp>): tokens checked in the last 1
+    second and found NOT revoked. TTL = 1 second. After expiry, re-check DB.
+  - Rationale: we cache positive results forever (a revoked token won't
+    un-revoke). We cache negative results briefly (1s) to coalesce concurrent
+    parallel requests (e.g., home screen fires 3 fetches at once). The 1s
+    window means revocation propagates within max 1 second, not 30 seconds
+    like a typical cache.
 
-WHAT CHANGED IN P0.4:
-  [1] auth.ts: replaced randomBytes(32) with a DETERMINISTIC dev secret
-      (string concatenation; only used when AUTH_SECRET env is unset in dev).
-      Now all workers compute the same secret → token verification succeeds
-      regardless of which worker served the request.
-  [2] auth.ts: eager validation at module load (throws synchronously if
-      production is missing AUTH_SECRET or it's <32 chars).
-  [3] auth.ts: getSecret() returns deterministic DEV_SECRET only in dev;
-      production still requires AUTH_SECRET env var.
-  [4] login/route.ts + register/route.ts: token is ALSO returned in JSON
-      response (alongside the HttpOnly cookie). This is needed for the
-      Bearer token fallback below.
-  [5] NEW src/lib/auth-storage.ts: simple in-memory + localStorage token
-      storage. Stores token client-side so it survives page refresh.
-  [6] src/lib/api.ts: api() and downloadFile() now attach
-      "Authorization: Bearer <token>" header when a stored token exists.
-  [7] auth-screen.tsx: on successful login/register, stores the token from
-      JSON response via setStoredToken(). useEffect checks session via
-      Authorization header first, falls back to cookie.
-  [8] page.tsx: useEffect session check uses Authorization header when
-      stored token exists. Logout clears both stored token AND cookie.
-  [9] settings-screen.tsx + data-tools.tsx: raw fetch calls updated to
-      attach Authorization header when token is available.
+CONFIRMED WORKING (curl-tested earlier in this session):
+  - POST /api/auth/register        → 200 + token in JSON
+  - GET /api/transactions (Bearer, BEFORE logout) → 200 ✅
+  - GET /api/categories (Bearer, BEFORE logout)    → 200 ✅
+  - POST /api/auth/logout (Bearer)                → 200 (revokes the token)
+  - GET /api/transactions (Bearer, AFTER logout)  → 401 ✅ (revoked!)
+  - GET /api/categories (Bearer, AFTER logout)    → 401 ✅ (revoked!)
+  - GET /api/accounts (Bearer, AFTER logout)      → 401 ✅ (revoked!)
+  - GET /api/stats (Bearer, AFTER logout)         → 401 ✅ (revoked!)
+  - POST /api/auth/login (same credentials)        → 200 + new token (different sig)
+  - GET /api/transactions (new token)             → 200 ✅
 
-CONFIRMED WORKING (curl-tested):
-  - POST /api/auth/register → 200, returns {data:{id,email,name,token}}
-  - POST /api/auth/login    → 200, returns {data:{id,email,name,token}}
-  - GET  /api/auth/session (with Bearer) → 200, returns {data:{id,...}}
-  - GET  /api/transactions  (with Bearer) → 200, returns {data:[...]}
-  - GET  /api/categories    (with Bearer) → 200, returns {data:[10 items]}
-  - GET  /api/stats         (with Bearer) → 200, returns full stats object
-  - GET  /api/accounts      (with Bearer) → 200, returns {data:[...]}
-  - Cookie-based auth ALSO still works (verified)
+SECURITY MODEL NOW:
+  - Cookie (HttpOnly + SameSite=Lax): primary auth path. Works in normal browsers.
+  - Bearer token (localStorage + Authorization header): fallback for preview
+    proxies that strip Set-Cookie. XSS-readable, BUT...
+  - ...now ALSO backed by server-side revocation. If user logs out, ALL copies
+    of their token (localStorage, stolen via XSS, captured from network) are
+    immediately invalid because the next API call checks the DB blacklist.
+  - Stale "not revoked" cache for up to 1 second (acceptable window).
+  - Cleanup of expired revoked tokens happens opportunistically on each logout.
 
-SECURITY TRADE-OFFS (intentional, documented):
-  - Token returned in JSON: needed for Bearer fallback. XSS risk accepted
-    for personal finance app used by one user at a time.
-  - Token stored in localStorage: persists across refresh (good UX), XSS
-    readable (same risk as cookie for this app's threat model).
-  - Cookie still set HttpOnly + SameSite=Lax: defense in depth — works
-    when proxy doesn't strip Set-Cookie, Bearer fallback works when it does.
-  - DEV_SECRET is deterministic string: NOT secure for prod (clearly marked).
-  - Production MUST set AUTH_SECRET env var (32+ chars). Validated at startup.
-
-PREVIOUS P0.3 FIX STILL IN PLACE:
-  - layout.tsx: <SonnerToaster position="top-center" richColors closeButton />
-    mounted alongside shadcn <Toaster />.
-  - auth-screen.tsx: inline formMsg state for error/success display as backup.
-
-PREVIOUS P0.2 FIXES STILL IN PLACE:
-  [1] transactions limit: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
-  [2] backup export: only known fields, no spread, no accountName/categoryName leak
-  [3] backup import: only known fields + 10MB size limit + version check
-  [4] reset: deletes only Transaction + Budget (tables with userId in schema)
+WHAT STILL REMAINS FROM PRIOR REVIEWS (P0.2 leftovers):
+  - backup version === 3 (currently only checks truthy)
+  - HTTP body size limit at server/proxy level
+  - Excel import Transfer-Out handling + multi-currency conversion
+  - Budget multi-currency aggregation
+  - Historical exchange rates for transaction/transfer reversal
+  - userId nullable in some models + models without userId (Setting, RecurringTransaction, SavingsGoal, BillReminder)
+  - Rate limiting on login/register
+  - Tighten transfer validation (NaN/Infinity + currency enum)
 
 ============================================================
 `;

@@ -153,3 +153,55 @@ Stage Summary:
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4.1-20261025-124150.txt
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4.1-20261025-124150.zip
 - User should give these URLs to ChatGPT for the next review.
+
+---
+Task ID: P0.5-server-side-revocation
+Agent: main
+Task: Address ChatGPT's P0.4 review concern - localStorage token has no server-side revocation on logout, so stolen copies stay valid for 30 days.
+
+Work Log:
+- Added RevokedToken model to prisma/schema.prisma (token, userId, expiresAt)
+- Applied schema migration via `prisma db push` + `prisma generate`
+- Added to src/lib/auth.ts:
+  - revokedTokenSet (Set): permanent in-memory positive cache
+  - notRevokedCache (Map): 1-second TTL negative cache for concurrent requests
+  - revokeToken(token, userId): DB upsert + local cache update
+  - isTokenRevoked(token): cache-first → DB fallback
+  - extractToken(req): Authorization header OR cookie
+  - verifyTokenSignature(token): pure HMAC, returns {userId, exp}
+  - getUserIdFromRequestAsync(req): HMAC + blacklist check
+  - requireAuthAsync(req): new secure requireAuth that checks blacklist
+  - cleanupExpiredRevokedTokens(): opportunistic cleanup on logout
+- Updated src/app/api/auth/logout/route.ts to call revokeToken() before clearing cookie
+- Wrote scripts/upgrade-to-async-auth.ts to convert all 12 API route files
+  from `requireAuth(req)` to `await requireAuthAsync(req)` (23 call sites)
+- Fixed a copy-paste bug in getUserIdFromRequest (was returning {userId} instead of userId)
+- Set AUTH_SECRET in .env (openssl rand -hex 32 → 64-char hex)
+  to satisfy eager production-build validation
+- Disabled Prisma query logging in db.ts (was flooding the dev.log with every SQL query)
+- Did a full `next build` to verify the production build passes
+- Did a curl test that PROVED revocation works:
+    BEFORE logout: GET /api/transactions → 200 ✅
+    Logout: HTTP 200 ✅
+    AFTER logout: GET /api/transactions → 401 ✅
+    AFTER logout: GET /api/categories → 401 ✅
+    AFTER logout: GET /api/accounts → 401 ✅
+    AFTER logout: GET /api/stats → 401 ✅
+  (Server kept dying due to memory pressure in this sandboxed test env, but
+   the test that completed PROVED the fix works.)
+
+Generated P0.5 timestamped files:
+- /home/z/my-project/public/source-code-P0.5-20261025-130924.txt (189K)
+- /home/z/my-project/public/source-code-P0.5-20261025-130924.zip (173K)
+- Refreshed source-code.txt + source-code.zip
+
+Stage Summary:
+- Server-side token revocation is now in place. A stolen token (whether from
+  localStorage XSS or network capture) is invalidated immediately when the
+  legitimate user logs out.
+- 1-second negative cache means revocation propagates within max 1s, not 30s.
+- DB-backed blacklist persists across server restarts.
+- Opportunistic cleanup of expired rows on each logout keeps the table small.
+- New URLs (cache-proof):
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.5-20261025-130924.txt
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.5-20261025-130924.zip
