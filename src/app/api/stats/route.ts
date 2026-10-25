@@ -38,9 +38,15 @@ export async function GET(req: NextRequest) {
       return inEgp / EXCHANGE_RATES[baseCurrency];
     };
 
-    const expenses = transactions.filter(t => t.type === 'EXPENSE');
-    const incomes = transactions.filter(t => t.type === 'INCOME');
-    const transfers = transactions.filter(t => t.type === 'TRANSFER' as any);
+    // Exclude transfers (both TRANSFER type AND "تحويلات" category from old Money Manager import)
+    const isTransfer = (t: any) =>
+      t.type === 'TRANSFER' ||
+      t.category?.nameAr === 'تحويلات' ||
+      t.category?.nameEn === 'Transfers';
+
+    const expenses = transactions.filter(t => t.type === 'EXPENSE' && !isTransfer(t));
+    const incomes = transactions.filter(t => t.type === 'INCOME' && !isTransfer(t));
+    const transfers = transactions.filter(t => isTransfer(t));
 
     const totalExpense = expenses.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
     const totalIncome = incomes.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
