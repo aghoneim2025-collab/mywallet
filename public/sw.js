@@ -1,4 +1,4 @@
-// Service Worker - MyWallet PWA v3
+// Service Worker - MyWallet PWA v5
 // - NO HTML caching (always network-first)
 // - Static assets only (CSS, JS, icons)
 // - API requests never cached in dev
