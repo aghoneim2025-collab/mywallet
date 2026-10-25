@@ -111,3 +111,45 @@ Stage Summary:
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4-20261025-123938.txt
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4-20261025-123938.zip
 - User should hard-refresh preview, log out (if logged in with stale state), then log in fresh.
+
+---
+Task ID: P0.4.1-a11y
+Agent: main
+Task: Apply ChatGPT's accessibility suggestions from P0.3 review + confirm P0.4 already addresses AUTH_SECRET startup validation.
+
+Work Log:
+- ChatGPT reviewed P0.3 (the older file) and made two minor accessibility suggestions:
+  1. Add role="alert" to error divs
+  2. Add role="status" to success divs
+  Plus noted curl tests don't verify browser message display (correct).
+- ChatGPT also noted P0.3 still had AUTH_SECRET validation inside getSecret(), not at startup.
+  → THIS IS ALREADY FIXED IN P0.4 (which ChatGPT hasn't seen yet).
+  → P0.4 auth.ts has eager validation at module load:
+        if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
+          throw new Error('AUTH_SECRET must be set ...');
+        }
+    This runs synchronously when the module is imported, before any request is served.
+
+Applied changes (P0.4.1):
+- src/components/auth-screen.tsx: added role="alert" for errors, role="status"
+  for success, plus aria-live="assertive"/"polite" for screen readers.
+
+Verified in regenerated source-code.txt:
+- 2 occurrences of role/aria-live (auth-screen.tsx error + success divs)
+- 1 occurrence of eager AUTH_SECRET validation at module load
+- 7 occurrences of Bearer token usage across api.ts, auth-screen.tsx,
+  page.tsx, settings-screen.tsx, data-tools.tsx, banner
+
+Generated P0.4.1 timestamped files:
+- /home/z/my-project/public/source-code-P0.4.1-20261025-124150.txt
+- /home/z/my-project/public/source-code-P0.4.1-20261025-124150.zip
+- Refreshed source-code.txt + source-code.zip
+
+Stage Summary:
+- ChatGPT's P0.3 accessibility suggestions now applied (role/aria-live).
+- Confirmed P0.4 already addresses the AUTH_SECRET startup validation concern
+  (eager throw at module load, not lazy in getSecret()).
+- New URLs (cache-proof):
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4.1-20261025-124150.txt
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4.1-20261025-124150.zip
+- User should give these URLs to ChatGPT for the next review.

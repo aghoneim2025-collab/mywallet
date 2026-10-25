@@ -151,9 +151,11 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
             </div>
           </div>
 
-          {/* Inline form message (backup for Sonner Toaster) */}
+          {/* Inline form message (backup for Sonner Toaster) + a11y attributes */}
           {formMsg && (
             <div
+              role={formMsg.type === 'error' ? 'alert' : 'status'}
+              aria-live={formMsg.type === 'error' ? 'assertive' : 'polite'}
               className={`text-sm px-3 py-2 rounded-md text-center font-medium ${
                 formMsg.type === 'error'
                   ? 'bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'
