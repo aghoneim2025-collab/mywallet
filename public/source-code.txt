@@ -1,81 +1,96 @@
-=== محفظتي (MyWallet) - Source Code (P0.5 Server-side Token Revocation) ===
-=== Fixed: stolen tokens invalidated server-side on logout ===
-=== VERSION: P0.5 (DB-backed token blacklist + async auth) ===
-=== BUILD: 2026-10-25T13:09:24.438Z ===
+=== محفظتي (MyWallet) - Source Code (P0.6 Hashed Token Storage + .env Leak Fix) ===
+=== Fixed: tokens stored as SHA-256 hash in DB; .env removed from ZIPs ===
+=== VERSION: P0.6 (token hashing + secret rotation) ===
+=== BUILD: 2026-10-25T13:18:55.950Z ===
 
-ROOT CAUSE ADDRESSED (raised in P0.4 review):
-  ChatGPT noted: "التوكن صالح 30 يومًا، ولا يظهر في المصدر مسار
-  لإبطاله من الخادم عند تسجيل الخروج؛ حذف التوكن من المتصفح لا يبطل
-  نسخة مسروقة منه." Translation: localStorage token is XSS-readable
-  (unlike the HttpOnly cookie), valid for 30 days, with no server-side
-  revocation on logout. A stolen copy would work for 30 days even after
-  the legitimate user logs out.
+URGENT SECURITY NOTE:
+  In P0.5, the source-code ZIP files inadvertently included the .env file
+  containing the AUTH_SECRET. ChatGPT flagged this risk: "إن ظهر AUTH_SECRET
+  في أي dump أو ZIP متاح للآخرين، اعتبره مكشوفًا، وغيّره وأبطِل الجلسات/
+  التوكنات الموقّعة به."
 
-WHAT CHANGED IN P0.5:
-  [1] prisma/schema.prisma: Added RevokedToken model
-         model RevokedToken {
-           id        String   @id @default(cuid())
-           token     String   @unique  // full JWT
-           userId    String
-           expiresAt DateTime           // when the original token would have expired
-           createdAt DateTime @default(now())
-           user      User     @relation(...)
-           @@index([expiresAt])
-           @@index([userId])
-         }
-  [2] src/lib/auth.ts: Added revokeToken() + isTokenRevoked() + cleanupExpiredRevokedTokens()
-      - revokeToken(token, userId): inserts the token into RevokedToken table + caches locally
-      - isTokenRevoked(token): checks in-memory positive cache first (revokedTokenSet),
-        then 1s negative cache (notRevokedCache), else falls back to DB lookup
-      - getUserIdFromRequestAsync(req): does HMAC verify + blacklist check
-      - requireAuthAsync(req): the new secure requireAuth that checks blacklist
-      - extractToken(req): pulls token from Authorization header OR cookie
-      - verifyTokenSignature(token): pure HMAC check (no DB), returns {userId, exp}
-      - cleanupExpiredRevokedTokens(): deletes rows where expiresAt < now()
-  [3] src/app/api/auth/logout/route.ts: now calls revokeToken() before clearing cookie
-      so even a stolen token (copied from localStorage or a network capture) is
-      invalidated server-side immediately
-  [4] ALL mutating API routes (transactions POST/PUT/DELETE, transfer, reset,
-      backup import, excel import, accounts POST/DELETE, categories POST/DELETE,
-      budgets POST/DELETE) now use 'await requireAuthAsync(req)' instead of
-      'requireAuth(req)' — every mutation checks the blacklist
-  [5] ALL GET endpoints also use requireAuthAsync (was a TODO from earlier —
-      a stolen token used on a GET endpoint shouldn't work either)
-  [6] .env: AUTH_SECRET generated and set to a 64-char random hex string
-      (so production build passes the eager validation at module load)
+  Response taken:
+  [1] ALL old ZIPs (P0.2, P0.3, P0.4, P0.4.1, P0.5) have been deleted from
+      /public. They are no longer downloadable.
+  [2] AUTH_SECRET has been ROTATED — a fresh 64-char hex random value was
+      generated via 'openssl rand -hex 32' and written to .env.
+  [3] Because the secret changed, ALL tokens signed with the OLD secret
+      are now invalid (their HMAC signature no longer matches). Every user
+      is forced to log in again.
+  [4] The new gen-source-dump.ts script EXPLICITLY excludes .env from the
+      ZIP. Verified via 'unzip -l' that .env is absent.
+  [5] Source dump (.txt) only includes code files — never .env.
 
-CACHE STRATEGY (in-memory, per-worker):
-  - revokedTokenSet (Set<string>): tokens known to be revoked. Stay forever in
-    the worker (until cleanup). Hits here return revoked=true with no DB lookup.
-  - notRevokedCache (Map<string, timestamp>): tokens checked in the last 1
-    second and found NOT revoked. TTL = 1 second. After expiry, re-check DB.
-  - Rationale: we cache positive results forever (a revoked token won't
-    un-revoke). We cache negative results briefly (1s) to coalesce concurrent
-    parallel requests (e.g., home screen fires 3 fetches at once). The 1s
-    window means revocation propagates within max 1 second, not 30 seconds
-    like a typical cache.
+P0.6 HASH STORAGE FIX (separate concern, also addressed in this round):
+  ChatGPT noted: "إذا كان حقل RevokedToken.token يخزّن التوكن الخام، فالأفضل
+  تخزين بصمة له بدلًا منه، حتى لا تتحول قاعدة البيانات إلى مخزن للتوكنات
+  القابلة للاستخدام."
 
-CONFIRMED WORKING (curl-tested earlier in this session):
-  - POST /api/auth/register        → 200 + token in JSON
-  - GET /api/transactions (Bearer, BEFORE logout) → 200 ✅
-  - GET /api/categories (Bearer, BEFORE logout)    → 200 ✅
-  - POST /api/auth/logout (Bearer)                → 200 (revokes the token)
-  - GET /api/transactions (Bearer, AFTER logout)  → 401 ✅ (revoked!)
-  - GET /api/categories (Bearer, AFTER logout)    → 401 ✅ (revoked!)
-  - GET /api/accounts (Bearer, AFTER logout)      → 401 ✅ (revoked!)
-  - GET /api/stats (Bearer, AFTER logout)         → 401 ✅ (revoked!)
-  - POST /api/auth/login (same credentials)        → 200 + new token (different sig)
-  - GET /api/transactions (new token)             → 200 ✅
+  What changed:
+  - src/lib/auth.ts: new exported hashToken(token) → SHA-256 hex (64 chars)
+  - revokeToken(token, userId): now stores hashToken(token) in DB, not the raw
+    token. A DB leak now exposes only one-way hashes (which can't be reversed
+    back to the original HMAC-signed JWT).
+  - isTokenRevoked(token): computes hashToken(token) first, then checks
+    cache + DB using the hash (never the raw token).
+  - Both in-memory caches (revokedTokenSet, notRevokedCache) are now keyed
+    by the hash.
 
-SECURITY MODEL NOW:
-  - Cookie (HttpOnly + SameSite=Lax): primary auth path. Works in normal browsers.
-  - Bearer token (localStorage + Authorization header): fallback for preview
-    proxies that strip Set-Cookie. XSS-readable, BUT...
-  - ...now ALSO backed by server-side revocation. If user logs out, ALL copies
-    of their token (localStorage, stolen via XSS, captured from network) are
-    immediately invalid because the next API call checks the DB blacklist.
-  - Stale "not revoked" cache for up to 1 second (acceptable window).
-  - Cleanup of expired revoked tokens happens opportunistically on each logout.
+  Verified by direct test (scripts/test-auth.ts):
+    Token: eyJ1c2VySWQiOiJjbXZudXJnM2cwMD... (122 chars, raw JWT)
+    Hash:  50018e524163fa141b640646c8fc4b97c3db00f43a8578481db1fea55950cfbf (64 hex)
+    DB row stores the HASH, not the JWT. ✅
+
+CROSS-WORKER REVOCATION LATENCY (acknowledged limitation):
+  ChatGPT noted: "الـ revocation ليس فوريًا على جميع العمال إذا كان العامل
+  قد خزّن نتيجة «غير ملغى» لمدة ثانية. قد يقبل عامل آخر التوكن حتى تنتهي
+  هذه المهلة."
+
+  Response: this is correct and intentional. The NEG_CACHE_TTL_MS is set
+  to 1 second specifically to coalesce concurrent parallel requests (the
+  home screen fires 3+ fetches at once on mount, all with the same token).
+  Without this short cache, the DB would be hit 3+ times per page load.
+
+  The MAXIMUM cross-worker revocation delay is 1 second (NEG_CACHE_TTL_MS).
+  After 1 second, even a worker that previously cached "not revoked" will
+  re-fetch from the DB and see the new revocation row.
+
+  For tighter revocation (0 second delay), set NEG_CACHE_TTL_MS = 0 — every
+  request does a DB lookup. Trade-off: more DB load + higher latency per
+  request. For a personal finance app with one user at a time, the 1s
+  window is acceptable.
+
+CLEANUP SCHEDULE (P0.6 also addressed):
+  ChatGPT noted: "الوصف لا يبيّن متى تُستدعى cleanupExpiredRevokedTokens()؛
+  إن لم تكن تُشغّل دوريًا فقد تتراكم السجلات."
+
+  - maybeCleanupExpiredRevokedTokens(): called on every logout.
+    Uses an in-memory counter (logoutCounter). Every 10th logout also runs
+    cleanupExpiredRevokedTokens(), which DELETEs rows where expiresAt < now().
+  - For high-traffic production, this should be wired to a real cron job
+    (e.g., daily at 3 AM). For now, the opportunistic approach is fine.
+
+CONFIRMED WORKING (script test):
+  - generateToken(userId) → returns JWT string
+  - hashToken(token) → returns 64-char hex SHA-256
+  - revokeToken(token, userId) → inserts hash row in DB
+  - DB row.token is 64-char hex (NOT the raw JWT) ✅
+  - DB row.token has no '.' (NOT a JWT) ✅
+  - DB leak would expose hashes, NOT usable tokens ✅
+
+PREVIOUS P0.5 FIXES STILL IN PLACE:
+  - RevokedToken table (now stores hash, not raw)
+  - requireAuthAsync(req) used on all 23 mutating + GET call sites
+  - Logout revokes token server-side
+  - AUTH_SECRET eagerly validated at module load
+
+PREVIOUS P0.2-P0.4 FIXES STILL IN PLACE:
+  - Stable deterministic dev secret (P0.4)
+  - Bearer token fallback in api.ts/auth-storage.ts (P0.4)
+  - Sonner Toaster mounted + inline a11y messages (P0.3)
+  - transactions limit clamp (P0.2)
+  - backup export/import known fields + 10MB limit + version check (P0.2)
+  - reset deletes only Transaction + Budget (P0.2)
 
 WHAT STILL REMAINS FROM PRIOR REVIEWS (P0.2 leftovers):
   - backup version === 3 (currently only checks truthy)
@@ -83,7 +98,8 @@ WHAT STILL REMAINS FROM PRIOR REVIEWS (P0.2 leftovers):
   - Excel import Transfer-Out handling + multi-currency conversion
   - Budget multi-currency aggregation
   - Historical exchange rates for transaction/transfer reversal
-  - userId nullable in some models + models without userId (Setting, RecurringTransaction, SavingsGoal, BillReminder)
+  - userId nullable in some models + models without userId
+    (Setting, RecurringTransaction, SavingsGoal, BillReminder)
   - Rate limiting on login/register
   - Tighten transfer validation (NaN/Infinity + currency enum)
 
@@ -443,10 +459,13 @@ FILE: src/lib/auth.ts
  *           runs MULTIPLE worker processes, each with its own randomBytes
  *   - P0.4: deterministic dev secret (string-based, shared across workers)
  *   - P0.5: server-side token revocation via DB-backed blacklist
- *           (addresses localStorage XSS risk raised in security review)
+ *   - P0.6: store SHA-256 hash of token (not raw) in DB blacklist, so a DB
+ *           leak doesn't turn the table into a vault of usable tokens.
+ *           Rotate AUTH_SECRET after every leak; new secret invalidates ALL
+ *           outstanding tokens (their HMAC signature no longer matches).
  */
 import bcrypt from 'bcryptjs';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHmac, timingSafeEqual, createHash } from 'crypto';
 import { db } from './db';
 
 const TOKEN_SECRET = process.env.AUTH_SECRET;
@@ -471,19 +490,41 @@ function getSecret(): string {
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-// P0.5: in-memory cache for "definitely revoked" tokens.
-// We ONLY cache positive revocation results (token IS revoked).
-// We do NOT cache negative results ("not revoked") because that would
-// delay revocation by up to the cache TTL. This means every request with
-// a non-revoked token does a DB lookup, but revocation is immediate.
+// P0.6: SHA-256 hash the token before storing/looking up in DB or cache.
+// This way, a DB dump doesn't expose usable tokens — only hashes that
+// can't be reversed back to the original HMAC-signed token.
 //
-// Set of revoked tokens (cleared on cleanup).
+// The cache is keyed by the SAME hash so that a positive cache hit means
+// the token (whose hash we know) is revoked.
+export function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+// P0.5: in-memory cache for "definitely revoked" tokens.
+// P0.6: keyed by SHA-256 hash, NOT the raw token.
+// We ONLY cache positive revocation results (token IS revoked).
+// We do NOT cache negative results ("not revoked") for long because that
+// would delay revocation by up to the cache TTL.
+//
+// Set of revoked-token hashes (cleared on cleanup).
 const revokedTokenSet = new Set<string>();
 
 // P0.5: optional short-TTL negative cache to reduce DB load on hot paths.
-// Set to 0 to disable (every request hits DB). 5000ms = max 5s revocation delay.
-const NEG_CACHE_TTL_MS = 1000; // 1 second — minimal revocation window
-const notRevokedCache = new Map<string, number>(); // token -> fetchedAt timestamp
+// Set to 0 to disable (every request hits DB). 1000ms = max 1s revocation delay.
+// P0.6: keyed by SHA-256 hash, NOT the raw token.
+//
+// IMPORTANT NOTE about multi-worker revocation latency:
+// This negative cache is per-worker. If worker A served the logout (clearing
+// its negative cache and adding the token to its positive cache), worker B
+// might still have the token in its negative cache for up to 1 second.
+// During that window, worker B may serve a request with the revoked token.
+// The MAXIMUM revocation delay across workers = NEG_CACHE_TTL_MS (1 second).
+const NEG_CACHE_TTL_MS = 1000; // 1 second — minimal cross-worker revocation window
+const notRevokedCache = new Map<string, number>(); // hash -> fetchedAt timestamp
+
+// P0.6: opportunistic cleanup counter — every Nth logout also runs cleanup.
+const CLEANUP_EVERY_N_LOGOUTS = 10;
+let logoutCounter = 0;
 
 export async function hashPassword(password: string): Promise<string> {
   const salt = await bcrypt.genSalt(12);
@@ -538,64 +579,75 @@ export function verifyTokenSignature(token: string): { userId: string; exp: numb
   }
 }
 
-// P0.5: Check if a token has been revoked server-side.
-// - If in revokedTokenSet (positive cache): revoked = true
-// - If in notRevokedCache (negative cache, 1s TTL): revoked = false
-// - Otherwise: DB lookup, then update the appropriate cache
+// P0.6: Check if a token has been revoked server-side.
+// All DB/cache operations use the SHA-256 hash, never the raw token.
+// - If hash in revokedTokenSet (positive cache): revoked = true
+// - If hash in notRevokedCache (negative cache, 1s TTL): revoked = false
+// - Otherwise: DB lookup on hash, then update the appropriate cache
+//
+// Note on cross-worker latency: this negative cache is per-worker.
+// If worker A serves the logout and worker B still has the token cached
+// as "not revoked", B may accept the token for up to NEG_CACHE_TTL_MS (1s).
+// Maximum cross-worker revocation delay = 1 second.
 async function isTokenRevoked(token: string): Promise<boolean> {
+  const tokenHash = hashToken(token);
   // Fast path: known revoked
-  if (revokedTokenSet.has(token)) return true;
+  if (revokedTokenSet.has(tokenHash)) return true;
   // Short-TTL negative cache (1s) to coalesce concurrent requests for the
   // same token (e.g., parallel fetches on the home screen)
-  const negCacheEntry = notRevokedCache.get(token);
+  const negCacheEntry = notRevokedCache.get(tokenHash);
   if (negCacheEntry && (Date.now() - negCacheEntry) < NEG_CACHE_TTL_MS) {
     return false;
   }
-  // DB lookup. Fail-open on DB errors (transient issues shouldn't block legit users).
+  // DB lookup (on hash). Fail-open on DB errors (transient issues shouldn't block legit users).
   try {
-    const found = await db.revokedToken.findUnique({ where: { token }, select: { id: true } });
+    const found = await db.revokedToken.findUnique({ where: { token: tokenHash }, select: { id: true } });
     if (found) {
-      revokedTokenSet.add(token);
-      notRevokedCache.delete(token);
+      revokedTokenSet.add(tokenHash);
+      notRevokedCache.delete(tokenHash);
       return true;
     }
     // Cache "not revoked" for 1s to coalesce parallel requests
-    notRevokedCache.set(token, Date.now());
+    notRevokedCache.set(tokenHash, Date.now());
     return false;
   } catch {
     return false;
   }
 }
 
-// P0.5: Revoke a token (insert into DB blacklist + update local caches).
+// P0.5/P0.6: Revoke a token (insert SHA-256 hash into DB blacklist + update local caches).
 // Called from /api/auth/logout.
 export async function revokeToken(token: string, userId: string): Promise<void> {
   const verified = verifyTokenSignature(token);
   if (!verified) return; // can't revoke an invalid token
+  const tokenHash = hashToken(token);
   try {
     await db.revokedToken.upsert({
-      where: { token },
-      create: { token, userId, expiresAt: new Date(verified.exp) },
+      where: { token: tokenHash },
+      create: { token: tokenHash, userId, expiresAt: new Date(verified.exp) },
       update: {}, // already revoked
     });
     // Update caches immediately so subsequent requests in this worker see revoked=true
-    revokedTokenSet.add(token);
-    notRevokedCache.delete(token);
+    revokedTokenSet.add(tokenHash);
+    notRevokedCache.delete(tokenHash);
   } catch (e) {
     console.error('Failed to revoke token:', e);
   }
 }
 
-// P0.5: Periodic cleanup of expired revoked tokens (called opportunistically
-// from /api/auth/logout). Also trims the in-memory set.
+// P0.5/P0.6: Cleanup of expired revoked tokens.
+// Called opportunistically on logout — every CLEANUP_EVERY_N_LOGOUTS (10) logouts.
+// Also clears the in-memory revokedTokenSet so it doesn't grow forever.
+//
+// For a more aggressive schedule, this could be wired to a cron job in production.
 export async function cleanupExpiredRevokedTokens(): Promise<number> {
   try {
     const result = await db.revokedToken.deleteMany({
       where: { expiresAt: { lt: new Date() } },
     });
-    // Clear local cache too (best-effort — Set has no .filter, so just clear all)
-    // This is fine because the next request for any revoked token will re-fetch.
     if (result.count > 0) {
+      // Clear local positive cache so it doesn't grow forever.
+      // (Next request for a still-valid token will re-fetch from DB.)
       revokedTokenSet.clear();
       notRevokedCache.clear();
     }
@@ -603,6 +655,16 @@ export async function cleanupExpiredRevokedTokens(): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+// P0.6: Called from /api/auth/logout to opportunistically trigger cleanup.
+// Returns the cleanup count (for logging) or 0 if cleanup was skipped this round.
+export async function maybeCleanupExpiredRevokedTokens(): Promise<number> {
+  logoutCounter++;
+  if (logoutCounter % CLEANUP_EVERY_N_LOGOUTS === 0) {
+    return cleanupExpiredRevokedTokens();
+  }
+  return 0;
 }
 
 export function verifyToken(token: string): { userId: string } | null {
@@ -1385,12 +1447,15 @@ export async function POST(req: NextRequest) {
 FILE: src/app/api/auth/logout/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
-import { revokeToken, extractToken, verifyTokenSignature, cleanupExpiredRevokedTokens } from '@/lib/auth';
+import { revokeToken, extractToken, verifyTokenSignature, maybeCleanupExpiredRevokedTokens } from '@/lib/auth';
 
 // POST /api/auth/logout
-// Server-side token revocation: stores the token in the RevokedToken table
-// until its natural expiry, so even a stolen copy cannot be used after the
-// legitimate user logs out. Also clears the auth cookie.
+// Server-side token revocation: stores a SHA-256 HASH of the token in the
+// RevokedToken table until its natural expiry, so even a stolen copy cannot
+// be used after the legitimate user logs out. (Storing a hash instead of
+// the raw token means a DB leak doesn't expose usable tokens.)
+// Also clears the auth cookie.
+// Every 10th logout also runs cleanup of expired revoked-token rows.
 export async function POST(req: NextRequest) {
   const token = extractToken(req);
   if (token) {
@@ -1399,8 +1464,9 @@ export async function POST(req: NextRequest) {
       await revokeToken(token, verified.userId);
     }
   }
-  // Opportunistic cleanup of expired revoked tokens (no await — fire-and-forget)
-  cleanupExpiredRevokedTokens().catch(() => {});
+  // Opportunistic cleanup of expired revoked tokens (fire-and-forget).
+  // Runs every 10 logouts to keep the table small without per-request overhead.
+  maybeCleanupExpiredRevokedTokens().catch(() => {});
 
   const response = NextResponse.json({ success: true });
   response.cookies.delete('auth-token');

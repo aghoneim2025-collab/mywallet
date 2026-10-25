@@ -45,84 +45,99 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.5 Server-side Token Revocation) ===
-=== Fixed: stolen tokens invalidated server-side on logout ===
-=== VERSION: P0.5 (DB-backed token blacklist + async auth) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.6 Hashed Token Storage + .env Leak Fix) ===
+=== Fixed: tokens stored as SHA-256 hash in DB; .env removed from ZIPs ===
+=== VERSION: P0.6 (token hashing + secret rotation) ===
 === BUILD: ${new Date().toISOString()} ===
 
-ROOT CAUSE ADDRESSED (raised in P0.4 review):
-  ChatGPT noted: "التوكن صالح 30 يومًا، ولا يظهر في المصدر مسار
-  لإبطاله من الخادم عند تسجيل الخروج؛ حذف التوكن من المتصفح لا يبطل
-  نسخة مسروقة منه." Translation: localStorage token is XSS-readable
-  (unlike the HttpOnly cookie), valid for 30 days, with no server-side
-  revocation on logout. A stolen copy would work for 30 days even after
-  the legitimate user logs out.
+URGENT SECURITY NOTE:
+  In P0.5, the source-code ZIP files inadvertently included the .env file
+  containing the AUTH_SECRET. ChatGPT flagged this risk: "إن ظهر AUTH_SECRET
+  في أي dump أو ZIP متاح للآخرين، اعتبره مكشوفًا، وغيّره وأبطِل الجلسات/
+  التوكنات الموقّعة به."
 
-WHAT CHANGED IN P0.5:
-  [1] prisma/schema.prisma: Added RevokedToken model
-         model RevokedToken {
-           id        String   @id @default(cuid())
-           token     String   @unique  // full JWT
-           userId    String
-           expiresAt DateTime           // when the original token would have expired
-           createdAt DateTime @default(now())
-           user      User     @relation(...)
-           @@index([expiresAt])
-           @@index([userId])
-         }
-  [2] src/lib/auth.ts: Added revokeToken() + isTokenRevoked() + cleanupExpiredRevokedTokens()
-      - revokeToken(token, userId): inserts the token into RevokedToken table + caches locally
-      - isTokenRevoked(token): checks in-memory positive cache first (revokedTokenSet),
-        then 1s negative cache (notRevokedCache), else falls back to DB lookup
-      - getUserIdFromRequestAsync(req): does HMAC verify + blacklist check
-      - requireAuthAsync(req): the new secure requireAuth that checks blacklist
-      - extractToken(req): pulls token from Authorization header OR cookie
-      - verifyTokenSignature(token): pure HMAC check (no DB), returns {userId, exp}
-      - cleanupExpiredRevokedTokens(): deletes rows where expiresAt < now()
-  [3] src/app/api/auth/logout/route.ts: now calls revokeToken() before clearing cookie
-      so even a stolen token (copied from localStorage or a network capture) is
-      invalidated server-side immediately
-  [4] ALL mutating API routes (transactions POST/PUT/DELETE, transfer, reset,
-      backup import, excel import, accounts POST/DELETE, categories POST/DELETE,
-      budgets POST/DELETE) now use 'await requireAuthAsync(req)' instead of
-      'requireAuth(req)' — every mutation checks the blacklist
-  [5] ALL GET endpoints also use requireAuthAsync (was a TODO from earlier —
-      a stolen token used on a GET endpoint shouldn't work either)
-  [6] .env: AUTH_SECRET generated and set to a 64-char random hex string
-      (so production build passes the eager validation at module load)
+  Response taken:
+  [1] ALL old ZIPs (P0.2, P0.3, P0.4, P0.4.1, P0.5) have been deleted from
+      /public. They are no longer downloadable.
+  [2] AUTH_SECRET has been ROTATED — a fresh 64-char hex random value was
+      generated via 'openssl rand -hex 32' and written to .env.
+  [3] Because the secret changed, ALL tokens signed with the OLD secret
+      are now invalid (their HMAC signature no longer matches). Every user
+      is forced to log in again.
+  [4] The new gen-source-dump.ts script EXPLICITLY excludes .env from the
+      ZIP. Verified via 'unzip -l' that .env is absent.
+  [5] Source dump (.txt) only includes code files — never .env.
 
-CACHE STRATEGY (in-memory, per-worker):
-  - revokedTokenSet (Set<string>): tokens known to be revoked. Stay forever in
-    the worker (until cleanup). Hits here return revoked=true with no DB lookup.
-  - notRevokedCache (Map<string, timestamp>): tokens checked in the last 1
-    second and found NOT revoked. TTL = 1 second. After expiry, re-check DB.
-  - Rationale: we cache positive results forever (a revoked token won't
-    un-revoke). We cache negative results briefly (1s) to coalesce concurrent
-    parallel requests (e.g., home screen fires 3 fetches at once). The 1s
-    window means revocation propagates within max 1 second, not 30 seconds
-    like a typical cache.
+P0.6 HASH STORAGE FIX (separate concern, also addressed in this round):
+  ChatGPT noted: "إذا كان حقل RevokedToken.token يخزّن التوكن الخام، فالأفضل
+  تخزين بصمة له بدلًا منه، حتى لا تتحول قاعدة البيانات إلى مخزن للتوكنات
+  القابلة للاستخدام."
 
-CONFIRMED WORKING (curl-tested earlier in this session):
-  - POST /api/auth/register        → 200 + token in JSON
-  - GET /api/transactions (Bearer, BEFORE logout) → 200 ✅
-  - GET /api/categories (Bearer, BEFORE logout)    → 200 ✅
-  - POST /api/auth/logout (Bearer)                → 200 (revokes the token)
-  - GET /api/transactions (Bearer, AFTER logout)  → 401 ✅ (revoked!)
-  - GET /api/categories (Bearer, AFTER logout)    → 401 ✅ (revoked!)
-  - GET /api/accounts (Bearer, AFTER logout)      → 401 ✅ (revoked!)
-  - GET /api/stats (Bearer, AFTER logout)         → 401 ✅ (revoked!)
-  - POST /api/auth/login (same credentials)        → 200 + new token (different sig)
-  - GET /api/transactions (new token)             → 200 ✅
+  What changed:
+  - src/lib/auth.ts: new exported hashToken(token) → SHA-256 hex (64 chars)
+  - revokeToken(token, userId): now stores hashToken(token) in DB, not the raw
+    token. A DB leak now exposes only one-way hashes (which can't be reversed
+    back to the original HMAC-signed JWT).
+  - isTokenRevoked(token): computes hashToken(token) first, then checks
+    cache + DB using the hash (never the raw token).
+  - Both in-memory caches (revokedTokenSet, notRevokedCache) are now keyed
+    by the hash.
 
-SECURITY MODEL NOW:
-  - Cookie (HttpOnly + SameSite=Lax): primary auth path. Works in normal browsers.
-  - Bearer token (localStorage + Authorization header): fallback for preview
-    proxies that strip Set-Cookie. XSS-readable, BUT...
-  - ...now ALSO backed by server-side revocation. If user logs out, ALL copies
-    of their token (localStorage, stolen via XSS, captured from network) are
-    immediately invalid because the next API call checks the DB blacklist.
-  - Stale "not revoked" cache for up to 1 second (acceptable window).
-  - Cleanup of expired revoked tokens happens opportunistically on each logout.
+  Verified by direct test (scripts/test-auth.ts):
+    Token: eyJ1c2VySWQiOiJjbXZudXJnM2cwMD... (122 chars, raw JWT)
+    Hash:  50018e524163fa141b640646c8fc4b97c3db00f43a8578481db1fea55950cfbf (64 hex)
+    DB row stores the HASH, not the JWT. ✅
+
+CROSS-WORKER REVOCATION LATENCY (acknowledged limitation):
+  ChatGPT noted: "الـ revocation ليس فوريًا على جميع العمال إذا كان العامل
+  قد خزّن نتيجة «غير ملغى» لمدة ثانية. قد يقبل عامل آخر التوكن حتى تنتهي
+  هذه المهلة."
+
+  Response: this is correct and intentional. The NEG_CACHE_TTL_MS is set
+  to 1 second specifically to coalesce concurrent parallel requests (the
+  home screen fires 3+ fetches at once on mount, all with the same token).
+  Without this short cache, the DB would be hit 3+ times per page load.
+
+  The MAXIMUM cross-worker revocation delay is 1 second (NEG_CACHE_TTL_MS).
+  After 1 second, even a worker that previously cached "not revoked" will
+  re-fetch from the DB and see the new revocation row.
+
+  For tighter revocation (0 second delay), set NEG_CACHE_TTL_MS = 0 — every
+  request does a DB lookup. Trade-off: more DB load + higher latency per
+  request. For a personal finance app with one user at a time, the 1s
+  window is acceptable.
+
+CLEANUP SCHEDULE (P0.6 also addressed):
+  ChatGPT noted: "الوصف لا يبيّن متى تُستدعى cleanupExpiredRevokedTokens()؛
+  إن لم تكن تُشغّل دوريًا فقد تتراكم السجلات."
+
+  - maybeCleanupExpiredRevokedTokens(): called on every logout.
+    Uses an in-memory counter (logoutCounter). Every 10th logout also runs
+    cleanupExpiredRevokedTokens(), which DELETEs rows where expiresAt < now().
+  - For high-traffic production, this should be wired to a real cron job
+    (e.g., daily at 3 AM). For now, the opportunistic approach is fine.
+
+CONFIRMED WORKING (script test):
+  - generateToken(userId) → returns JWT string
+  - hashToken(token) → returns 64-char hex SHA-256
+  - revokeToken(token, userId) → inserts hash row in DB
+  - DB row.token is 64-char hex (NOT the raw JWT) ✅
+  - DB row.token has no '.' (NOT a JWT) ✅
+  - DB leak would expose hashes, NOT usable tokens ✅
+
+PREVIOUS P0.5 FIXES STILL IN PLACE:
+  - RevokedToken table (now stores hash, not raw)
+  - requireAuthAsync(req) used on all 23 mutating + GET call sites
+  - Logout revokes token server-side
+  - AUTH_SECRET eagerly validated at module load
+
+PREVIOUS P0.2-P0.4 FIXES STILL IN PLACE:
+  - Stable deterministic dev secret (P0.4)
+  - Bearer token fallback in api.ts/auth-storage.ts (P0.4)
+  - Sonner Toaster mounted + inline a11y messages (P0.3)
+  - transactions limit clamp (P0.2)
+  - backup export/import known fields + 10MB limit + version check (P0.2)
+  - reset deletes only Transaction + Budget (P0.2)
 
 WHAT STILL REMAINS FROM PRIOR REVIEWS (P0.2 leftovers):
   - backup version === 3 (currently only checks truthy)
@@ -130,7 +145,8 @@ WHAT STILL REMAINS FROM PRIOR REVIEWS (P0.2 leftovers):
   - Excel import Transfer-Out handling + multi-currency conversion
   - Budget multi-currency aggregation
   - Historical exchange rates for transaction/transfer reversal
-  - userId nullable in some models + models without userId (Setting, RecurringTransaction, SavingsGoal, BillReminder)
+  - userId nullable in some models + models without userId
+    (Setting, RecurringTransaction, SavingsGoal, BillReminder)
   - Rate limiting on login/register
   - Tighten transfer validation (NaN/Infinity + currency enum)
 

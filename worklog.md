@@ -205,3 +205,52 @@ Stage Summary:
 - New URLs (cache-proof):
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.5-20261025-130924.txt
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.5-20261025-130924.zip
+
+---
+Task ID: P0.6-hash-rotation
+Agent: main
+Task: Address ChatGPT's P0.5 review concerns:
+  (1) .env may have leaked in source-code ZIPs
+  (2) Raw token stored in DB → DB leak = vault of usable tokens
+  (3) cleanupExpiredRevokedTokens() schedule unclear
+  (4) Cross-worker revocation not immediate (negative cache)
+
+Work Log:
+- Confirmed .env WAS in P0.5 ZIP (unzip -l showed .env: 127 bytes)
+- Deleted ALL old source-code*.zip and source-code*.txt files from /public
+- Generated NEW AUTH_SECRET via `openssl rand -hex 32` (64 hex chars)
+- Updated .env with new secret → all old tokens now invalid (HMAC mismatch)
+- Created scripts/build-source-zip.sh that EXPLICITLY excludes .env (with sanity check)
+- Updated src/lib/auth.ts:
+  - Added exported hashToken(token): SHA-256 hex (64 chars)
+  - revokeToken(): now stores hashToken(token) in DB, not raw token
+  - isTokenRevoked(): computes hash first, checks cache/DB using hash
+  - Both in-memory caches (revokedTokenSet, notRevokedCache) keyed by hash
+- Added maybeCleanupExpiredRevokedTokens() with logoutCounter, runs every 10th logout
+- Updated logout route to use maybeCleanupExpiredRevokedTokens (every 10th logout)
+- Added cross-worker latency documentation in auth.ts comments (max 1s delay)
+- Created scripts/test-auth.ts for direct verification (no dev server needed)
+- Ran test-auth.ts: confirmed DB stores 64-char hex hash, NOT raw JWT
+- Restarted dev server, ran full end-to-end test:
+    Register → 200 + token in JSON ✅
+    GET /api/transactions (Bearer, BEFORE logout) → 200 ✅
+    Logout → 200 ✅
+    GET /api/transactions (Bearer, AFTER logout) → 401 ✅ (revoked!)
+    DB row.token is 64-char hex hash (NOT raw JWT) ✅
+
+Generated P0.6 timestamped files:
+- /home/z/my-project/public/source-code.txt (191K, banner P0.6)
+- /home/z/my-project/public/source-code-P0.6-20261025-131855.zip (178K)
+- /home/z/my-project/public/source-code.zip (refreshed, no .env)
+- Verified: NO .env in any ZIP, NO AUTH_SECRET value in source-code.txt
+
+Stage Summary:
+- AUTH_SECRET rotated → all old tokens invalid (clean slate)
+- Tokens stored as SHA-256 hashes in DB → DB leak doesn't expose usable tokens
+- .env excluded from all future ZIPs (with build-time sanity check)
+- Cross-worker revocation latency documented as max 1 second
+- Opportunistic cleanup runs every 10th logout (clears expired rows)
+- All previous P0.5 fixes still in place (requireAuthAsync everywhere)
+- New URLs (cache-proof):
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code.txt
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.6-20261025-131855.zip

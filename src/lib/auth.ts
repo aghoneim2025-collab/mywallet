@@ -7,10 +7,13 @@
  *           runs MULTIPLE worker processes, each with its own randomBytes
  *   - P0.4: deterministic dev secret (string-based, shared across workers)
  *   - P0.5: server-side token revocation via DB-backed blacklist
- *           (addresses localStorage XSS risk raised in security review)
+ *   - P0.6: store SHA-256 hash of token (not raw) in DB blacklist, so a DB
+ *           leak doesn't turn the table into a vault of usable tokens.
+ *           Rotate AUTH_SECRET after every leak; new secret invalidates ALL
+ *           outstanding tokens (their HMAC signature no longer matches).
  */
 import bcrypt from 'bcryptjs';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHmac, timingSafeEqual, createHash } from 'crypto';
 import { db } from './db';
 
 const TOKEN_SECRET = process.env.AUTH_SECRET;
@@ -35,19 +38,41 @@ function getSecret(): string {
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-// P0.5: in-memory cache for "definitely revoked" tokens.
-// We ONLY cache positive revocation results (token IS revoked).
-// We do NOT cache negative results ("not revoked") because that would
-// delay revocation by up to the cache TTL. This means every request with
-// a non-revoked token does a DB lookup, but revocation is immediate.
+// P0.6: SHA-256 hash the token before storing/looking up in DB or cache.
+// This way, a DB dump doesn't expose usable tokens — only hashes that
+// can't be reversed back to the original HMAC-signed token.
 //
-// Set of revoked tokens (cleared on cleanup).
+// The cache is keyed by the SAME hash so that a positive cache hit means
+// the token (whose hash we know) is revoked.
+export function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+// P0.5: in-memory cache for "definitely revoked" tokens.
+// P0.6: keyed by SHA-256 hash, NOT the raw token.
+// We ONLY cache positive revocation results (token IS revoked).
+// We do NOT cache negative results ("not revoked") for long because that
+// would delay revocation by up to the cache TTL.
+//
+// Set of revoked-token hashes (cleared on cleanup).
 const revokedTokenSet = new Set<string>();
 
 // P0.5: optional short-TTL negative cache to reduce DB load on hot paths.
-// Set to 0 to disable (every request hits DB). 5000ms = max 5s revocation delay.
-const NEG_CACHE_TTL_MS = 1000; // 1 second — minimal revocation window
-const notRevokedCache = new Map<string, number>(); // token -> fetchedAt timestamp
+// Set to 0 to disable (every request hits DB). 1000ms = max 1s revocation delay.
+// P0.6: keyed by SHA-256 hash, NOT the raw token.
+//
+// IMPORTANT NOTE about multi-worker revocation latency:
+// This negative cache is per-worker. If worker A served the logout (clearing
+// its negative cache and adding the token to its positive cache), worker B
+// might still have the token in its negative cache for up to 1 second.
+// During that window, worker B may serve a request with the revoked token.
+// The MAXIMUM revocation delay across workers = NEG_CACHE_TTL_MS (1 second).
+const NEG_CACHE_TTL_MS = 1000; // 1 second — minimal cross-worker revocation window
+const notRevokedCache = new Map<string, number>(); // hash -> fetchedAt timestamp
+
+// P0.6: opportunistic cleanup counter — every Nth logout also runs cleanup.
+const CLEANUP_EVERY_N_LOGOUTS = 10;
+let logoutCounter = 0;
 
 export async function hashPassword(password: string): Promise<string> {
   const salt = await bcrypt.genSalt(12);
@@ -102,64 +127,75 @@ export function verifyTokenSignature(token: string): { userId: string; exp: numb
   }
 }
 
-// P0.5: Check if a token has been revoked server-side.
-// - If in revokedTokenSet (positive cache): revoked = true
-// - If in notRevokedCache (negative cache, 1s TTL): revoked = false
-// - Otherwise: DB lookup, then update the appropriate cache
+// P0.6: Check if a token has been revoked server-side.
+// All DB/cache operations use the SHA-256 hash, never the raw token.
+// - If hash in revokedTokenSet (positive cache): revoked = true
+// - If hash in notRevokedCache (negative cache, 1s TTL): revoked = false
+// - Otherwise: DB lookup on hash, then update the appropriate cache
+//
+// Note on cross-worker latency: this negative cache is per-worker.
+// If worker A serves the logout and worker B still has the token cached
+// as "not revoked", B may accept the token for up to NEG_CACHE_TTL_MS (1s).
+// Maximum cross-worker revocation delay = 1 second.
 async function isTokenRevoked(token: string): Promise<boolean> {
+  const tokenHash = hashToken(token);
   // Fast path: known revoked
-  if (revokedTokenSet.has(token)) return true;
+  if (revokedTokenSet.has(tokenHash)) return true;
   // Short-TTL negative cache (1s) to coalesce concurrent requests for the
   // same token (e.g., parallel fetches on the home screen)
-  const negCacheEntry = notRevokedCache.get(token);
+  const negCacheEntry = notRevokedCache.get(tokenHash);
   if (negCacheEntry && (Date.now() - negCacheEntry) < NEG_CACHE_TTL_MS) {
     return false;
   }
-  // DB lookup. Fail-open on DB errors (transient issues shouldn't block legit users).
+  // DB lookup (on hash). Fail-open on DB errors (transient issues shouldn't block legit users).
   try {
-    const found = await db.revokedToken.findUnique({ where: { token }, select: { id: true } });
+    const found = await db.revokedToken.findUnique({ where: { token: tokenHash }, select: { id: true } });
     if (found) {
-      revokedTokenSet.add(token);
-      notRevokedCache.delete(token);
+      revokedTokenSet.add(tokenHash);
+      notRevokedCache.delete(tokenHash);
       return true;
     }
     // Cache "not revoked" for 1s to coalesce parallel requests
-    notRevokedCache.set(token, Date.now());
+    notRevokedCache.set(tokenHash, Date.now());
     return false;
   } catch {
     return false;
   }
 }
 
-// P0.5: Revoke a token (insert into DB blacklist + update local caches).
+// P0.5/P0.6: Revoke a token (insert SHA-256 hash into DB blacklist + update local caches).
 // Called from /api/auth/logout.
 export async function revokeToken(token: string, userId: string): Promise<void> {
   const verified = verifyTokenSignature(token);
   if (!verified) return; // can't revoke an invalid token
+  const tokenHash = hashToken(token);
   try {
     await db.revokedToken.upsert({
-      where: { token },
-      create: { token, userId, expiresAt: new Date(verified.exp) },
+      where: { token: tokenHash },
+      create: { token: tokenHash, userId, expiresAt: new Date(verified.exp) },
       update: {}, // already revoked
     });
     // Update caches immediately so subsequent requests in this worker see revoked=true
-    revokedTokenSet.add(token);
-    notRevokedCache.delete(token);
+    revokedTokenSet.add(tokenHash);
+    notRevokedCache.delete(tokenHash);
   } catch (e) {
     console.error('Failed to revoke token:', e);
   }
 }
 
-// P0.5: Periodic cleanup of expired revoked tokens (called opportunistically
-// from /api/auth/logout). Also trims the in-memory set.
+// P0.5/P0.6: Cleanup of expired revoked tokens.
+// Called opportunistically on logout — every CLEANUP_EVERY_N_LOGOUTS (10) logouts.
+// Also clears the in-memory revokedTokenSet so it doesn't grow forever.
+//
+// For a more aggressive schedule, this could be wired to a cron job in production.
 export async function cleanupExpiredRevokedTokens(): Promise<number> {
   try {
     const result = await db.revokedToken.deleteMany({
       where: { expiresAt: { lt: new Date() } },
     });
-    // Clear local cache too (best-effort — Set has no .filter, so just clear all)
-    // This is fine because the next request for any revoked token will re-fetch.
     if (result.count > 0) {
+      // Clear local positive cache so it doesn't grow forever.
+      // (Next request for a still-valid token will re-fetch from DB.)
       revokedTokenSet.clear();
       notRevokedCache.clear();
     }
@@ -167,6 +203,16 @@ export async function cleanupExpiredRevokedTokens(): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+// P0.6: Called from /api/auth/logout to opportunistically trigger cleanup.
+// Returns the cleanup count (for logging) or 0 if cleanup was skipped this round.
+export async function maybeCleanupExpiredRevokedTokens(): Promise<number> {
+  logoutCounter++;
+  if (logoutCounter % CLEANUP_EVERY_N_LOGOUTS === 0) {
+    return cleanupExpiredRevokedTokens();
+  }
+  return 0;
 }
 
 export function verifyToken(token: string): { userId: string } | null {
