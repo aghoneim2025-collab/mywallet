@@ -1,0 +1,1521 @@
+=== محفظتي (MyWallet) - Source Code (P0.2 Fixes) ===
+=== Stable dev secret + backup round-trip fixed + reset clarity ===
+=== Updated after third ChatGPT security review ===
+=== VERSION: P0.2 (third revision) ===
+=== BUILD: 20261025-122504 UTC ===
+=== HASH: $(date -u +%s) ===
+
+CONFIRMED P0.2 FIXES (verify against this list):
+  [1] Stable dev secret      → DEV_SECRET = randomBytes(32).toString('hex') at module load (NOT per-call Math.random)
+  [2] AUTH_SECRET validation → production: throws if AUTH_SECRET missing or <32 chars at startup
+  [3] transactions limit     → Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
+  [4] backup export          → only known Transaction fields (no spread ...t, no accountName/categoryName leak)
+  [5] backup import          → only known fields + 10MB file size limit + version check (backup.version && backup.data)
+  [6] reset                  → deletes only Transaction + Budget (tables that have userId in schema). Message: "Deleted N transactions, N budgets. Accounts reset to 0. Categories kept."
+
+VERIFY BY SEARCHING FOR THESE MARKERS:
+  - "DEV_SECRET = randomBytes(32)"           → src/lib/auth.ts
+  - "Math.max(1, Math.min(parseInt"          → src/app/api/transactions/route.ts
+  - "10 * 1024 * 1024"                       → src/app/api/backup/route.ts
+  - "backup?.data || !backup?.version"      → src/app/api/backup/route.ts
+  - "Deleted ${txCount} transactions"        → src/app/api/reset/route.ts
+
+========================================
+FILE: prisma/schema.prisma
+========================================
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ===== User (المستخدم - تسجيل دخول) =====
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  accounts      Account[]
+  categories    Category[]
+  transactions  Transaction[]
+  budgets       Budget[]
+
+  @@map("users")
+}
+
+// ===== Account (الحسابات) =====
+model Account {
+  id        String   @id @default(cuid())
+  name      String
+  type      AccountType
+  currency  Currency
+  balance   Float    @default(0)
+  color     String   @default("#2563EB")
+  icon      String   @default("wallet")
+  isDefault Boolean  @default(false)
+  userId    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions  Transaction[]
+  transfersTo   Transaction[] @relation("TransfersTo")
+
+  @@map("accounts")
+}
+
+enum AccountType {
+  CASH         // نقدي
+  BANK         // بنك
+  E_WALLET     // محفظة إلكترونية
+  CARD         // بطاقة ائتمان
+  SAVINGS      // حساب توفير
+  INVESTMENT   // استثمار (ذهب، كريبتو، أسهم، صناديق)
+  LOAN         // قرض / سلفة
+  EXTERNAL     // حساب خارجي (متابعة فقط - زي عقار، حساب شخص تاني)
+}
+
+enum Currency {
+  EGP
+  SAR
+  USD
+  EUR
+  AED
+}
+
+// ===== Category (الفئات: مصروفات + دخل) =====
+model Category {
+  id        String        @id @default(cuid())
+  nameAr    String
+  nameEn    String
+  type      CategoryType
+  icon      String        @default("tag")
+  color     String        @default("#10B981")
+  isDefault Boolean       @default(false)
+  userId    String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  budgets     Budget[]
+
+  @@map("categories")
+}
+
+enum CategoryType {
+  EXPENSE
+  INCOME
+  TRANSFER   // تحويل بين حسابين (لا يحسب كدخل أو مصروف)
+}
+
+// ===== Transaction (المعاملة: مصروف أو دخل أو تحويل) =====
+model Transaction {
+  id            String   @id @default(cuid())
+  type          CategoryType
+  amount        Float
+  currency      Currency
+  accountId     String
+  categoryId    String
+  toAccountId   String?
+  date          DateTime  @default(now())
+  note          String?
+  tags          String?
+  transferPairId String?
+  userId        String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user         User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account      Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category     Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  toAccount    Account?  @relation("TransfersTo", fields: [toAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([accountId])
+  @@index([toAccountId])
+  @@index([categoryId])
+  @@index([date])
+  @@index([type])
+  @@index([userId])
+  @@map("transactions")
+}
+
+// ===== Budget (الميزانية الشهرية لكل فئة) =====
+model Budget {
+  id          String   @id @default(cuid())
+  categoryId  String
+  month       String
+  limit       Float
+  currency    Currency   @default(EGP)
+  userId      String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category    Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([categoryId, month])
+  @@index([month])
+  @@index([userId])
+  @@map("budgets")
+}
+
+// ===== Setting (الإعدادات العامة) =====
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+// ===== RecurringTransaction (معاملات متكررة - #1) =====
+model RecurringTransaction {
+  id          String   @id @default(cuid())
+  type        String   // EXPENSE | INCOME | TRANSFER
+  amount      Float
+  currency    String
+  accountId   String
+  categoryId  String
+  toAccountId String?  // للتحويلات
+  frequency   String   // daily | weekly | monthly | yearly
+  dayOfMonth  Int?     // يوم التنفيذ (1-31)
+  startDate   DateTime
+  endDate     DateTime?
+  lastRun     DateTime?
+  nextRun     DateTime
+  note        String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("recurring_transactions")
+}
+
+// ===== SavingsGoal (أهداف ادخارية - #7) =====
+model SavingsGoal {
+  id          String   @id @default(cuid())
+  name        String
+  targetAmount Float
+  currentAmount Float @default(0)
+  currency    String   @default("EGP")
+  targetDate  DateTime?
+  color       String   @default("#10B981")
+  icon        String   @default("piggy-bank")
+  achieved    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("savings_goals")
+}
+
+// ===== BillReminder (تذكير فواتير - #8) =====
+model BillReminder {
+  id          String   @id @default(cuid())
+  name        String
+  amount      Float
+  currency    String   @default("EGP")
+  dueDate     DateTime
+  recurring   Boolean  @default(true)
+  frequency   String   @default("monthly") // daily | weekly | monthly | yearly
+  accountId   String?
+  paid        Boolean  @default(false)
+  remindDays  Int      @default(3) // تذكير قبل كام يوم
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("bill_reminders")
+}
+
+========================================
+FILE: src/lib/auth.ts
+========================================
+/**
+ * Secure authentication - bcrypt + HMAC-signed tokens
+ * P0.2 fixes: stable dev secret, startup validation, timingSafeEqual
+ */
+import bcrypt from 'bcryptjs';
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
+
+// Validate AUTH_SECRET at module load time
+const TOKEN_SECRET = process.env.AUTH_SECRET;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// In production: AUTH_SECRET is REQUIRED (fail fast at startup)
+// In development: generate a STABLE random secret (once per process, not per call)
+const DEV_SECRET = randomBytes(32).toString('hex');
+
+function getSecret(): string {
+  if (isProduction) {
+    if (!TOKEN_SECRET || TOKEN_SECRET.length < 32) {
+      throw new Error('AUTH_SECRET must be set to a random string of at least 32 characters in production');
+    }
+    return TOKEN_SECRET;
+  }
+  // Dev: use stable secret (generated once at module load, not per call)
+  return TOKEN_SECRET || DEV_SECRET;
+}
+
+const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = await bcrypt.genSalt(12);
+  return bcrypt.hash(password, salt);
+}
+
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return bcrypt.compare(password, hash);
+}
+
+export function generateToken(userId: string): string {
+  const payload = { userId, exp: Date.now() + TOKEN_EXPIRY_MS };
+  const payloadStr = JSON.stringify(payload);
+  const payloadB64 = Buffer.from(payloadStr).toString('base64url');
+  const signature = createHmac('sha256', getSecret()).update(payloadB64).digest('base64url');
+  return `${payloadB64}.${signature}`;
+}
+
+export function verifyToken(token: string): { userId: string } | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [payloadB64, signature] = parts;
+    if (!payloadB64 || !signature) return null;
+
+    // Constant-time comparison
+    const expectedSig = createHmac('sha256', getSecret()).update(payloadB64).digest('base64url');
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length) return null;
+    if (!timingSafeEqual(sigBuf, expBuf)) return null;
+
+    // Validate payload structure
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
+    if (typeof payload.userId !== 'string' || !payload.userId) return null;
+    if (typeof payload.exp !== 'number' || payload.exp < Date.now()) return null;
+
+    return { userId: payload.userId };
+  } catch {
+    return null;
+  }
+}
+
+export function getUserIdFromRequest(req: Request): string | null {
+  const authHeader = req.headers.get('authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    const result = verifyToken(authHeader.slice(7));
+    if (result) return result.userId;
+  }
+  const cookie = req.headers.get('cookie') || '';
+  const tokenMatch = cookie.match(/auth-token=([^;]+)/);
+  if (tokenMatch) {
+    const result = verifyToken(tokenMatch[1]);
+    if (result) return result.userId;
+  }
+  return null;
+}
+
+export function requireAuth(req: Request): string {
+  const userId = getUserIdFromRequest(req);
+  if (!userId) throw new Error('Unauthorized');
+  return userId;
+}
+
+export function setAuthCookie(response: Response, token: string): Response {
+  const secure = isProduction ? '; Secure' : '';
+  response.headers.set(
+    'Set-Cookie',
+    `auth-token=${token}; HttpOnly; SameSite=Lax${secure}; Max-Age=2592000; Path=/`
+  );
+  return response;
+}
+
+========================================
+FILE: src/app/api/auth/register/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { hashPassword, generateToken, setAuthCookie } from '@/lib/auth';
+
+export async function POST(req: NextRequest) {
+  try {
+    const { email, password, name } = await req.json();
+    if (!email || !password) return NextResponse.json({ error: 'Email and password required' }, { status: 400 });
+    if (password.length < 6) return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 });
+    const normalizedEmail = email.toLowerCase().trim();
+    const existing = await db.user.findUnique({ where: { email: normalizedEmail } });
+    if (existing) return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
+
+    const passwordHash = await hashPassword(password);
+    const result = await db.$transaction(async (tx) => {
+      const user = await tx.user.create({ data: { email: normalizedEmail, name: name || null, passwordHash } });
+      const cats = [
+        { nameAr: 'مصاريف أساسية', nameEn: 'Essentials', type: 'EXPENSE', icon: 'home', color: '#EF4444', userId: user.id },
+        { nameAr: 'تسوق وطعام', nameEn: 'Shopping & Food', type: 'EXPENSE', icon: 'shopping-cart', color: '#F59E0B', userId: user.id },
+        { nameAr: 'مواصلات', nameEn: 'Transportation', type: 'EXPENSE', icon: 'car', color: '#3B82F6', userId: user.id },
+        { nameAr: 'صحة ورعاية', nameEn: 'Health & Care', type: 'EXPENSE', icon: 'heart-pulse', color: '#EC4899', userId: user.id },
+        { nameAr: 'تعليم وتطوير', nameEn: 'Education', type: 'EXPENSE', icon: 'graduation-cap', color: '#8B5CF6', userId: user.id },
+        { nameAr: 'سفر وترفيه', nameEn: 'Travel & Fun', type: 'EXPENSE', icon: 'plane', color: '#06B6D4', userId: user.id },
+        { nameAr: 'اشتراكات وهدايا', nameEn: 'Subscriptions & Gifts', type: 'EXPENSE', icon: 'gift', color: '#14B8A6', userId: user.id },
+        { nameAr: 'راتب أساسي', nameEn: 'Salary', type: 'INCOME', icon: 'banknote', color: '#10B981', userId: user.id },
+        { nameAr: 'دخل فريلانس', nameEn: 'Freelance', type: 'INCOME', icon: 'laptop', color: '#22C55E', userId: user.id },
+        { nameAr: 'دخل استثماري', nameEn: 'Investment', type: 'INCOME', icon: 'trending-up', color: '#16A34A', userId: user.id },
+      ];
+      for (const c of cats) await tx.category.create({ data: c });
+      await tx.account.create({ data: { name: 'محفظتي', type: 'CASH', currency: 'EGP', balance: 0, color: '#2563EB', icon: 'wallet', isDefault: true, userId: user.id } });
+      return user;
+    });
+
+    const token = generateToken(result.id);
+    // Return user data WITHOUT token in JSON (cookie only)
+    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name } });
+    return setAuthCookie(response, token);
+  } catch (err: any) {
+    console.error('Register error:', err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/auth/login/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { verifyPassword, generateToken, setAuthCookie } from '@/lib/auth';
+
+export async function POST(req: NextRequest) {
+  try {
+    const { email, password } = await req.json();
+    if (!email || !password) return NextResponse.json({ error: 'Email and password required' }, { status: 400 });
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await db.user.findUnique({ where: { email: normalizedEmail } });
+    if (!user) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    const valid = await verifyPassword(password, user.passwordHash);
+    if (!valid) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+
+    const token = generateToken(user.id);
+    // Return user data WITHOUT token in JSON (cookie only)
+    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name } });
+    return setAuthCookie(response, token);
+  } catch (err: any) {
+    console.error('Login error:', err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/auth/logout/route.ts
+========================================
+import { NextResponse } from 'next/server';
+
+// POST /api/auth/logout
+export async function POST() {
+  const response = NextResponse.json({ success: true });
+  response.cookies.delete('auth-token');
+  return response;
+}
+
+========================================
+FILE: src/app/api/auth/session/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { getUserIdFromRequest } from '@/lib/auth';
+
+// GET /api/auth/session - check if logged in
+export async function GET(req: NextRequest) {
+  const userId = getUserIdFromRequest(req);
+  if (!userId) {
+    return NextResponse.json({ data: null }, { status: 200 });
+  }
+
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { id: true, email: true, name: true },
+  });
+
+  return NextResponse.json({ data: user });
+}
+
+========================================
+FILE: src/app/api/transactions/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { convert, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
+
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const url = new URL(req.url);
+    const where: any = { userId };
+    const type = url.searchParams.get('type');
+    const accountId = url.searchParams.get('accountId');
+    const categoryId = url.searchParams.get('categoryId');
+    const from = url.searchParams.get('from');
+    const to = url.searchParams.get('to');
+    const limit = url.searchParams.get('limit');
+    if (type) where.type = type;
+    if (accountId) where.accountId = accountId;
+    if (categoryId) where.categoryId = categoryId;
+    if (from || to) {
+      where.date = {};
+      if (from) where.date.gte = new Date(from);
+      if (to) where.date.lte = new Date(to);
+    }
+    const transactions = await db.transaction.findMany({
+      where,
+      include: { account: true, category: true, toAccount: true },
+      orderBy: { date: 'desc' },
+      ...(limit ? { take: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000)) } : {}),
+    });
+    return NextResponse.json({ data: transactions });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const body = await req.json();
+    const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
+
+    // Validate input
+    if (!type || !['EXPENSE', 'INCOME'].includes(type)) {
+      return NextResponse.json({ error: 'Type must be EXPENSE or INCOME' }, { status: 400 });
+    }
+    const amt = Number(amount);
+    if (!amt || amt <= 0 || !isFinite(amt)) {
+      return NextResponse.json({ error: 'Amount must be positive number' }, { status: 400 });
+    }
+    if (!accountId || !categoryId) {
+      return NextResponse.json({ error: 'accountId and categoryId required' }, { status: 400 });
+    }
+
+    // Verify BOTH account AND category ownership
+    const [account, category] = await Promise.all([
+      db.account.findFirst({ where: { id: accountId, userId } }),
+      db.category.findFirst({ where: { id: categoryId, userId } }),
+    ]);
+    if (!account) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
+    if (!category) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
+
+    // Verify category type matches transaction type
+    if (category.type !== type) {
+      return NextResponse.json({ error: `Category type mismatch: category is ${category.type}, transaction is ${type}` }, { status: 400 });
+    }
+
+    const txCurrency = (currency || account.currency) as Currency;
+    const amountInAccountCurrency = txCurrency === account.currency
+      ? amt : convert(amt, txCurrency, account.currency as Currency);
+    const delta = type === 'INCOME' ? amountInAccountCurrency : -amountInAccountCurrency;
+
+    // ATOMIC
+    const transaction = await db.$transaction(async (tx) => {
+      await tx.account.update({ where: { id: accountId }, data: { balance: { increment: delta } } });
+      return tx.transaction.create({
+        data: { type, amount: amt, currency: txCurrency, accountId, categoryId, userId,
+          date: date ? new Date(date) : new Date(), note: note || null, tags: tags || null },
+        include: { account: true, category: true },
+      });
+    });
+    return NextResponse.json({ data: transaction });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/transactions/[id]/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { convert, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
+
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    const t = await db.transaction.findFirst({ where: { id, userId }, include: { account: true, category: true, toAccount: true } });
+    if (!t) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    return NextResponse.json({ data: t });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    const existing = await db.transaction.findFirst({ where: { id, userId } });
+    if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+    // REJECT editing TRANSFER via this route
+    if (existing.type === 'TRANSFER' as any) {
+      return NextResponse.json({ error: 'Cannot edit transfer. Delete and recreate.' }, { status: 400 });
+    }
+
+    const body = await req.json();
+    const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
+    const newType = type || existing.type;
+    if (!['EXPENSE', 'INCOME'].includes(newType)) {
+      return NextResponse.json({ error: 'Type must be EXPENSE or INCOME' }, { status: 400 });
+    }
+    const newAmount = Number(amount ?? existing.amount);
+    if (!newAmount || newAmount <= 0 || !isFinite(newAmount)) {
+      return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
+    }
+
+    // Verify BOTH account AND category ownership
+    const newAccountId = accountId || existing.accountId;
+    const newCategoryId = categoryId || existing.categoryId;
+    const [newAccount, newCategory] = await Promise.all([
+      db.account.findFirst({ where: { id: newAccountId, userId } }),
+      db.category.findFirst({ where: { id: newCategoryId, userId } }),
+    ]);
+    if (!newAccount) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
+    if (!newCategory) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
+    if (newCategory.type !== newType) {
+      return NextResponse.json({ error: 'Category type mismatch' }, { status: 400 });
+    }
+
+    const newTxCurrency = (currency || existing.currency) as Currency;
+    const newAmountInAcc = newTxCurrency === newAccount.currency
+      ? newAmount : convert(newAmount, newTxCurrency, newAccount.currency as Currency);
+    const newDelta = newType === 'INCOME' ? newAmountInAcc : -newAmountInAcc;
+
+    // ATOMIC: reverse old + apply new
+    const updated = await db.$transaction(async (tx) => {
+      // Reverse old
+      const oldAcc = await tx.account.findUnique({ where: { id: existing.accountId } });
+      if (oldAcc) {
+        const oldAmt = existing.currency === oldAcc.currency
+          ? existing.amount : convert(existing.amount, existing.currency as Currency, oldAcc.currency as Currency);
+        const oldDelta = existing.type === 'INCOME' ? -oldAmt : oldAmt;
+        await tx.account.update({ where: { id: existing.accountId }, data: { balance: { increment: oldDelta } } });
+      }
+      // Apply new
+      await tx.account.update({ where: { id: newAccount.id }, data: { balance: { increment: newDelta } } });
+      return tx.transaction.update({ where: { id }, data: {
+        type: newType, amount: newAmount, currency: newTxCurrency,
+        accountId: newAccount.id, categoryId: newCategory.id,
+        date: date ? new Date(date) : existing.date,
+        note: note !== undefined ? note : existing.note,
+        tags: tags !== undefined ? tags : existing.tags,
+      }, include: { account: true, category: true, toAccount: true } });
+    });
+    return NextResponse.json({ data: updated });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    const existing = await db.transaction.findFirst({ where: { id, userId } });
+    if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+    if (existing.type === 'TRANSFER' as any && existing.toAccountId) {
+      // ATOMIC: reverse both accounts
+      await db.$transaction(async (tx) => {
+        const [src, dst] = await Promise.all([
+          tx.account.findFirst({ where: { id: existing.accountId, userId } }),
+          tx.account.findFirst({ where: { id: existing.toAccountId!, userId } }),
+        ]);
+        if (src) {
+          const amt = existing.currency === src.currency ? existing.amount
+            : convert(existing.amount, existing.currency as Currency, src.currency as Currency);
+          await tx.account.update({ where: { id: src.id }, data: { balance: { increment: amt } } });
+        }
+        if (dst) {
+          const amt = existing.currency === dst.currency ? existing.amount
+            : convert(existing.amount, existing.currency as Currency, dst.currency as Currency);
+          await tx.account.update({ where: { id: dst.id }, data: { balance: { increment: -amt } } });
+        }
+        await tx.transaction.delete({ where: { id } });
+      });
+      return NextResponse.json({ success: true });
+    }
+
+    // Normal: ATOMIC reverse + delete
+    await db.$transaction(async (tx) => {
+      const acc = await tx.account.findFirst({ where: { id: existing.accountId, userId } });
+      if (acc) {
+        const amt = existing.currency === acc.currency ? existing.amount
+          : convert(existing.amount, existing.currency as Currency, acc.currency as Currency);
+        const delta = existing.type === 'INCOME' ? -amt : amt;
+        await tx.account.update({ where: { id: acc.id }, data: { balance: { increment: delta } } });
+      }
+      await tx.transaction.delete({ where: { id } });
+    });
+    return NextResponse.json({ success: true });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/stats/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { EXCHANGE_RATES, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
+
+// GET /api/stats?month=YYYY-MM&baseCurrency=EGP
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const url = new URL(req.url);
+    const month = url.searchParams.get('month');
+    const baseCurrency = (url.searchParams.get('baseCurrency') || 'EGP') as Currency;
+
+    let start: Date, end: Date;
+    if (month) {
+      start = new Date(`${month}-01T00:00:00.000Z`);
+      end = new Date(start);
+      end.setMonth(end.getMonth() + 1);
+    } else {
+      start = new Date();
+      start.setDate(1);
+      start.setHours(0, 0, 0, 0);
+      end = new Date(start);
+      end.setMonth(end.getMonth() + 1);
+    }
+
+    const transactions = await db.transaction.findMany({
+      where: { date: { gte: start, lt: end }, userId },
+      include: { category: true, account: true },
+    });
+
+    const accounts = await db.account.findMany({ where: { userId } });
+
+    const toBase = (amount: number, from: string) => {
+      const fromCur = (from as Currency) || 'EGP';
+      if (fromCur === baseCurrency) return amount;
+      const inEgp = amount * EXCHANGE_RATES[fromCur];
+      return inEgp / EXCHANGE_RATES[baseCurrency];
+    };
+
+    // Exclude transfers from BOTH expense and income
+    const isTransfer = (t: any) =>
+      t.type === 'TRANSFER' ||
+      t.category?.nameAr === 'تحويلات' ||
+      t.category?.nameEn === 'Transfers';
+
+    const expenses = transactions.filter(t => t.type === 'EXPENSE' && !isTransfer(t));
+    const incomes = transactions.filter(t => t.type === 'INCOME' && !isTransfer(t));
+
+    const totalExpense = expenses.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
+    const totalIncome = incomes.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
+
+    // Total assets: exclude LOAN type
+    const totalAssets = accounts
+      .filter(a => a.type !== 'LOAN')
+      .reduce((s, a) => s + toBase(a.balance, a.currency), 0);
+    const totalLiabilities = accounts
+      .filter(a => a.type === 'LOAN' && a.balance < 0)
+      .reduce((s, a) => s + Math.abs(toBase(a.balance, a.currency)), 0);
+
+    const byCategoryMap: Record<string, { total: number; count: number; category: any }> = {};
+    expenses.forEach(t => {
+      const cid = t.categoryId;
+      if (!byCategoryMap[cid]) byCategoryMap[cid] = { total: 0, count: 0, category: t.category };
+      byCategoryMap[cid].total += toBase(t.amount, t.currency);
+      byCategoryMap[cid].count += 1;
+    });
+
+    // Daily chart: exclude transfers
+    const daysInMonth = new Date(end.getFullYear(), end.getMonth(), 0).getDate();
+    const byDay: { date: string; expense: number; income: number }[] = [];
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateStr = `${month || start.toISOString().slice(0, 7)}-${String(day).padStart(2, '0')}`;
+      byDay.push({ date: dateStr, expense: 0, income: 0 });
+    }
+    transactions.forEach(t => {
+      if (isTransfer(t)) return; // Exclude transfers from daily chart too
+      const day = t.date.getDate();
+      const idx = day - 1;
+      if (idx >= 0 && idx < byDay.length) {
+        if (t.type === 'EXPENSE') byDay[idx].expense += toBase(t.amount, t.currency);
+        else if (t.type === 'INCOME') byDay[idx].income += toBase(t.amount, t.currency);
+      }
+    });
+
+    return NextResponse.json({
+      data: {
+        totalExpense,
+        totalIncome,
+        balance: totalIncome - totalExpense,
+        totalAssets,
+        totalLiabilities,
+        net: totalAssets - totalLiabilities,
+        baseCurrency,
+        expenseCount: expenses.length,
+        incomeCount: incomes.length,
+        byCategory: Object.values(byCategoryMap).sort((a: any, b: any) => b.total - a.total),
+        byDay,
+        month: month || start.toISOString().slice(0, 7),
+      },
+    });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    console.error('GET /api/stats error:', err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/transfer/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { convert, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
+
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const body = await req.json();
+    const { fromAccountId, toAccountId, amount, currency, date, note } = body;
+
+    if (!fromAccountId || !toAccountId || !amount || fromAccountId === toAccountId) {
+      return NextResponse.json({ error: 'Invalid transfer parameters' }, { status: 400 });
+    }
+
+    const amt = Number(amount);
+    if (amt <= 0) return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
+
+    // Verify both accounts belong to user
+    const [sourceAccount, destAccount] = await Promise.all([
+      db.account.findFirst({ where: { id: fromAccountId, userId } }),
+      db.account.findFirst({ where: { id: toAccountId, userId } }),
+    ]);
+    if (!sourceAccount) return NextResponse.json({ error: 'Source account not found' }, { status: 404 });
+    if (!destAccount) return NextResponse.json({ error: 'Destination account not found' }, { status: 404 });
+
+    const txCurrency = (currency || sourceAccount.currency) as Currency;
+    const sourceAmount = txCurrency === sourceAccount.currency
+      ? amt : convert(amt, txCurrency, sourceAccount.currency as Currency);
+    const destAmount = txCurrency === destAccount.currency
+      ? amt : convert(amt, txCurrency, destAccount.currency as Currency);
+
+    // ATOMIC: update both balances + create transaction
+    let transferCat = await db.category.findFirst({ where: { nameAr: 'تحويلات', userId } });
+    if (!transferCat) {
+      transferCat = await db.category.create({
+        data: { nameAr: 'تحويلات', nameEn: 'Transfers', type: 'EXPENSE', icon: 'arrow-right-left', color: '#64748B', userId },
+      });
+    }
+
+    const transfer = await db.$transaction(async (tx) => {
+      await tx.account.update({ where: { id: fromAccountId }, data: { balance: { increment: -sourceAmount } } });
+      await tx.account.update({ where: { id: toAccountId }, data: { balance: { increment: destAmount } } });
+
+      return tx.transaction.create({
+        data: {
+          type: 'TRANSFER' as any,
+          amount: amt,
+          currency: txCurrency,
+          accountId: fromAccountId,
+          categoryId: transferCat!.id,
+          toAccountId: toAccountId,
+          userId,
+          date: date ? new Date(date) : new Date(),
+          note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
+        },
+        include: { account: true, category: true, toAccount: true },
+      });
+    });
+
+    return NextResponse.json({ data: transfer });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    console.error('Transfer error:', err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/excel/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+import * as XLSX from 'xlsx';
+
+// GET /api/excel?action=export&month=YYYY-MM
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const url = new URL(req.url);
+    const month = url.searchParams.get('month');
+    const type = url.searchParams.get('type');
+
+    const where: any = { userId };
+    if (type) where.type = type;
+    if (month) {
+      const start = new Date(`${month}-01T00:00:00.000Z`);
+      const end = new Date(start);
+      end.setMonth(end.getMonth() + 1);
+      where.date = { gte: start, lt: end };
+    }
+
+    const transactions = await db.transaction.findMany({
+      where,
+      include: { account: true, category: true },
+      orderBy: { date: 'desc' },
+    });
+
+    const rows = transactions.map(t => ({
+      'Date': t.date.toISOString().slice(0, 10),
+      'Account': t.account.name,
+      'Category': t.category.nameAr,
+      'Subcategory': '*',
+      'Note': t.note || '',
+      'SAR': t.amount,
+      'Income/Expense': t.type === 'INCOME' ? 'Income' : t.type === 'TRANSFER' ? 'Transfer-Out' : 'Expense',
+      'Description': '',
+      'Amount': t.amount,
+      'Currency': t.currency,
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [
+      { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 8 }, { wch: 30 },
+      { wch: 12 }, { wch: 12 }, { wch: 20 }, { wch: 12 }, { wch: 8 },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Money Manager');
+
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    return new NextResponse(buf, {
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="mywallet-${month || 'all'}.xlsx"`,
+      },
+    });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    console.error('Excel export error:', err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+// POST /api/excel?action=import
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const formData = await req.formData();
+    const file = formData.get('file') as File;
+    if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(Buffer.from(buf), { type: 'buffer', cellDates: true });
+    const wsName = wb.SheetNames[0];
+    const ws = wb.Sheets[wsName];
+    const rows = XLSX.utils.sheet_to_json<any>(ws, { defval: '' });
+
+    if (rows.length === 0) return NextResponse.json({ error: 'No data found' }, { status: 400 });
+
+    const existingAccounts = await db.account.findMany({ where: { userId } });
+    const existingCategories = await db.category.findMany({ where: { userId } });
+    const accByArName = new Map(existingAccounts.map(a => [a.name, a]));
+    const catByArName = new Map(existingCategories.map(c => [c.nameAr, c]));
+    const catByEnName = new Map(existingCategories.map(c => [c.nameEn, c]));
+
+    const ensureAccount = async (name: string, currency: string = 'SAR') => {
+      if (!name) return null;
+      const existing = accByArName.get(name);
+      if (existing) return existing;
+      const created = await db.account.create({
+        data: { name, type: 'BANK', currency: currency as any, balance: 0, userId },
+      });
+      accByArName.set(name, created);
+      return created;
+    };
+
+    const ensureCategory = async (nameAr: string, rowType: string, amount: number) => {
+      if (!nameAr || nameAr === 'None' || nameAr === '*') return null;
+      const isIncome = rowType === 'income' || amount < 0;
+      const type = isIncome ? 'INCOME' : 'EXPENSE';
+      const existing = catByArName.get(nameAr);
+      if (existing) return existing;
+      const created = await db.category.create({
+        data: { nameAr, nameEn: nameAr, type: type as any, icon: 'tag', color: '#64748B', userId },
+      });
+      catByArName.set(created.nameAr, created);
+      return created;
+    };
+
+    let imported = 0, skipped = 0;
+    for (const row of rows) {
+      try {
+        const keys = Object.keys(row);
+        const findKey = (patterns: string[]) => {
+          for (const p of patterns) {
+            const k = keys.find(k => k.toLowerCase().trim().includes(p.toLowerCase()));
+            if (k) return k;
+          }
+          return undefined;
+        };
+
+        const dateKey = findKey(['date', 'تاريخ']);
+        const accountKey = findKey(['account', 'حساب']);
+        const catKey = findKey(['category', 'فئة', 'تصنيف']);
+        const typeKey = findKey(['income/expense', 'نوع', 'type']);
+        const amountKey = findKey(['sar', 'amount', 'مبلغ', 'value']);
+        const currencyKey = findKey(['currency', 'عملة']);
+        const noteKey = findKey(['note', 'ملاحظة', 'description']);
+
+        let date: Date = new Date();
+        if (dateKey) {
+          const dv = row[dateKey];
+          if (dv instanceof Date) date = dv;
+          else if (typeof dv === 'number') date = new Date((Math.floor(dv) - 25569) * 86400 * 1000);
+          else if (typeof dv === 'string') {
+            const str = dv.trim();
+            if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+              const [dd, mm, yyyy] = str.split('/');
+              date = new Date(`${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`);
+            } else date = new Date(str);
+          }
+        }
+
+        const amount = amountKey ? parseFloat(String(row[amountKey])) || 0 : 0;
+        if (!amount) { skipped++; continue; }
+
+        const accName = accountKey ? String(row[accountKey] || '').trim() : '';
+        if (!accName) { skipped++; continue; }
+        const account = await ensureAccount(accName);
+        if (!account) { skipped++; continue; }
+
+        const catName = catKey ? String(row[catKey] || '').trim() : '';
+        const rowType = (typeKey ? String(row[typeKey] || 'Expense') : 'Expense').toLowerCase();
+        const category = await ensureCategory(catName, rowType, amount);
+        if (!category) { skipped++; continue; }
+
+        const currency = (currencyKey ? String(row[currencyKey] || 'SAR') : 'SAR').toUpperCase();
+        const note = noteKey ? String(row[noteKey] || '') : '';
+
+        const txType = rowType === 'income' || amount < 0 ? 'INCOME' : 'EXPENSE';
+        const absAmount = Math.abs(amount);
+
+        // ATOMIC: update balance + create transaction
+        await db.$transaction(async (tx) => {
+          const delta = txType === 'INCOME' ? absAmount : -absAmount;
+          await tx.account.update({ where: { id: account.id }, data: { balance: { increment: delta } } });
+          await tx.transaction.create({
+            data: { type: txType, amount: absAmount, currency, accountId: account.id, categoryId: category.id, date, note: note || null, userId },
+          });
+        });
+
+        imported++;
+      } catch (e) { skipped++; }
+    }
+
+    return NextResponse.json({ success: true, imported, skipped, message: `Imported ${imported}, skipped ${skipped}` });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    console.error('Excel import error:', err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/backup/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+// GET /api/backup?action=export - user-scoped
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const [accounts, categories, transactions, budgets] = await Promise.all([
+      db.account.findMany({ where: { userId } }),
+      db.category.findMany({ where: { userId } }),
+      db.transaction.findMany({ where: { userId }, include: { account: true, category: true } }),
+      db.budget.findMany({ where: { userId } }),
+    ]);
+
+    const backup = {
+      version: 3,
+      app: 'mywallet',
+      exportedAt: new Date().toISOString(),
+      data: {
+        accounts: accounts.map(({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) => 
+          ({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
+        categories: categories.map(({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) => 
+          ({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
+        // Only export known Transaction fields (NO accountName/categoryName)
+        transactions: transactions.map(({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, userId: _uid, createdAt, updatedAt }) => 
+          ({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, createdAt, updatedAt })),
+        budgets: budgets.map(({ id, categoryId, month, limit, currency, createdAt, updatedAt }) => 
+          ({ id, categoryId, month, limit, currency, createdAt, updatedAt })),
+      },
+    };
+
+    return new NextResponse(JSON.stringify(backup, null, 2), {
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="mywallet-backup-${new Date().toISOString().slice(0, 10)}.json"`,
+      },
+    });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+// POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const formData = await req.formData();
+    const file = formData.get('file') as File;
+    if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+    
+    // Limit file size (10MB max)
+    if (file.size > 10 * 1024 * 1024) {
+      return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 400 });
+    }
+
+    const text = await file.text();
+    let backup;
+    try {
+      backup = JSON.parse(text);
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON file' }, { status: 400 });
+    }
+    
+    if (!backup?.data || !backup?.version) {
+      return NextResponse.json({ error: 'Invalid backup format - missing version or data' }, { status: 400 });
+    }
+
+    const { accounts, categories, transactions, budgets } = backup.data;
+
+    // ATOMIC: delete old + restore new (only with known fields)
+    const result = await db.$transaction(async (tx) => {
+      await tx.transaction.deleteMany({ where: { userId } });
+      await tx.budget.deleteMany({ where: { userId } });
+      await tx.account.deleteMany({ where: { userId } });
+      await tx.category.deleteMany({ where: { userId } });
+
+      let catCount = 0, accCount = 0, txCount = 0, budCount = 0;
+
+      for (const c of categories || []) {
+        await tx.category.create({
+          data: {
+            id: c.id, nameAr: c.nameAr, nameEn: c.nameEn, type: c.type,
+            icon: c.icon || 'tag', color: c.color || '#10B981',
+            isDefault: c.isDefault || false, userId,
+          },
+        });
+        catCount++;
+      }
+      for (const a of accounts || []) {
+        await tx.account.create({
+          data: {
+            id: a.id, name: a.name, type: a.type, currency: a.currency,
+            balance: a.balance || 0, color: a.color || '#2563EB',
+            icon: a.icon || 'wallet', isDefault: a.isDefault || false, userId,
+          },
+        });
+        accCount++;
+      }
+      for (const t of transactions || []) {
+        await tx.transaction.create({
+          data: {
+            id: t.id, type: t.type, amount: t.amount, currency: t.currency,
+            accountId: t.accountId, categoryId: t.categoryId,
+            toAccountId: t.toAccountId || null,
+            date: new Date(t.date),
+            note: t.note || null, tags: t.tags || null,
+            transferPairId: t.transferPairId || null,
+            userId,
+          },
+        });
+        txCount++;
+      }
+      for (const b of budgets || []) {
+        await tx.budget.create({
+          data: {
+            id: b.id, categoryId: b.categoryId, month: b.month,
+            limit: b.limit, currency: b.currency || 'EGP', userId,
+          },
+        });
+        budCount++;
+      }
+
+      return { accounts: accCount, categories: catCount, transactions: txCount, budgets: budCount };
+    });
+
+    return NextResponse.json({ success: true, imported: result });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/reset/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+// POST /api/reset - Delete user's transactions + budgets, reset account balances
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+
+    const txCount = await db.transaction.count({ where: { userId } });
+    const budgetCount = await db.budget.count({ where: { userId } });
+
+    await db.$transaction(async (tx) => {
+      // Delete only models that HAVE userId in schema
+      await tx.transaction.deleteMany({ where: { userId } });
+      await tx.budget.deleteMany({ where: { userId } });
+
+      // Reset account balances to 0 (keep accounts + categories for reuse)
+      const accounts = await tx.account.findMany({ where: { userId } });
+      for (const acc of accounts) {
+        await tx.account.update({ where: { id: acc.id }, data: { balance: 0 } });
+      }
+    });
+
+    return NextResponse.json({
+      success: true,
+      deleted: { transactions: txCount, budgets: budgetCount },
+      message: `Deleted ${txCount} transactions, ${budgetCount} budgets. Accounts reset to 0. Categories kept.`,
+    });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/categories/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+// GET /api/categories - user-scoped
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const url = new URL(req.url);
+    const type = url.searchParams.get('type');
+    const categories = await db.category.findMany({
+      where: { userId, ...(type ? { type: type as any } : {}) },
+      orderBy: [{ isDefault: 'desc' }, { type: 'asc' }],
+    });
+    return NextResponse.json({ data: categories });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+// POST /api/categories - user-scoped
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const body = await req.json();
+    const { nameAr, nameEn, type, icon, color, id } = body;
+    if (!nameAr || !nameEn || !type) {
+      return NextResponse.json({ error: 'nameAr, nameEn, type required' }, { status: 400 });
+    }
+
+    if (id) {
+      const existing = await db.category.findFirst({ where: { id, userId } });
+      if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+      const updated = await db.category.update({
+        where: { id },
+        data: { nameAr, nameEn, type, icon: icon || 'tag', color: color || '#10B981' },
+      });
+      return NextResponse.json({ data: updated });
+    }
+
+    const category = await db.category.create({
+      data: { nameAr, nameEn, type, icon: icon || 'tag', color: color || '#10B981', userId },
+    });
+    return NextResponse.json({ data: category });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/categories/[id]/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    // Verify ownership FIRST
+    const existing = await db.category.findFirst({ where: { id, userId } });
+    if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+    const body = await req.json();
+    const { nameAr, nameEn, type, icon, color } = body;
+    const updated = await db.category.update({ where: { id }, data: {
+      ...(nameAr !== undefined ? { nameAr } : {}),
+      ...(nameEn !== undefined ? { nameEn } : {}),
+      ...(type !== undefined ? { type } : {}),
+      ...(icon !== undefined ? { icon } : {}),
+      ...(color !== undefined ? { color } : {}),
+    }});
+    return NextResponse.json({ data: updated });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    // Verify ownership FIRST
+    const category = await db.category.findFirst({ where: { id, userId } });
+    if (!category) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+    const txCount = await db.transaction.count({ where: { categoryId: id, userId } });
+    if (txCount > 0) {
+      return NextResponse.json({ error: `Cannot delete: ${txCount} transactions` }, { status: 400 });
+    }
+    await db.budget.deleteMany({ where: { categoryId: id } });
+    await db.category.delete({ where: { id } });
+    return NextResponse.json({ success: true });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/accounts/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+// GET /api/accounts - user-scoped
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const accounts = await db.account.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } });
+    return NextResponse.json({ data: accounts });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+// POST /api/accounts - user-scoped
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const body = await req.json();
+    const { name, type, currency, balance, color, icon, isDefault } = body;
+    if (!name || !type || !currency) {
+      return NextResponse.json({ error: 'name, type, currency required' }, { status: 400 });
+    }
+
+    if (isDefault) {
+      const oldDefault = await db.account.findFirst({ where: { isDefault: true, userId } });
+      if (oldDefault) {
+        await db.account.update({ where: { id: oldDefault.id }, data: { isDefault: false } });
+      }
+    }
+
+    const account = await db.account.create({
+      data: {
+        name, type, currency,
+        balance: Number(balance) || 0,
+        color: color || '#2563EB',
+        icon: icon || 'wallet',
+        isDefault: isDefault || false,
+        userId,
+      },
+    });
+    return NextResponse.json({ data: account });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/accounts/[id]/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    // Verify ownership FIRST
+    const account = await db.account.findFirst({ where: { id, userId } });
+    if (!account) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+    const body = await req.json();
+    const { name, type, currency, balance, color, icon, isDefault } = body;
+    if (isDefault) {
+      const old = await db.account.findFirst({ where: { isDefault: true, userId, NOT: { id } } });
+      if (old) await db.account.update({ where: { id: old.id }, data: { isDefault: false } });
+    }
+    const updated = await db.account.update({ where: { id }, data: {
+      ...(name !== undefined ? { name } : {}),
+      ...(type !== undefined ? { type } : {}),
+      ...(currency !== undefined ? { currency } : {}),
+      ...(balance !== undefined ? { balance: Number(balance) } : {}),
+      ...(color !== undefined ? { color } : {}),
+      ...(icon !== undefined ? { icon } : {}),
+      ...(isDefault !== undefined ? { isDefault } : {}),
+    }});
+    return NextResponse.json({ data: updated });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const userId = requireAuth(req);
+    const { id } = await params;
+    // Verify ownership FIRST before any operation
+    const account = await db.account.findFirst({ where: { id, userId } });
+    if (!account) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+
+    // Check transactions (both as source AND destination for transfers)
+    const txCount = await db.transaction.count({
+      where: { OR: [{ accountId: id }, { toAccountId: id }], userId }
+    });
+    if (txCount > 0) {
+      return NextResponse.json({ error: `Cannot delete: ${txCount} transactions linked` }, { status: 400 });
+    }
+
+    // Delete budgets linked to categories of this account (fixed: was using categoryId: id incorrectly)
+    await db.account.delete({ where: { id } });
+    return NextResponse.json({ success: true });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+========================================
+FILE: src/app/api/budgets/route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
+
+export async function GET(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const url = new URL(req.url);
+    const month = url.searchParams.get('month');
+    const where: any = { userId };
+    if (month) where.month = month;
+    const budgets = await db.budget.findMany({ where, include: { category: true } });
+    if (month) {
+      const start = new Date(`${month}-01T00:00:00.000Z`);
+      const end = new Date(start); end.setMonth(end.getMonth() + 1);
+      const spent = await db.transaction.groupBy({
+        by: ['categoryId'], where: { type: 'EXPENSE', date: { gte: start, lt: end }, userId },
+        _sum: { amount: true },
+      });
+      const spentMap = new Map(spent.map(s => [s.categoryId, s._sum.amount || 0]));
+      return NextResponse.json({ data: budgets.map(b => ({ ...b, spent: spentMap.get(b.categoryId) || 0 })) });
+    }
+    return NextResponse.json({ data: budgets });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const body = await req.json();
+    const { categoryId, month, limit, currency } = body;
+    if (!categoryId || !month || !limit) {
+      return NextResponse.json({ error: 'categoryId, month, limit required' }, { status: 400 });
+    }
+    const limitNum = Number(limit);
+    if (!limitNum || limitNum <= 0 || !isFinite(limitNum)) {
+      return NextResponse.json({ error: 'limit must be positive' }, { status: 400 });
+    }
+    // Verify category ownership
+    const category = await db.category.findFirst({ where: { id: categoryId, userId } });
+    if (!category) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
+
+    const existing = await db.budget.findFirst({ where: { categoryId, month, userId } });
+    if (existing) {
+      const updated = await db.budget.update({ where: { id: existing.id },
+        data: { limit: limitNum, currency: currency || existing.currency }, include: { category: true } });
+      return NextResponse.json({ data: updated });
+    }
+    const created = await db.budget.create({ data: { categoryId, month, limit: limitNum, currency: currency || 'EGP', userId }, include: { category: true } });
+    return NextResponse.json({ data: created });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: NextRequest) {
+  try {
+    const userId = requireAuth(req);
+    const url = new URL(req.url);
+    const id = url.searchParams.get('id');
+    if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
+    const budget = await db.budget.findFirst({ where: { id, userId } });
+    if (!budget) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    await db.budget.delete({ where: { id } });
+    return NextResponse.json({ success: true });
+  } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}

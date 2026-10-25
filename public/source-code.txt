@@ -1,6 +1,24 @@
 === محفظتي (MyWallet) - Source Code (P0.2 Fixes) ===
 === Stable dev secret + backup round-trip fixed + reset clarity ===
 === Updated after third ChatGPT security review ===
+=== VERSION: P0.2 (third revision) ===
+=== BUILD: 20261025-122504 UTC ===
+=== HASH: $(date -u +%s) ===
+
+CONFIRMED P0.2 FIXES (verify against this list):
+  [1] Stable dev secret      → DEV_SECRET = randomBytes(32).toString('hex') at module load (NOT per-call Math.random)
+  [2] AUTH_SECRET validation → production: throws if AUTH_SECRET missing or <32 chars at startup
+  [3] transactions limit     → Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
+  [4] backup export          → only known Transaction fields (no spread ...t, no accountName/categoryName leak)
+  [5] backup import          → only known fields + 10MB file size limit + version check (backup.version && backup.data)
+  [6] reset                  → deletes only Transaction + Budget (tables that have userId in schema). Message: "Deleted N transactions, N budgets. Accounts reset to 0. Categories kept."
+
+VERIFY BY SEARCHING FOR THESE MARKERS:
+  - "DEV_SECRET = randomBytes(32)"           → src/lib/auth.ts
+  - "Math.max(1, Math.min(parseInt"          → src/app/api/transactions/route.ts
+  - "10 * 1024 * 1024"                       → src/app/api/backup/route.ts
+  - "backup?.data || !backup?.version"      → src/app/api/backup/route.ts
+  - "Deleted ${txCount} transactions"        → src/app/api/reset/route.ts
 
 ========================================
 FILE: prisma/schema.prisma
