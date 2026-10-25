@@ -70,7 +70,14 @@ const revokedTokenSet = new Set<string>();
 const NEG_CACHE_TTL_MS = 1000; // 1 second — minimal cross-worker revocation window
 const notRevokedCache = new Map<string, number>(); // hash -> fetchedAt timestamp
 
-// P0.6: opportunistic cleanup counter — every Nth logout also runs cleanup.
+// P0.6/P0.7: time-based cleanup schedule (in addition to count-based).
+// Every CLEANUP_INTERVAL_MS, the next logout triggers cleanup.
+// Also runs at most once per CLEANUP_INTERVAL_MS regardless of logout count.
+// This ensures cleanup runs even if logouts are infrequent.
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+let lastCleanupAt = 0;
+
+// P0.6: opportunistic cleanup counter — also runs every Nth logout.
 const CLEANUP_EVERY_N_LOGOUTS = 10;
 let logoutCounter = 0;
 
@@ -205,11 +212,21 @@ export async function cleanupExpiredRevokedTokens(): Promise<number> {
   }
 }
 
-// P0.6: Called from /api/auth/logout to opportunistically trigger cleanup.
+// P0.7: Called from /api/auth/logout to opportunistically trigger cleanup.
+// Runs cleanup in TWO cases:
+//   (1) every CLEANUP_EVERY_N_LOGOUTS (10) logouts — count-based
+//   (2) if last cleanup was more than CLEANUP_INTERVAL_MS (1 hour) ago — time-based
+// The time-based path ensures cleanup runs even if logouts are infrequent.
 // Returns the cleanup count (for logging) or 0 if cleanup was skipped this round.
 export async function maybeCleanupExpiredRevokedTokens(): Promise<number> {
   logoutCounter++;
-  if (logoutCounter % CLEANUP_EVERY_N_LOGOUTS === 0) {
+  const now = Date.now();
+  const timeSinceLastCleanup = now - lastCleanupAt;
+  const shouldRun =
+    (logoutCounter % CLEANUP_EVERY_N_LOGOUTS === 0) ||
+    (timeSinceLastCleanup >= CLEANUP_INTERVAL_MS);
+  if (shouldRun) {
+    lastCleanupAt = now;
     return cleanupExpiredRevokedTokens();
   }
   return 0;

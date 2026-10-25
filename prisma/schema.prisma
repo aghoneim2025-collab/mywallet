@@ -33,7 +33,7 @@ model User {
 // so even a stolen copy cannot be used after the legitimate user logs out.
 model RevokedToken {
   id        String   @id @default(cuid())
-  token     String   @unique  // the full JWT (HMAC signature included)
+  token     String   @unique  // SHA-256 hash of the JWT (NOT the raw token - DB leak safe)
   userId    String
   expiresAt DateTime           // when the original token would have expired
   createdAt DateTime @default(now())

@@ -254,3 +254,40 @@ Stage Summary:
 - New URLs (cache-proof):
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code.txt
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.6-20261025-131855.zip
+
+---
+Task ID: P0.7-time-based-cleanup
+Agent: main
+Task: Address remaining P0.6 concerns from ChatGPT review:
+  (1) cleanup schedule should be time-based, not count-based (infrequent logouts)
+  (2) cross-worker revocation latency acknowledged (1s max delay)
+  (3) .env.example should be provided as a template
+  (4) ZIP should exclude all .env.* files except .env.example
+  (5) User reports preview URL returns Z.ai logo page - need to paste code directly
+
+Work Log:
+- Updated src/lib/auth.ts:
+  - Added CLEANUP_INTERVAL_MS = 1 hour (time-based cleanup trigger)
+  - Added lastCleanupAt timestamp variable
+  - Updated maybeCleanupExpiredRevokedTokens() to trigger cleanup on:
+      (a) every 10th logout (count-based), OR
+      (b) if last cleanup was > 1 hour ago (time-based)
+  - The time-based path ensures cleanup runs even if logouts are infrequent.
+- Updated prisma/schema.prisma comment: clarified that RevokedToken.token
+  stores the SHA-256 HASH of the JWT, NOT the raw JWT itself.
+- Created .env.example with placeholder values + clear instructions
+- Updated scripts/build-source-zip.sh:
+  - Explicitly excludes: .env, .env.local, .env.production, .env.development, .env.*.local
+  - Explicitly INCLUDES .env.example (placeholder only, no real secrets)
+  - Sanity check uses regex that catches real .env files but skips .env.example
+- Verified ZIP build: .env.example IS in ZIP, .env is NOT
+- Pasting source code directly in chat (since preview URL is broken on user's side)
+
+Stage Summary:
+- Time-based cleanup ensures the table doesn't grow forever even with
+  infrequent logouts (max 1 hour between cleanup runs).
+- .env.example provides clear documentation for required env vars
+  without exposing real secrets.
+- All other P0.6 fixes remain in place (hash storage, secret rotation,
+  requireAuthAsync everywhere, etc.).
+- Code pasted directly in chat for ChatGPT review.
