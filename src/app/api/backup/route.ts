@@ -14,18 +14,19 @@ export async function GET(req: NextRequest) {
     ]);
 
     const backup = {
-      version: 2,
+      version: 3,
       app: 'mywallet',
       exportedAt: new Date().toISOString(),
       data: {
-        accounts: accounts.map(({ ...r }) => r),
-        categories: categories.map(({ ...r }) => r),
-        transactions: transactions.map(({ account: _a, category: _c, ...r }) => ({
-          ...r,
-          accountName: _a?.name,
-          categoryName: _c?.nameAr,
-        })),
-        budgets: budgets.map(({ ...r }) => r),
+        accounts: accounts.map(({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) => 
+          ({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
+        categories: categories.map(({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) => 
+          ({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
+        // Only export known Transaction fields (NO accountName/categoryName)
+        transactions: transactions.map(({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, userId: _uid, createdAt, updatedAt }) => 
+          ({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, createdAt, updatedAt })),
+        budgets: budgets.map(({ id, categoryId, month, limit, currency, createdAt, updatedAt }) => 
+          ({ id, categoryId, month, limit, currency, createdAt, updatedAt })),
       },
     };
 
@@ -41,21 +42,34 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST /api/backup?action=import - user-scoped, ATOMIC
+// POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
 export async function POST(req: NextRequest) {
   try {
     const userId = requireAuth(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+    
+    // Limit file size (10MB max)
+    if (file.size > 10 * 1024 * 1024) {
+      return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 400 });
+    }
 
     const text = await file.text();
-    const backup = JSON.parse(text);
-    if (!backup?.data) return NextResponse.json({ error: 'Invalid backup format' }, { status: 400 });
+    let backup;
+    try {
+      backup = JSON.parse(text);
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON file' }, { status: 400 });
+    }
+    
+    if (!backup?.data || !backup?.version) {
+      return NextResponse.json({ error: 'Invalid backup format - missing version or data' }, { status: 400 });
+    }
 
     const { accounts, categories, transactions, budgets } = backup.data;
 
-    // ATOMIC: delete old + restore new
+    // ATOMIC: delete old + restore new (only with known fields)
     const result = await db.$transaction(async (tx) => {
       await tx.transaction.deleteMany({ where: { userId } });
       await tx.budget.deleteMany({ where: { userId } });
@@ -65,19 +79,46 @@ export async function POST(req: NextRequest) {
       let catCount = 0, accCount = 0, txCount = 0, budCount = 0;
 
       for (const c of categories || []) {
-        await tx.category.create({ data: { ...c, userId } });
+        await tx.category.create({
+          data: {
+            id: c.id, nameAr: c.nameAr, nameEn: c.nameEn, type: c.type,
+            icon: c.icon || 'tag', color: c.color || '#10B981',
+            isDefault: c.isDefault || false, userId,
+          },
+        });
         catCount++;
       }
       for (const a of accounts || []) {
-        await tx.account.create({ data: { ...a, userId } });
+        await tx.account.create({
+          data: {
+            id: a.id, name: a.name, type: a.type, currency: a.currency,
+            balance: a.balance || 0, color: a.color || '#2563EB',
+            icon: a.icon || 'wallet', isDefault: a.isDefault || false, userId,
+          },
+        });
         accCount++;
       }
       for (const t of transactions || []) {
-        await tx.transaction.create({ data: { ...t, userId } });
+        await tx.transaction.create({
+          data: {
+            id: t.id, type: t.type, amount: t.amount, currency: t.currency,
+            accountId: t.accountId, categoryId: t.categoryId,
+            toAccountId: t.toAccountId || null,
+            date: new Date(t.date),
+            note: t.note || null, tags: t.tags || null,
+            transferPairId: t.transferPairId || null,
+            userId,
+          },
+        });
         txCount++;
       }
       for (const b of budgets || []) {
-        await tx.budget.create({ data: { ...b, userId } });
+        await tx.budget.create({
+          data: {
+            id: b.id, categoryId: b.categoryId, month: b.month,
+            limit: b.limit, currency: b.currency || 'EGP', userId,
+          },
+        });
         budCount++;
       }
 

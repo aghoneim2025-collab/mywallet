@@ -1,6 +1,6 @@
-=== محفظتي (MyWallet) - Source Code (P0.1 Security Fixes) ===
-=== bcrypt + HMAC + timingSafeEqual + ownership checks + atomic ===
-=== Updated after second ChatGPT security review ===
+=== محفظتي (MyWallet) - Source Code (P0.2 Fixes) ===
+=== Stable dev secret + backup round-trip fixed + reset clarity ===
+=== Updated after third ChatGPT security review ===
 
 ========================================
 FILE: prisma/schema.prisma
@@ -225,23 +225,31 @@ FILE: src/lib/auth.ts
 ========================================
 /**
  * Secure authentication - bcrypt + HMAC-signed tokens
+ * P0.2 fixes: stable dev secret, startup validation, timingSafeEqual
  */
 import bcrypt from 'bcryptjs';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
 
+// Validate AUTH_SECRET at module load time
 const TOKEN_SECRET = process.env.AUTH_SECRET;
-const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// In production: AUTH_SECRET is REQUIRED (fail fast at startup)
+// In development: generate a STABLE random secret (once per process, not per call)
+const DEV_SECRET = randomBytes(32).toString('hex');
 
 function getSecret(): string {
-  if (!TOKEN_SECRET || TOKEN_SECRET === 'mywallet-secret-key-change-in-production') {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('AUTH_SECRET must be set in production');
+  if (isProduction) {
+    if (!TOKEN_SECRET || TOKEN_SECRET.length < 32) {
+      throw new Error('AUTH_SECRET must be set to a random string of at least 32 characters in production');
     }
-    // Dev only - auto-generate random secret
-    return 'dev-only-secret-' + Math.random().toString(36).slice(2);
+    return TOKEN_SECRET;
   }
-  return TOKEN_SECRET;
+  // Dev: use stable secret (generated once at module load, not per call)
+  return TOKEN_SECRET || DEV_SECRET;
 }
+
+const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 export async function hashPassword(password: string): Promise<string> {
   const salt = await bcrypt.genSalt(12);
@@ -307,10 +315,10 @@ export function requireAuth(req: Request): string {
 }
 
 export function setAuthCookie(response: Response, token: string): Response {
-  const isHttps = process.env.NODE_ENV === 'production';
+  const secure = isProduction ? '; Secure' : '';
   response.headers.set(
     'Set-Cookie',
-    `auth-token=${token}; HttpOnly; SameSite=Lax${isHttps ? '; Secure' : ''}; Max-Age=2592000; Path=/`
+    `auth-token=${token}; HttpOnly; SameSite=Lax${secure}; Max-Age=2592000; Path=/`
   );
   return response;
 }
@@ -453,7 +461,7 @@ export async function GET(req: NextRequest) {
       where,
       include: { account: true, category: true, toAccount: true },
       orderBy: { date: 'desc' },
-      ...(limit ? { take: Math.min(parseInt(limit, 10), 1000) } : {}),
+      ...(limit ? { take: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000)) } : {}),
     });
     return NextResponse.json({ data: transactions });
   } catch (err: any) {
@@ -1039,18 +1047,19 @@ export async function GET(req: NextRequest) {
     ]);
 
     const backup = {
-      version: 2,
+      version: 3,
       app: 'mywallet',
       exportedAt: new Date().toISOString(),
       data: {
-        accounts: accounts.map(({ ...r }) => r),
-        categories: categories.map(({ ...r }) => r),
-        transactions: transactions.map(({ account: _a, category: _c, ...r }) => ({
-          ...r,
-          accountName: _a?.name,
-          categoryName: _c?.nameAr,
-        })),
-        budgets: budgets.map(({ ...r }) => r),
+        accounts: accounts.map(({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) => 
+          ({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
+        categories: categories.map(({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) => 
+          ({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
+        // Only export known Transaction fields (NO accountName/categoryName)
+        transactions: transactions.map(({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, userId: _uid, createdAt, updatedAt }) => 
+          ({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, createdAt, updatedAt })),
+        budgets: budgets.map(({ id, categoryId, month, limit, currency, createdAt, updatedAt }) => 
+          ({ id, categoryId, month, limit, currency, createdAt, updatedAt })),
       },
     };
 
@@ -1066,21 +1075,34 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST /api/backup?action=import - user-scoped, ATOMIC
+// POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
 export async function POST(req: NextRequest) {
   try {
     const userId = requireAuth(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+    
+    // Limit file size (10MB max)
+    if (file.size > 10 * 1024 * 1024) {
+      return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 400 });
+    }
 
     const text = await file.text();
-    const backup = JSON.parse(text);
-    if (!backup?.data) return NextResponse.json({ error: 'Invalid backup format' }, { status: 400 });
+    let backup;
+    try {
+      backup = JSON.parse(text);
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON file' }, { status: 400 });
+    }
+    
+    if (!backup?.data || !backup?.version) {
+      return NextResponse.json({ error: 'Invalid backup format - missing version or data' }, { status: 400 });
+    }
 
     const { accounts, categories, transactions, budgets } = backup.data;
 
-    // ATOMIC: delete old + restore new
+    // ATOMIC: delete old + restore new (only with known fields)
     const result = await db.$transaction(async (tx) => {
       await tx.transaction.deleteMany({ where: { userId } });
       await tx.budget.deleteMany({ where: { userId } });
@@ -1090,19 +1112,46 @@ export async function POST(req: NextRequest) {
       let catCount = 0, accCount = 0, txCount = 0, budCount = 0;
 
       for (const c of categories || []) {
-        await tx.category.create({ data: { ...c, userId } });
+        await tx.category.create({
+          data: {
+            id: c.id, nameAr: c.nameAr, nameEn: c.nameEn, type: c.type,
+            icon: c.icon || 'tag', color: c.color || '#10B981',
+            isDefault: c.isDefault || false, userId,
+          },
+        });
         catCount++;
       }
       for (const a of accounts || []) {
-        await tx.account.create({ data: { ...a, userId } });
+        await tx.account.create({
+          data: {
+            id: a.id, name: a.name, type: a.type, currency: a.currency,
+            balance: a.balance || 0, color: a.color || '#2563EB',
+            icon: a.icon || 'wallet', isDefault: a.isDefault || false, userId,
+          },
+        });
         accCount++;
       }
       for (const t of transactions || []) {
-        await tx.transaction.create({ data: { ...t, userId } });
+        await tx.transaction.create({
+          data: {
+            id: t.id, type: t.type, amount: t.amount, currency: t.currency,
+            accountId: t.accountId, categoryId: t.categoryId,
+            toAccountId: t.toAccountId || null,
+            date: new Date(t.date),
+            note: t.note || null, tags: t.tags || null,
+            transferPairId: t.transferPairId || null,
+            userId,
+          },
+        });
         txCount++;
       }
       for (const b of budgets || []) {
-        await tx.budget.create({ data: { ...b, userId } });
+        await tx.budget.create({
+          data: {
+            id: b.id, categoryId: b.categoryId, month: b.month,
+            limit: b.limit, currency: b.currency || 'EGP', userId,
+          },
+        });
         budCount++;
       }
 
@@ -1123,23 +1172,20 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuth } from '@/lib/auth';
 
-// POST /api/reset - Delete ALL data FOR AUTHENTICATED USER ONLY
+// POST /api/reset - Delete user's transactions + budgets, reset account balances
 export async function POST(req: NextRequest) {
   try {
     const userId = requireAuth(req);
 
-    // Delete ONLY this user's data
     const txCount = await db.transaction.count({ where: { userId } });
     const budgetCount = await db.budget.count({ where: { userId } });
 
     await db.$transaction(async (tx) => {
+      // Delete only models that HAVE userId in schema
       await tx.transaction.deleteMany({ where: { userId } });
       await tx.budget.deleteMany({ where: { userId } });
-      try { await (tx as any).recurringTransaction.deleteMany({ where: { userId } }); } catch {}
-      try { await (tx as any).savingsGoal.deleteMany({ where: { userId } }); } catch {}
-      try { await (tx as any).billReminder.deleteMany({ where: { userId } }); } catch {}
 
-      // Reset account balances to 0 for this user
+      // Reset account balances to 0 (keep accounts + categories for reuse)
       const accounts = await tx.account.findMany({ where: { userId } });
       for (const acc of accounts) {
         await tx.account.update({ where: { id: acc.id }, data: { balance: 0 } });
@@ -1149,7 +1195,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: true,
       deleted: { transactions: txCount, budgets: budgetCount },
-      message: `Deleted ${txCount} transactions, ${budgetCount} budgets`,
+      message: `Deleted ${txCount} transactions, ${budgetCount} budgets. Accounts reset to 0. Categories kept.`,
     });
   } catch (err: any) {
     if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

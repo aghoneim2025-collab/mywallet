@@ -26,7 +26,7 @@ export async function GET(req: NextRequest) {
       where,
       include: { account: true, category: true, toAccount: true },
       orderBy: { date: 'desc' },
-      ...(limit ? { take: Math.min(parseInt(limit, 10), 1000) } : {}),
+      ...(limit ? { take: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000)) } : {}),
     });
     return NextResponse.json({ data: transactions });
   } catch (err: any) {

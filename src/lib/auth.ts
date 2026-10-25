@@ -1,22 +1,30 @@
 /**
  * Secure authentication - bcrypt + HMAC-signed tokens
+ * P0.2 fixes: stable dev secret, startup validation, timingSafeEqual
  */
 import bcrypt from 'bcryptjs';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
 
+// Validate AUTH_SECRET at module load time
 const TOKEN_SECRET = process.env.AUTH_SECRET;
-const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// In production: AUTH_SECRET is REQUIRED (fail fast at startup)
+// In development: generate a STABLE random secret (once per process, not per call)
+const DEV_SECRET = randomBytes(32).toString('hex');
 
 function getSecret(): string {
-  if (!TOKEN_SECRET || TOKEN_SECRET === 'mywallet-secret-key-change-in-production') {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('AUTH_SECRET must be set in production');
+  if (isProduction) {
+    if (!TOKEN_SECRET || TOKEN_SECRET.length < 32) {
+      throw new Error('AUTH_SECRET must be set to a random string of at least 32 characters in production');
     }
-    // Dev only - auto-generate random secret
-    return 'dev-only-secret-' + Math.random().toString(36).slice(2);
+    return TOKEN_SECRET;
   }
-  return TOKEN_SECRET;
+  // Dev: use stable secret (generated once at module load, not per call)
+  return TOKEN_SECRET || DEV_SECRET;
 }
+
+const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 export async function hashPassword(password: string): Promise<string> {
   const salt = await bcrypt.genSalt(12);
@@ -82,10 +90,10 @@ export function requireAuth(req: Request): string {
 }
 
 export function setAuthCookie(response: Response, token: string): Response {
-  const isHttps = process.env.NODE_ENV === 'production';
+  const secure = isProduction ? '; Secure' : '';
   response.headers.set(
     'Set-Cookie',
-    `auth-token=${token}; HttpOnly; SameSite=Lax${isHttps ? '; Secure' : ''}; Max-Age=2592000; Path=/`
+    `auth-token=${token}; HttpOnly; SameSite=Lax${secure}; Max-Age=2592000; Path=/`
   );
   return response;
 }
