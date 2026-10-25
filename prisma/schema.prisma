@@ -23,8 +23,26 @@ model User {
   categories    Category[]
   transactions  Transaction[]
   budgets       Budget[]
+  revokedTokens RevokedToken[]
 
   @@map("users")
+}
+
+// ===== RevokedToken (توكنات ملغاة - server-side logout) =====
+// When a user logs out, the JWT is stored here until its natural expiry,
+// so even a stolen copy cannot be used after the legitimate user logs out.
+model RevokedToken {
+  id        String   @id @default(cuid())
+  token     String   @unique  // the full JWT (HMAC signature included)
+  userId    String
+  expiresAt DateTime           // when the original token would have expired
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])   // for periodic cleanup
+  @@index([userId])
+  @@map("revoked_tokens")
 }
 
 // ===== Account (الحسابات) =====

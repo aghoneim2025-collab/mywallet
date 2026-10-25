@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/categories - user-scoped
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const type = url.searchParams.get('type');
     const categories = await db.category.findMany({
@@ -22,7 +22,7 @@ export async function GET(req: NextRequest) {
 // POST /api/categories - user-scoped
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { nameAr, nameEn, type, icon, color, id } = body;
     if (!nameAr || !nameEn || !type) {

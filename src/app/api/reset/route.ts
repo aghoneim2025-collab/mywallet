@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // POST /api/reset - Delete user's transactions + budgets, reset account balances
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
 
     const txCount = await db.transaction.count({ where: { userId } });
     const budgetCount = await db.budget.count({ where: { userId } });

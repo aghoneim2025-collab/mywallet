@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/accounts - user-scoped
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const accounts = await db.account.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } });
     return NextResponse.json({ data: accounts });
   } catch (err: any) {
@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
 // POST /api/accounts - user-scoped
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const body = await req.json();
     const { name, type, currency, balance, color, icon, isDefault } = body;
     if (!name || !type || !currency) {

@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { EXCHANGE_RATES, type Currency } from '@/lib/currency';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/stats?month=YYYY-MM&baseCurrency=EGP
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
     const baseCurrency = (url.searchParams.get('baseCurrency') || 'EGP') as Currency;

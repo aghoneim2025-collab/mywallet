@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 // GET /api/backup?action=export - user-scoped
 export async function GET(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const [accounts, categories, transactions, budgets] = await Promise.all([
       db.account.findMany({ where: { userId } }),
       db.category.findMany({ where: { userId } }),
@@ -45,7 +45,7 @@ export async function GET(req: NextRequest) {
 // POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
 export async function POST(req: NextRequest) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });

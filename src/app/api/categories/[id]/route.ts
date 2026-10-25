@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAuth } from '@/lib/auth';
+import { requireAuthAsync } from '@/lib/auth';
 
 export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const { id } = await params;
     // Verify ownership FIRST
     const existing = await db.category.findFirst({ where: { id, userId } });
@@ -28,7 +28,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const userId = requireAuth(req);
+    const userId = await requireAuthAsync(req);
     const { id } = await params;
     // Verify ownership FIRST
     const category = await db.category.findFirst({ where: { id, userId } });
