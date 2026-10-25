@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { verifyPassword, generateToken } from '@/lib/auth';
+import { verifyPassword, generateToken, setAuthCookie } from '@/lib/auth';
 
 // POST /api/auth/login
 // Body: { email, password }
@@ -12,29 +12,24 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Email and password required' }, { status: 400 });
     }
 
-    const user = await db.user.findUnique({ where: { email } });
+    // Normalize email
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const user = await db.user.findUnique({ where: { email: normalizedEmail } });
     if (!user) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
-    if (!verifyPassword(password, user.passwordHash)) {
+    const valid = await verifyPassword(password, user.passwordHash);
+    if (!valid) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
     const token = generateToken(user.id);
-
     const response = NextResponse.json({
       data: { id: user.id, email: user.email, name: user.name, token },
     });
-
-    response.cookies.set('auth-token', token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60,
-      path: '/',
-    });
-
-    return response;
+    return setAuthCookie(response, token);
   } catch (err: any) {
     console.error('Login error:', err);
     return NextResponse.json({ error: err.message }, { status: 500 });

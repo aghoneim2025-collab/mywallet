@@ -1,23 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
 
-// PUT /api/accounts/:id
-export async function PUT(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
     const body = await req.json();
+    const account = await db.account.findFirst({ where: { id, userId } });
+    if (!account) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     const { name, type, currency, balance, color, icon, isDefault } = body;
-
     if (isDefault) {
-      const oldDefault = await db.account.findFirst({ where: { isDefault: true, NOT: { id } } });
-      if (oldDefault) {
-        await db.account.update({ where: { id: oldDefault.id }, data: { isDefault: false } });
-      }
+      const old = await db.account.findFirst({ where: { isDefault: true, userId, NOT: { id } } });
+      if (old) await db.account.update({ where: { id: old.id }, data: { isDefault: false } });
     }
-
     const updated = await db.account.update({
       where: { id },
       data: {
@@ -32,27 +28,22 @@ export async function PUT(
     });
     return NextResponse.json({ data: updated });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
 
-// DELETE /api/accounts/:id
-export async function DELETE(
-  _req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
-    const txCount = await db.transaction.count({ where: { accountId: id } });
-    if (txCount > 0) {
-      return NextResponse.json(
-        { error: 'Cannot delete account with transactions. Move or delete them first.' },
-        { status: 400 }
-      );
-    }
+    const txCount = await db.transaction.count({ where: { accountId: id, userId } });
+    if (txCount > 0) return NextResponse.json({ error: `Cannot delete: ${txCount} transactions` }, { status: 400 });
+    await db.budget.deleteMany({ where: { categoryId: id } }).catch(() => {});
     await db.account.delete({ where: { id } });
     return NextResponse.json({ success: true });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }

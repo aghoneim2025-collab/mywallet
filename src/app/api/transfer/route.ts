@@ -1,104 +1,66 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
 
-/**
- * POST /api/transfer
- * Body: { fromAccountId, toAccountId, amount, currency, date, note }
- *
- * Creates a transfer between two accounts:
- *  1. Records one TRANSFER transaction with accountId=source, toAccountId=destination
- *  2. Updates both account balances (source -= amount, destination += amount)
- *  3. Currency conversion happens automatically if accounts have different currencies
- */
 export async function POST(req: NextRequest) {
   try {
+    const userId = requireAuth(req);
     const body = await req.json();
     const { fromAccountId, toAccountId, amount, currency, date, note } = body;
 
     if (!fromAccountId || !toAccountId || !amount || fromAccountId === toAccountId) {
-      return NextResponse.json(
-        { error: 'fromAccountId, toAccountId, amount are required and must be different' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Invalid transfer parameters' }, { status: 400 });
     }
 
     const amt = Number(amount);
-    if (amt <= 0) {
-      return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
-    }
+    if (amt <= 0) return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
 
-    // Get both accounts
+    // Verify both accounts belong to user
     const [sourceAccount, destAccount] = await Promise.all([
-      db.account.findUnique({ where: { id: fromAccountId } }),
-      db.account.findUnique({ where: { id: toAccountId } }),
+      db.account.findFirst({ where: { id: fromAccountId, userId } }),
+      db.account.findFirst({ where: { id: toAccountId, userId } }),
     ]);
-
     if (!sourceAccount) return NextResponse.json({ error: 'Source account not found' }, { status: 404 });
     if (!destAccount) return NextResponse.json({ error: 'Destination account not found' }, { status: 404 });
 
-    // Currency conversion
     const txCurrency = (currency || sourceAccount.currency) as Currency;
-    const sourceAmountInSourceCur =
-      txCurrency === sourceAccount.currency
-        ? amt
-        : convert(amt, txCurrency, sourceAccount.currency as Currency);
-    const destAmountInDestCur =
-      txCurrency === destAccount.currency
-        ? amt
-        : convert(amt, txCurrency, destAccount.currency as Currency);
+    const sourceAmount = txCurrency === sourceAccount.currency
+      ? amt : convert(amt, txCurrency, sourceAccount.currency as Currency);
+    const destAmount = txCurrency === destAccount.currency
+      ? amt : convert(amt, txCurrency, destAccount.currency as Currency);
 
-    // Update account balances
-    await db.account.update({
-      where: { id: fromAccountId },
-      data: { balance: sourceAccount.balance - sourceAmountInSourceCur },
-    });
-    await db.account.update({
-      where: { id: toAccountId },
-      data: { balance: destAccount.balance + destAmountInDestCur },
-    });
-
-    // Get or create the "تحويلات" category for transfers
-    let transferCat = await db.category.findFirst({
-      where: { nameAr: 'تحويلات', type: 'TRANSFER' as any },
-    });
+    // ATOMIC: update both balances + create transaction
+    let transferCat = await db.category.findFirst({ where: { nameAr: 'تحويلات', userId } });
     if (!transferCat) {
-      // Fall back to existing "تحويلات" or create new
-      transferCat = await db.category.findFirst({ where: { nameAr: 'تحويلات' } });
-      if (!transferCat) {
-        transferCat = await db.category.create({
-          data: {
-            nameAr: 'تحويلات',
-            nameEn: 'Transfers',
-            type: 'EXPENSE' as any, // Will be unused since tx type is TRANSFER
-            icon: 'arrow-right-left',
-            color: '#64748B',
-          },
-        });
-      }
+      transferCat = await db.category.create({
+        data: { nameAr: 'تحويلات', nameEn: 'Transfers', type: 'EXPENSE', icon: 'arrow-right-left', color: '#64748B', userId },
+      });
     }
 
-    // Create ONE transfer transaction
-    const transfer = await db.transaction.create({
-      data: {
-        type: 'TRANSFER' as any,
-        amount: amt,
-        currency: txCurrency,
-        accountId: fromAccountId,
-        categoryId: transferCat.id,
-        toAccountId: toAccountId,
-        date: date ? new Date(date) : new Date(),
-        note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
-      },
-      include: {
-        account: true,
-        category: true,
-        toAccount: true,
-      },
+    const transfer = await db.$transaction(async (tx) => {
+      await tx.account.update({ where: { id: fromAccountId }, data: { balance: { increment: -sourceAmount } } });
+      await tx.account.update({ where: { id: toAccountId }, data: { balance: { increment: destAmount } } });
+
+      return tx.transaction.create({
+        data: {
+          type: 'TRANSFER' as any,
+          amount: amt,
+          currency: txCurrency,
+          accountId: fromAccountId,
+          categoryId: transferCat!.id,
+          toAccountId: toAccountId,
+          userId,
+          date: date ? new Date(date) : new Date(),
+          note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
+        },
+        include: { account: true, category: true, toAccount: true },
+      });
     });
 
     return NextResponse.json({ data: transfer });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     console.error('Transfer error:', err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

@@ -1,55 +1,46 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
 
 // GET /api/transactions/:id
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
-    const t = await db.transaction.findUnique({
-      where: { id },
-      include: { account: true, category: true },
+    const t = await db.transaction.findFirst({
+      where: { id, userId },
+      include: { account: true, category: true, toAccount: true },
     });
     if (!t) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     return NextResponse.json({ data: t });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
 
-// PUT /api/transactions/:id - تعديل
+// PUT /api/transactions/:id - edit (ATOMIC with $transaction)
 export async function PUT(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
     const body = await req.json();
-    const existing = await db.transaction.findUnique({ where: { id } });
+
+    // Find existing (verify ownership)
+    const existing = await db.transaction.findFirst({ where: { id, userId } });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    // revert old balance (حوّل المبلغ القديم لعملة الحساب القديم)
-    const oldAccount = await db.account.findUnique({ where: { id: existing.accountId } });
-    if (oldAccount) {
-      const oldAmountInAcc =
-        existing.currency === oldAccount.currency
-          ? existing.amount
-          : convert(existing.amount, existing.currency as Currency, oldAccount.currency as Currency);
-      const oldDelta = existing.type === 'INCOME' ? -oldAmountInAcc : oldAmountInAcc;
-      await db.account.update({
-        where: { id: existing.accountId },
-        data: { balance: oldAccount.balance + oldDelta },
-      });
-    }
-
-    // القيم الجديدة
     const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
     const newType = type || existing.type;
     const newAmount = Number(amount ?? existing.amount);
-    const newAccount = await db.account.findUnique({ where: { id: accountId || existing.accountId } });
+    const newAccount = await db.account.findFirst({ where: { id: accountId || existing.accountId, userId } });
     if (!newAccount) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
 
     const newTxCurrency = (currency || existing.currency) as Currency;
@@ -57,94 +48,106 @@ export async function PUT(
       newTxCurrency === newAccount.currency
         ? newAmount
         : convert(newAmount, newTxCurrency, newAccount.currency as Currency);
-
     const newDelta = newType === 'INCOME' ? newAmountInAcc : -newAmountInAcc;
-    await db.account.update({
-      where: { id: newAccount.id },
-      data: { balance: newAccount.balance + newDelta },
-    });
 
-    const updated = await db.transaction.update({
-      where: { id },
-      data: {
-        type: newType,
-        amount: newAmount,                       // ← المبلغ الأصلي بعملته الجديدة
-        currency: newTxCurrency,                // ← العملة الأصلية
-        accountId: newAccount.id,
-        categoryId: categoryId || existing.categoryId,
-        date: date ? new Date(date) : existing.date,
-        note: note !== undefined ? note : existing.note,
-        tags: tags !== undefined ? tags : existing.tags,
-      },
-      include: { account: true, category: true },
+    // ATOMIC: reverse old + apply new
+    const updated = await db.$transaction(async (tx) => {
+      // Reverse old balance
+      const oldAccount = await tx.account.findUnique({ where: { id: existing.accountId } });
+      if (oldAccount) {
+        const oldAmountInAcc =
+          existing.currency === oldAccount.currency
+            ? existing.amount
+            : convert(existing.amount, existing.currency as Currency, oldAccount.currency as Currency);
+        const oldDelta = existing.type === 'INCOME' ? -oldAmountInAcc : oldAmountInAcc;
+        await tx.account.update({
+          where: { id: existing.accountId },
+          data: { balance: { increment: oldDelta } },
+        });
+      }
+
+      // Apply new balance
+      await tx.account.update({
+        where: { id: newAccount.id },
+        data: { balance: { increment: newDelta } },
+      });
+
+      // Update transaction
+      return tx.transaction.update({
+        where: { id },
+        data: {
+          type: newType,
+          amount: newAmount,
+          currency: newTxCurrency,
+          accountId: newAccount.id,
+          categoryId: categoryId || existing.categoryId,
+          date: date ? new Date(date) : existing.date,
+          note: note !== undefined ? note : existing.note,
+          tags: tags !== undefined ? tags : existing.tags,
+        },
+        include: { account: true, category: true, toAccount: true },
+      });
     });
 
     return NextResponse.json({ data: updated });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
 
-// DELETE /api/transactions/:id
+// DELETE /api/transactions/:id - ATOMIC
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
-    const existing = await db.transaction.findUnique({ where: { id } });
+    const existing = await db.transaction.findFirst({ where: { id, userId } });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-    // Handle TRANSFER: reverse balance for both source and destination
+    // Handle TRANSFER: reverse both accounts
     if (existing.type === 'TRANSFER' as any && existing.toAccountId) {
-      const [sourceAccount, destAccount] = await Promise.all([
-        db.account.findUnique({ where: { id: existing.accountId } }),
-        db.account.findUnique({ where: { id: existing.toAccountId } }),
-      ]);
+      await db.$transaction(async (tx) => {
+        const [sourceAcc, destAcc] = await Promise.all([
+          tx.account.findFirst({ where: { id: existing.accountId, userId } }),
+          tx.account.findFirst({ where: { id: existing.toAccountId!, userId } }),
+        ]);
 
-      if (sourceAccount) {
-        // Reverse source debit (add back the amount)
-        const sourceAmountInCur =
-          existing.currency === sourceAccount.currency
+        if (sourceAcc) {
+          const amt = existing.currency === sourceAcc.currency
             ? existing.amount
-            : convert(existing.amount, existing.currency as Currency, sourceAccount.currency as Currency);
-        await db.account.update({
-          where: { id: sourceAccount.id },
-          data: { balance: sourceAccount.balance + sourceAmountInCur },
-        });
-      }
-      if (destAccount) {
-        // Reverse destination credit (subtract the amount)
-        const destAmountInCur =
-          existing.currency === destAccount.currency
+            : convert(existing.amount, existing.currency as Currency, sourceAcc.currency as Currency);
+          await tx.account.update({ where: { id: sourceAcc.id }, data: { balance: { increment: amt } } });
+        }
+        if (destAcc) {
+          const amt = existing.currency === destAcc.currency
             ? existing.amount
-            : convert(existing.amount, existing.currency as Currency, destAccount.currency as Currency);
-        await db.account.update({
-          where: { id: destAccount.id },
-          data: { balance: destAccount.balance - destAmountInCur },
-        });
-      }
-      await db.transaction.delete({ where: { id } });
+            : convert(existing.amount, existing.currency as Currency, destAcc.currency as Currency);
+          await tx.account.update({ where: { id: destAcc.id }, data: { balance: { increment: -amt } } });
+        }
+        await tx.transaction.delete({ where: { id } });
+      });
       return NextResponse.json({ success: true });
     }
 
-    // Normal expense/income: revert balance
-    const account = await db.account.findUnique({ where: { id: existing.accountId } });
-    if (account) {
-      const amountInAcc =
-        existing.currency === account.currency
+    // Normal expense/income: ATOMIC reverse + delete
+    await db.$transaction(async (tx) => {
+      const account = await tx.account.findFirst({ where: { id: existing.accountId, userId } });
+      if (account) {
+        const amt = existing.currency === account.currency
           ? existing.amount
           : convert(existing.amount, existing.currency as Currency, account.currency as Currency);
-      const delta = existing.type === 'INCOME' ? -amountInAcc : amountInAcc;
-      await db.account.update({
-        where: { id: existing.accountId },
-        data: { balance: account.balance + delta },
-      });
-    }
+        const delta = existing.type === 'INCOME' ? -amt : amt;
+        await tx.account.update({ where: { id: account.id }, data: { balance: { increment: delta } } });
+      }
+      await tx.transaction.delete({ where: { id } });
+    });
 
-    await db.transaction.delete({ where: { id } });
     return NextResponse.json({ success: true });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }

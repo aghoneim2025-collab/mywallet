@@ -1,16 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { EXCHANGE_RATES, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
 
 // GET /api/stats?month=YYYY-MM&baseCurrency=EGP
 export async function GET(req: NextRequest) {
   try {
+    const userId = requireAuth(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
     const baseCurrency = (url.searchParams.get('baseCurrency') || 'EGP') as Currency;
 
-    let start: Date;
-    let end: Date;
+    let start: Date, end: Date;
     if (month) {
       start = new Date(`${month}-01T00:00:00.000Z`);
       end = new Date(start);
@@ -24,13 +25,12 @@ export async function GET(req: NextRequest) {
     }
 
     const transactions = await db.transaction.findMany({
-      where: { date: { gte: start, lt: end } },
+      where: { date: { gte: start, lt: end }, userId },
       include: { category: true, account: true },
     });
 
-    const accounts = await db.account.findMany();
+    const accounts = await db.account.findMany({ where: { userId } });
 
-    // Helper: convert from tx currency to base currency
     const toBase = (amount: number, from: string) => {
       const fromCur = (from as Currency) || 'EGP';
       if (fromCur === baseCurrency) return amount;
@@ -38,7 +38,7 @@ export async function GET(req: NextRequest) {
       return inEgp / EXCHANGE_RATES[baseCurrency];
     };
 
-    // Exclude transfers (both TRANSFER type AND "تحويلات" category from old Money Manager import)
+    // Exclude transfers from BOTH expense and income
     const isTransfer = (t: any) =>
       t.type === 'TRANSFER' ||
       t.category?.nameAr === 'تحويلات' ||
@@ -46,20 +46,18 @@ export async function GET(req: NextRequest) {
 
     const expenses = transactions.filter(t => t.type === 'EXPENSE' && !isTransfer(t));
     const incomes = transactions.filter(t => t.type === 'INCOME' && !isTransfer(t));
-    const transfers = transactions.filter(t => isTransfer(t));
 
     const totalExpense = expenses.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
     const totalIncome = incomes.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
-    const totalTransfers = transfers.reduce((s, t) => s + toBase(t.amount, t.currency), 0);
-    const balance = totalIncome - totalExpense;
 
-    // total assets = sum of account balances converted to base
-    const totalAssets = accounts.reduce(
-      (s, a) => s + toBase(a.balance, a.currency),
-      0
-    );
+    // Total assets: exclude LOAN type
+    const totalAssets = accounts
+      .filter(a => a.type !== 'LOAN')
+      .reduce((s, a) => s + toBase(a.balance, a.currency), 0);
+    const totalLiabilities = accounts
+      .filter(a => a.type === 'LOAN' && a.balance < 0)
+      .reduce((s, a) => s + Math.abs(toBase(a.balance, a.currency)), 0);
 
-    // تجميع حسب الفئة (مع تحويل)
     const byCategoryMap: Record<string, { total: number; count: number; category: any }> = {};
     expenses.forEach(t => {
       const cid = t.categoryId;
@@ -68,7 +66,7 @@ export async function GET(req: NextRequest) {
       byCategoryMap[cid].count += 1;
     });
 
-    // تجميع يومي للـ chart (مع تحويل)
+    // Daily chart: exclude transfers
     const daysInMonth = new Date(end.getFullYear(), end.getMonth(), 0).getDate();
     const byDay: { date: string; expense: number; income: number }[] = [];
     for (let day = 1; day <= daysInMonth; day++) {
@@ -76,11 +74,12 @@ export async function GET(req: NextRequest) {
       byDay.push({ date: dateStr, expense: 0, income: 0 });
     }
     transactions.forEach(t => {
+      if (isTransfer(t)) return; // Exclude transfers from daily chart too
       const day = t.date.getDate();
       const idx = day - 1;
       if (idx >= 0 && idx < byDay.length) {
         if (t.type === 'EXPENSE') byDay[idx].expense += toBase(t.amount, t.currency);
-        else byDay[idx].income += toBase(t.amount, t.currency);
+        else if (t.type === 'INCOME') byDay[idx].income += toBase(t.amount, t.currency);
       }
     });
 
@@ -88,19 +87,20 @@ export async function GET(req: NextRequest) {
       data: {
         totalExpense,
         totalIncome,
-        totalTransfers,
-        balance,
+        balance: totalIncome - totalExpense,
         totalAssets,
+        totalLiabilities,
+        net: totalAssets - totalLiabilities,
         baseCurrency,
         expenseCount: expenses.length,
         incomeCount: incomes.length,
-        transferCount: transfers.length,
         byCategory: Object.values(byCategoryMap).sort((a: any, b: any) => b.total - a.total),
         byDay,
         month: month || start.toISOString().slice(0, 7),
       },
     });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     console.error('GET /api/stats error:', err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

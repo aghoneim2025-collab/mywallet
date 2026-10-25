@@ -1,19 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
+import { requireAuth } from '@/lib/auth';
 
-// GET /api/transactions - يسترجع كل المعاملات مع فلترة اختيارية
+// GET /api/transactions - returns transactions for authenticated user only
 export async function GET(req: NextRequest) {
   try {
+    const userId = requireAuth(req);
+
     const url = new URL(req.url);
-    const type = url.searchParams.get('type');           // EXPENSE | INCOME
+    const type = url.searchParams.get('type');
     const accountId = url.searchParams.get('accountId');
     const categoryId = url.searchParams.get('categoryId');
-    const from = url.searchParams.get('from');            // ISO date
+    const from = url.searchParams.get('from');
     const to = url.searchParams.get('to');
     const limit = url.searchParams.get('limit');
 
-    const where: any = {};
+    const where: any = { userId };
     if (type) where.type = type;
     if (accountId) where.accountId = accountId;
     if (categoryId) where.categoryId = categoryId;
@@ -32,14 +35,18 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ data: transactions });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
     console.error('GET /api/transactions error:', err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
 
-// POST /api/transactions - ينشئ معاملة جديدة
+// POST /api/transactions - create transaction for authenticated user (ATOMIC)
 export async function POST(req: NextRequest) {
   try {
+    const userId = requireAuth(req);
     const body = await req.json();
     const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
 
@@ -50,11 +57,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // تحديث رصيد الحساب مع التحويل للعملة الأصلية للحساب
-    const account = await db.account.findUnique({ where: { id: accountId } });
+    // Verify account belongs to user
+    const account = await db.account.findFirst({ where: { id: accountId, userId } });
     if (!account) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
 
-    // حوّل المبلغ لعملة الحساب (لو المعاملة بعملة مختلفة)
     const txCurrency = (currency || account.currency) as Currency;
     const accountCurrency = account.currency as Currency;
     const amountInAccountCurrency =
@@ -63,27 +69,37 @@ export async function POST(req: NextRequest) {
         : convert(Number(amount), txCurrency, accountCurrency);
 
     const delta = type === 'INCOME' ? amountInAccountCurrency : -amountInAccountCurrency;
-    await db.account.update({
-      where: { id: accountId },
-      data: { balance: account.balance + delta },
-    });
 
-    const transaction = await db.transaction.create({
-      data: {
-        type,
-        amount: Number(amount),                         // ← المبلغ الأصلي بعملته
-        currency: txCurrency,                            // ← العملة الأصلية
-        accountId,
-        categoryId,
-        date: date ? new Date(date) : new Date(),
-        note: note || null,
-        tags: tags || null,
-      },
-      include: { account: true, category: true },
+    // ATOMIC: update balance + create transaction in one transaction
+    const transaction = await db.$transaction(async (tx) => {
+      // Update balance
+      await tx.account.update({
+        where: { id: accountId },
+        data: { balance: { increment: delta } },
+      });
+
+      // Create transaction
+      return tx.transaction.create({
+        data: {
+          type,
+          amount: Number(amount),
+          currency: txCurrency,
+          accountId,
+          categoryId,
+          userId,
+          date: date ? new Date(date) : new Date(),
+          note: note || null,
+          tags: tags || null,
+        },
+        include: { account: true, category: true },
+      });
     });
 
     return NextResponse.json({ data: transaction });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
     console.error('POST /api/transactions error:', err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

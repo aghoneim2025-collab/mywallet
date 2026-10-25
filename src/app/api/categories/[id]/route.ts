@@ -1,16 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
+import { requireAuth } from '@/lib/auth';
 
-// PUT /api/categories/:id
-export async function PUT(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
     const body = await req.json();
+    const existing = await db.category.findFirst({ where: { id, userId } });
+    if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     const { nameAr, nameEn, type, icon, color } = body;
-
     const updated = await db.category.update({
       where: { id },
       data: {
@@ -23,30 +22,22 @@ export async function PUT(
     });
     return NextResponse.json({ data: updated });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
 
-// DELETE /api/categories/:id
-export async function DELETE(
-  _req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = requireAuth(req);
     const { id } = await params;
-    // لو الفئة عليها معاملات، ارفض الحذف
-    const txCount = await db.transaction.count({ where: { categoryId: id } });
-    if (txCount > 0) {
-      return NextResponse.json(
-        { error: `Cannot delete category with ${txCount} transactions. Move or delete them first.` },
-        { status: 400 }
-      );
-    }
-    // لو عليها ميزانية، امسح الميزانية كمان
+    const txCount = await db.transaction.count({ where: { categoryId: id, userId } });
+    if (txCount > 0) return NextResponse.json({ error: `Cannot delete: ${txCount} transactions` }, { status: 400 });
     await db.budget.deleteMany({ where: { categoryId: id } });
     await db.category.delete({ where: { id } });
     return NextResponse.json({ success: true });
   } catch (err: any) {
+    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
