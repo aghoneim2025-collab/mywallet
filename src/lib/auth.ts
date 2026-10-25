@@ -23,17 +23,49 @@ const isProduction = process.env.NODE_ENV === 'production';
 const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +
   'do-not-use-in-prod-' + (process.env.NODE_ENV || 'development');
 
-// Eagerly validate at module load time so the process fails fast
-if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
+// P0.8: known-bad placeholder values from .env.example. If someone copies
+// the example file to .env without filling in a real secret, the app
+// would silently use a publicly-known placeholder value. This check
+// rejects those values explicitly, even if they happen to meet the
+// 32-char minimum (e.g., a long descriptive placeholder).
+const FORBIDDEN_SECRETS = new Set([
+  'REPLACE_ME',
+  'replace-me',
+  'replace_me',
+  'changeme',
+  'change-me',
+  'placeholder',
+  'todo',
+  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+  'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-do-not-use-in-prod-development',
+]);
+
+function isPlaceholderSecret(s: string | undefined): boolean {
+  if (!s) return false;
+  if (FORBIDDEN_SECRETS.has(s)) return true;
+  const lower = s.toLowerCase();
+  if (lower.startsWith('replace') && lower.length < 64) return true;
+  if (lower.startsWith('changeme')) return true;
+  if (lower.startsWith('todo')) return true;
+  if (lower.startsWith('placeholder')) return true;
+  return false;
+}
+
+// Eagerly validate at module load time so the process fails fast.
+// P0.8: rejects placeholder values even if they meet length requirement.
+if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32 || isPlaceholderSecret(TOKEN_SECRET))) {
   throw new Error(
     'AUTH_SECRET must be set to a random string of at least 32 characters in production. ' +
-    'Generate one with: openssl rand -hex 32'
+    'Generate one with: openssl rand -hex 32. ' +
+    (isPlaceholderSecret(TOKEN_SECRET) ? 'Placeholder values are not allowed in production.' : '')
   );
 }
 
 function getSecret(): string {
   if (isProduction) return TOKEN_SECRET!;
-  return TOKEN_SECRET && TOKEN_SECRET.length >= 32 ? TOKEN_SECRET : DEV_SECRET;
+  return TOKEN_SECRET && TOKEN_SECRET.length >= 32 && !isPlaceholderSecret(TOKEN_SECRET)
+    ? TOKEN_SECRET
+    : DEV_SECRET;
 }
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -134,27 +166,21 @@ export function verifyTokenSignature(token: string): { userId: string; exp: numb
   }
 }
 
-// P0.6: Check if a token has been revoked server-side.
-// All DB/cache operations use the SHA-256 hash, never the raw token.
-// - If hash in revokedTokenSet (positive cache): revoked = true
-// - If hash in notRevokedCache (negative cache, 1s TTL): revoked = false
-// - Otherwise: DB lookup on hash, then update the appropriate cache
-//
-// Note on cross-worker latency: this negative cache is per-worker.
-// If worker A serves the logout and worker B still has the token cached
-// as "not revoked", B may accept the token for up to NEG_CACHE_TTL_MS (1s).
-// Maximum cross-worker revocation delay = 1 second.
+// P0.8: fail-closed on DB errors. If the DB lookup fails, treat the token as
+// REVOKED (return true), not as "not revoked". A transient DB outage should
+// not let a stolen token through. The trade-off: legitimate users may see
+// transient 401s when the DB is down. For a financial app, denying access
+// during a DB outage is safer than allowing a revoked token through.
 async function isTokenRevoked(token: string): Promise<boolean> {
   const tokenHash = hashToken(token);
-  // Fast path: known revoked
   if (revokedTokenSet.has(tokenHash)) return true;
-  // Short-TTL negative cache (1s) to coalesce concurrent requests for the
-  // same token (e.g., parallel fetches on the home screen)
   const negCacheEntry = notRevokedCache.get(tokenHash);
   if (negCacheEntry && (Date.now() - negCacheEntry) < NEG_CACHE_TTL_MS) {
     return false;
   }
-  // DB lookup (on hash). Fail-open on DB errors (transient issues shouldn't block legit users).
+  // P0.8: fail-closed. DB errors → treat as revoked (deny request).
+  // Previously this was fail-open (return false), which let revoked tokens
+  // through during DB outages. For a financial app, fail-closed is safer.
   try {
     const found = await db.revokedToken.findUnique({ where: { token: tokenHash }, select: { id: true } });
     if (found) {
@@ -162,32 +188,31 @@ async function isTokenRevoked(token: string): Promise<boolean> {
       notRevokedCache.delete(tokenHash);
       return true;
     }
-    // Cache "not revoked" for 1s to coalesce parallel requests
     notRevokedCache.set(tokenHash, Date.now());
     return false;
-  } catch {
-    return false;
+  } catch (e) {
+    console.error('isTokenRevoked: DB lookup failed, failing closed (revoked=true):', e);
+    return true;
   }
 }
 
-// P0.5/P0.6: Revoke a token (insert SHA-256 hash into DB blacklist + update local caches).
-// Called from /api/auth/logout.
+// P0.8: Revoke a token. THROWS on DB error (does not swallow).
+// Callers (logout route) must propagate the error to the user, so they
+// know revocation failed and can retry. Otherwise a stolen token would
+// remain valid while the user thinks they've logged out.
 export async function revokeToken(token: string, userId: string): Promise<void> {
   const verified = verifyTokenSignature(token);
-  if (!verified) return; // can't revoke an invalid token
+  if (!verified) return; // can't revoke an invalid token — nothing to revoke
   const tokenHash = hashToken(token);
-  try {
-    await db.revokedToken.upsert({
-      where: { token: tokenHash },
-      create: { token: tokenHash, userId, expiresAt: new Date(verified.exp) },
-      update: {}, // already revoked
-    });
-    // Update caches immediately so subsequent requests in this worker see revoked=true
-    revokedTokenSet.add(tokenHash);
-    notRevokedCache.delete(tokenHash);
-  } catch (e) {
-    console.error('Failed to revoke token:', e);
-  }
+  // P0.8: let errors propagate. Caller MUST handle.
+  await db.revokedToken.upsert({
+    where: { token: tokenHash },
+    create: { token: tokenHash, userId, expiresAt: new Date(verified.exp) },
+    update: {}, // already revoked
+  });
+  // Update local caches only AFTER successful DB write
+  revokedTokenSet.add(tokenHash);
+  notRevokedCache.delete(tokenHash);
 }
 
 // P0.5/P0.6: Cleanup of expired revoked tokens.

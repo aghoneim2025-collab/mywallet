@@ -1,7 +1,7 @@
 === محفظتي (MyWallet) - Source Code (P0.6 Hashed Token Storage + .env Leak Fix) ===
 === Fixed: tokens stored as SHA-256 hash in DB; .env removed from ZIPs ===
 === VERSION: P0.6 (token hashing + secret rotation) ===
-=== BUILD: 2026-10-25T13:28:49.898Z ===
+=== BUILD: 2026-10-25T13:38:55.455Z ===
 
 URGENT SECURITY NOTE:
   In P0.5, the source-code ZIP files inadvertently included the .env file
@@ -475,17 +475,49 @@ const isProduction = process.env.NODE_ENV === 'production';
 const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +
   'do-not-use-in-prod-' + (process.env.NODE_ENV || 'development');
 
-// Eagerly validate at module load time so the process fails fast
-if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
+// P0.8: known-bad placeholder values from .env.example. If someone copies
+// the example file to .env without filling in a real secret, the app
+// would silently use a publicly-known placeholder value. This check
+// rejects those values explicitly, even if they happen to meet the
+// 32-char minimum (e.g., a long descriptive placeholder).
+const FORBIDDEN_SECRETS = new Set([
+  'REPLACE_ME',
+  'replace-me',
+  'replace_me',
+  'changeme',
+  'change-me',
+  'placeholder',
+  'todo',
+  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+  'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-do-not-use-in-prod-development',
+]);
+
+function isPlaceholderSecret(s: string | undefined): boolean {
+  if (!s) return false;
+  if (FORBIDDEN_SECRETS.has(s)) return true;
+  const lower = s.toLowerCase();
+  if (lower.startsWith('replace') && lower.length < 64) return true;
+  if (lower.startsWith('changeme')) return true;
+  if (lower.startsWith('todo')) return true;
+  if (lower.startsWith('placeholder')) return true;
+  return false;
+}
+
+// Eagerly validate at module load time so the process fails fast.
+// P0.8: rejects placeholder values even if they meet length requirement.
+if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32 || isPlaceholderSecret(TOKEN_SECRET))) {
   throw new Error(
     'AUTH_SECRET must be set to a random string of at least 32 characters in production. ' +
-    'Generate one with: openssl rand -hex 32'
+    'Generate one with: openssl rand -hex 32. ' +
+    (isPlaceholderSecret(TOKEN_SECRET) ? 'Placeholder values are not allowed in production.' : '')
   );
 }
 
 function getSecret(): string {
   if (isProduction) return TOKEN_SECRET!;
-  return TOKEN_SECRET && TOKEN_SECRET.length >= 32 ? TOKEN_SECRET : DEV_SECRET;
+  return TOKEN_SECRET && TOKEN_SECRET.length >= 32 && !isPlaceholderSecret(TOKEN_SECRET)
+    ? TOKEN_SECRET
+    : DEV_SECRET;
 }
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -586,27 +618,21 @@ export function verifyTokenSignature(token: string): { userId: string; exp: numb
   }
 }
 
-// P0.6: Check if a token has been revoked server-side.
-// All DB/cache operations use the SHA-256 hash, never the raw token.
-// - If hash in revokedTokenSet (positive cache): revoked = true
-// - If hash in notRevokedCache (negative cache, 1s TTL): revoked = false
-// - Otherwise: DB lookup on hash, then update the appropriate cache
-//
-// Note on cross-worker latency: this negative cache is per-worker.
-// If worker A serves the logout and worker B still has the token cached
-// as "not revoked", B may accept the token for up to NEG_CACHE_TTL_MS (1s).
-// Maximum cross-worker revocation delay = 1 second.
+// P0.8: fail-closed on DB errors. If the DB lookup fails, treat the token as
+// REVOKED (return true), not as "not revoked". A transient DB outage should
+// not let a stolen token through. The trade-off: legitimate users may see
+// transient 401s when the DB is down. For a financial app, denying access
+// during a DB outage is safer than allowing a revoked token through.
 async function isTokenRevoked(token: string): Promise<boolean> {
   const tokenHash = hashToken(token);
-  // Fast path: known revoked
   if (revokedTokenSet.has(tokenHash)) return true;
-  // Short-TTL negative cache (1s) to coalesce concurrent requests for the
-  // same token (e.g., parallel fetches on the home screen)
   const negCacheEntry = notRevokedCache.get(tokenHash);
   if (negCacheEntry && (Date.now() - negCacheEntry) < NEG_CACHE_TTL_MS) {
     return false;
   }
-  // DB lookup (on hash). Fail-open on DB errors (transient issues shouldn't block legit users).
+  // P0.8: fail-closed. DB errors → treat as revoked (deny request).
+  // Previously this was fail-open (return false), which let revoked tokens
+  // through during DB outages. For a financial app, fail-closed is safer.
   try {
     const found = await db.revokedToken.findUnique({ where: { token: tokenHash }, select: { id: true } });
     if (found) {
@@ -614,32 +640,31 @@ async function isTokenRevoked(token: string): Promise<boolean> {
       notRevokedCache.delete(tokenHash);
       return true;
     }
-    // Cache "not revoked" for 1s to coalesce parallel requests
     notRevokedCache.set(tokenHash, Date.now());
     return false;
-  } catch {
-    return false;
+  } catch (e) {
+    console.error('isTokenRevoked: DB lookup failed, failing closed (revoked=true):', e);
+    return true;
   }
 }
 
-// P0.5/P0.6: Revoke a token (insert SHA-256 hash into DB blacklist + update local caches).
-// Called from /api/auth/logout.
+// P0.8: Revoke a token. THROWS on DB error (does not swallow).
+// Callers (logout route) must propagate the error to the user, so they
+// know revocation failed and can retry. Otherwise a stolen token would
+// remain valid while the user thinks they've logged out.
 export async function revokeToken(token: string, userId: string): Promise<void> {
   const verified = verifyTokenSignature(token);
-  if (!verified) return; // can't revoke an invalid token
+  if (!verified) return; // can't revoke an invalid token — nothing to revoke
   const tokenHash = hashToken(token);
-  try {
-    await db.revokedToken.upsert({
-      where: { token: tokenHash },
-      create: { token: tokenHash, userId, expiresAt: new Date(verified.exp) },
-      update: {}, // already revoked
-    });
-    // Update caches immediately so subsequent requests in this worker see revoked=true
-    revokedTokenSet.add(tokenHash);
-    notRevokedCache.delete(tokenHash);
-  } catch (e) {
-    console.error('Failed to revoke token:', e);
-  }
+  // P0.8: let errors propagate. Caller MUST handle.
+  await db.revokedToken.upsert({
+    where: { token: tokenHash },
+    create: { token: tokenHash, userId, expiresAt: new Date(verified.exp) },
+    update: {}, // already revoked
+  });
+  // Update local caches only AFTER successful DB write
+  revokedTokenSet.add(tokenHash);
+  notRevokedCache.delete(tokenHash);
 }
 
 // P0.5/P0.6: Cleanup of expired revoked tokens.
@@ -1464,30 +1489,83 @@ export async function POST(req: NextRequest) {
 FILE: src/app/api/auth/logout/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
-import { revokeToken, extractToken, verifyTokenSignature, maybeCleanupExpiredRevokedTokens } from '@/lib/auth';
+import {
+  revokeToken,
+  verifyTokenSignature,
+  maybeCleanupExpiredRevokedTokens,
+} from '@/lib/auth';
 
 // POST /api/auth/logout
 // Server-side token revocation: stores a SHA-256 HASH of the token in the
 // RevokedToken table until its natural expiry, so even a stolen copy cannot
-// be used after the legitimate user logs out. (Storing a hash instead of
-// the raw token means a DB leak doesn't expose usable tokens.)
-// Also clears the auth cookie.
-// Every 10th logout also runs cleanup of expired revoked-token rows.
+// be used after the legitimate user logs out.
+//
+// P0.8 fixes:
+//   - Returns 500 if revocation FAILS. Caller (UI) must know if logout
+//     didn't actually invalidate the token, so the user can retry.
+//     Previously returned 200 unconditionally → false sense of security.
+//   - Revokes BOTH Bearer token AND cookie token (if both present and
+//     different). Previously only the Bearer was revoked, so a stolen
+//     copy kept in a cookie (different signature) would remain valid.
+//   - revokeToken() throws on DB error (does not swallow), so we can
+//     detect and report failure.
+//
+// Cleanup runs every 10 logouts OR if 1+ hour since last cleanup
+// (opportunistic — not a true cron; see notes in auth.ts).
 export async function POST(req: NextRequest) {
-  const token = extractToken(req);
-  if (token) {
+  const bearerToken = extractBearerToken(req);
+  const cookieToken = extractCookieToken(req);
+
+  // Revoke all distinct tokens present in the request.
+  const tokensToRevoke = new Set<string>();
+  if (bearerToken) tokensToRevoke.add(bearerToken);
+  if (cookieToken) tokensToRevoke.add(cookieToken);
+
+  let revocationFailed = false;
+  let revocationError: string | undefined;
+
+  for (const token of tokensToRevoke) {
     const verified = verifyTokenSignature(token);
-    if (verified) {
+    if (!verified) continue; // invalid token, nothing to revoke
+    try {
       await revokeToken(token, verified.userId);
+    } catch (e: any) {
+      // P0.8: don't swallow — record the failure so we can return error
+      console.error('revokeToken failed for token', token.substring(0, 16) + '...:', e?.message);
+      revocationFailed = true;
+      revocationError = e?.message || 'Unknown revocation error';
     }
   }
-  // Opportunistic cleanup of expired revoked tokens (fire-and-forget).
-  // Runs every 10 logouts to keep the table small without per-request overhead.
+
+  // Opportunistic cleanup (fire-and-forget; failure doesn't affect logout).
   maybeCleanupExpiredRevokedTokens().catch(() => {});
 
-  const response = NextResponse.json({ success: true });
+  // Always clear the auth cookie — even if revocation failed, the user
+  // can still log out from this browser session.
+  const response = NextResponse.json(
+    revocationFailed
+      ? { success: false, error: 'Logout failed: token revocation failed. Stolen tokens may still be valid. Please try again.' }
+      : { success: true },
+    { status: revocationFailed ? 500 : 200 },
+  );
   response.cookies.delete('auth-token');
   return response;
+}
+
+// Extract Bearer token from Authorization header (returns null if absent).
+function extractBearerToken(req: Request): string | null {
+  const authHeader = req.headers.get('authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice(7);
+  }
+  return null;
+}
+
+// Extract auth-token from Cookie header (returns null if absent).
+function extractCookieToken(req: Request): string | null {
+  const cookie = req.headers.get('cookie') || '';
+  const tokenMatch = cookie.match(/auth-token=([^;]+)/);
+  return tokenMatch ? tokenMatch[1] : null;
 }
 
 ========================================
@@ -1495,11 +1573,16 @@ FILE: src/app/api/auth/session/route.ts
 ========================================
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { getUserIdFromRequest } from '@/lib/auth';
+import { getUserIdFromRequestAsync } from '@/lib/auth';
 
 // GET /api/auth/session - check if logged in
+// P0.8: uses getUserIdFromRequestAsync (which checks the blacklist),
+// not the synchronous getUserIdFromRequest (which doesn't).
+// Without this, a logged-out token (whose hash is in the blacklist)
+// would still return user data here, even though other API routes
+// correctly reject it.
 export async function GET(req: NextRequest) {
-  const userId = getUserIdFromRequest(req);
+  const userId = await getUserIdFromRequestAsync(req);
   if (!userId) {
     return NextResponse.json({ data: null }, { status: 200 });
   }
