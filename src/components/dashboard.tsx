@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { Card } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { ArrowUpRight, ArrowDownRight, Wallet, TrendingUp, TrendingDown, Plus, CreditCard } from 'lucide-react';
+import { ArrowUpRight, ArrowDownRight, Wallet, TrendingUp, TrendingDown, Plus } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
@@ -52,10 +52,11 @@ export function Dashboard({ onAddExpense, onAddIncome, onEditTx, onOpenAccounts 
   const load = async () => {
     setLoading(true);
     const month = new Date().toISOString().slice(0, 7);
+    const today = new Date().toISOString();
     try {
       const [s, r] = await Promise.all([
         api<{ data: Stat }>(`/api/stats?month=${month}&baseCurrency=${baseCurrency}`),
-        api<{ data: TxItem[] }>(`/api/transactions?limit=10`),
+        api<{ data: TxItem[] }>(`/api/transactions?limit=10&to=${today}`),
       ]);
       setStat(s.data);
       setRecent(r.data);
@@ -88,13 +89,6 @@ export function Dashboard({ onAddExpense, onAddIncome, onEditTx, onOpenAccounts 
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={onOpenAccounts}
-            className="w-10 h-10 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 flex items-center justify-center active:scale-95 transition"
-            aria-label={t('accounts')}
-          >
-            <CreditCard className="w-5 h-5" />
-          </button>
-          <button
             onClick={onAddExpense}
             className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-md active:scale-95 transition"
             aria-label={t('add')}
@@ -104,33 +98,31 @@ export function Dashboard({ onAddExpense, onAddIncome, onEditTx, onOpenAccounts 
         </div>
       </header>
 
-      {/* Total Balance Card - clickable to open accounts */}
-      <button onClick={onOpenAccounts} className="block w-full text-start">
-        <Card className="relative overflow-hidden bg-gradient-to-br from-blue-600 to-blue-700 text-white border-0 p-5">
-          <div className="absolute -right-8 -top-8 w-32 h-32 rounded-full bg-white/10" />
-          <div className="absolute -left-12 -bottom-12 w-40 h-40 rounded-full bg-white/5" />
-          <div className="relative">
-            <p className="text-sm text-blue-100">{t('totalBalance')}</p>
-            <p className="text-3xl font-bold mt-1 mb-4">{fmt(stat.totalAssets)}</p>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="bg-white/15 rounded-xl p-3 backdrop-blur-sm text-start">
-                <div className="flex items-center gap-1 text-emerald-300 text-xs">
-                  <ArrowUpRight className="w-3 h-3" />
-                  {t('monthlyIncome')}
-                </div>
-                <p className="font-bold mt-0.5">{fmt(stat.totalIncome)}</p>
+      {/* Total Balance Card */}
+      <Card className="relative overflow-hidden bg-gradient-to-br from-blue-600 to-blue-700 text-white border-0 p-5">
+        <div className="absolute -right-8 -top-8 w-32 h-32 rounded-full bg-white/10" />
+        <div className="absolute -left-12 -bottom-12 w-40 h-40 rounded-full bg-white/5" />
+        <div className="relative">
+          <p className="text-sm text-blue-100">{t('totalBalance')}</p>
+          <p className="text-3xl font-bold mt-1 mb-4">{fmt(stat.totalAssets)}</p>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white/15 rounded-xl p-3 backdrop-blur-sm text-start">
+              <div className="flex items-center gap-1 text-emerald-300 text-xs">
+                <ArrowUpRight className="w-3 h-3" />
+                {t('monthlyIncome')}
               </div>
-              <div className="bg-white/15 rounded-xl p-3 backdrop-blur-sm text-start">
-                <div className="flex items-center gap-1 text-red-300 text-xs">
-                  <ArrowDownRight className="w-3 h-3" />
-                  {t('monthlyExpenses')}
-                </div>
-                <p className="font-bold mt-0.5">{fmt(stat.totalExpense)}</p>
+              <p className="font-bold mt-0.5">{fmt(stat.totalIncome)}</p>
+            </div>
+            <div className="bg-white/15 rounded-xl p-3 backdrop-blur-sm text-start">
+              <div className="flex items-center gap-1 text-red-300 text-xs">
+                <ArrowDownRight className="w-3 h-3" />
+                {t('monthlyExpenses')}
               </div>
+              <p className="font-bold mt-0.5">{fmt(stat.totalExpense)}</p>
             </div>
           </div>
-        </Card>
-      </button>
+        </div>
+      </Card>
 
       {/* Daily trend chart */}
       <section>

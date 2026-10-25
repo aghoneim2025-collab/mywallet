@@ -10,20 +10,17 @@ import { AccountsScreen } from '@/components/accounts-screen';
 import { SettingsScreen } from '@/components/settings-screen';
 import { TransactionModal } from '@/components/transaction-modal';
 import { TransferModal } from '@/components/transfer-modal';
-import { ArrowRight } from 'lucide-react';
 import { useT } from '@/hooks/use-t';
-
-type Screen = TabKey | 'accounts';
 
 export default function Home() {
   const { t } = useT();
-  const [activeTab, setActiveTab] = useState<Screen>('dashboard');
+  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
   const [transferModal, setTransferModal] = useState(false);
 
   const openAddExpense = () => setTxModal({ open: true, type: 'EXPENSE' });
   const openAddIncome = () => setTxModal({ open: true, type: 'INCOME' });
-  const openEditTx = (tx: any) => setTxModal({ open: true, type: tx.type, initial: tx });
+  const openEditTx = (tx: any) => setTxModal({ open: true, type: tx.type === 'INCOME' ? 'INCOME' : 'EXPENSE', initial: tx });
   const openTransfer = () => setTransferModal(true);
 
   const [reloadKey, setReloadKey] = useState(0);
@@ -44,35 +41,27 @@ export default function Home() {
         {activeTab === 'transactions' && (
           <TransactionsScreen key={`t-${reloadKey}`} onEditTx={openEditTx} />
         )}
-        {activeTab === 'budget' && <BudgetScreen key={`b-${reloadKey}`} />}
-        {activeTab === 'reports' && <ReportsScreen key={`r-${reloadKey}`} />}
         {activeTab === 'accounts' && (
-          <div>
-            <div className="px-4 pt-4 flex items-center gap-2">
-              <button
-                onClick={() => setActiveTab('dashboard')}
-                className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
-                aria-label={t('dashboard')}
-              >
-                <ArrowRight className="w-5 h-5 rtl:rotate-180" />
-              </button>
-            </div>
-            <AccountsScreen key={`a-${reloadKey}`} />
-          </div>
+          <AccountsScreen key={`a-${reloadKey}`} />
         )}
-        {activeTab === 'settings' && <SettingsScreen />}
+        {activeTab === 'reports' && <ReportsScreen key={`r-${reloadKey}`} />}
+        {activeTab === 'settings' && (
+          <>
+            <SettingsScreen />
+            <div className="px-4 pb-4">
+              <BudgetScreen key={`b-${reloadKey}`} />
+            </div>
+          </>
+        )}
       </main>
 
-      {/* FAB hidden on accounts sub-screen to avoid conflict */}
-      {activeTab !== 'accounts' && (
-        <FAB
-          onAddExpense={openAddExpense}
-          onAddIncome={openAddIncome}
-          onTransfer={openTransfer}
-        />
-      )}
+      <FAB
+        onAddExpense={openAddExpense}
+        onAddIncome={openAddIncome}
+        onTransfer={openTransfer}
+      />
 
-      <BottomNav active={activeTab === 'accounts' ? 'dashboard' : activeTab} onChange={setActiveTab} />
+      <BottomNav active={activeTab} onChange={setActiveTab} />
 
       <TransactionModal
         open={txModal.open}
