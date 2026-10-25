@@ -17,6 +17,7 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
+  const [formMsg, setFormMsg] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
   // Check if already logged in
   useEffect(() => {
@@ -29,8 +30,11 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
   }, []);
 
   const handleSubmit = async () => {
+    setFormMsg(null);
     if (!email || !password) {
-      toast.error(lang === 'ar' ? 'أدخل الإيميل وكلمة السر' : 'Enter email and password');
+      const msg = lang === 'ar' ? 'أدخل الإيميل وكلمة السر' : 'Enter email and password';
+      setFormMsg({ type: 'error', text: msg });
+      toast.error(msg);
       return;
     }
     setLoading(true);
@@ -48,13 +52,21 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
       const data = await res.json();
 
       if (!res.ok) {
-        throw new Error(data.error || 'Authentication failed');
+        const errMsg = data.error || (lang === 'ar' ? 'فشل العملية' : 'Authentication failed');
+        throw new Error(errMsg);
       }
 
-      toast.success(lang === 'ar' ? 'تم تسجيل الدخول' : 'Welcome!');
-      onAuth();
+      const successMsg = mode === 'login'
+        ? (lang === 'ar' ? 'تم تسجيل الدخول' : 'Welcome!')
+        : (lang === 'ar' ? 'تم إنشاء حسابك' : 'Account created!');
+      toast.success(successMsg);
+      setFormMsg({ type: 'success', text: successMsg });
+      // Small delay so user sees the success message
+      setTimeout(() => onAuth(), 400);
     } catch (e: any) {
-      toast.error(e.message);
+      const errMsg = e.message || (lang === 'ar' ? 'خطأ غير معروف' : 'Unknown error');
+      toast.error(errMsg);
+      setFormMsg({ type: 'error', text: errMsg });
     } finally {
       setLoading(false);
     }
@@ -117,6 +129,19 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
               <Input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="******" className="ps-9" onKeyDown={e => e.key === 'Enter' && handleSubmit()} />
             </div>
           </div>
+
+          {/* Inline form message (backup for Sonner Toaster) */}
+          {formMsg && (
+            <div
+              className={`text-sm px-3 py-2 rounded-md text-center font-medium ${
+                formMsg.type === 'error'
+                  ? 'bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'
+                  : 'bg-green-50 dark:bg-green-950/50 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
+              }`}
+            >
+              {formMsg.text}
+            </div>
+          )}
 
           <Button onClick={handleSubmit} disabled={loading} className="w-full h-12 bg-blue-600 hover:bg-blue-700">
             {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : null}
