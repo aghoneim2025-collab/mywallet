@@ -58,3 +58,56 @@ Stage Summary:
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.3-20261025-123130.txt
   - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.3-20261025-123130.zip
 - User should hard-refresh the preview to pick up the new auth-screen + Sonner Toaster
+
+---
+Task ID: P0.4-auth-flow-fix
+Agent: main
+Task: User reported "Runtime Error: Unauthorized" on home-screen.tsx:55 when calling /api/stats etc after login.
+
+Work Log:
+- Investigated dev.log → found 401 errors on every API call right after successful login
+- Tested cookie path with curl → 401! Even cookie auth was broken
+- Diagnosed ROOT CAUSE #1: Next.js dev server runs MULTIPLE worker processes
+  - P0.2 used randomBytes(32) at module load → stable per worker, but unstable across workers
+  - Token generated in worker A, verified in worker B → HMAC signature mismatch → 401
+- Diagnosed ROOT CAUSE #2: no Bearer token fallback for preview proxies that strip cookies
+
+Applied fixes (P0.4):
+  [1] src/lib/auth.ts: replaced randomBytes(32) with DETERMINISTIC dev secret
+      (string-based, shared across all workers). Production still requires AUTH_SECRET env.
+  [2] src/lib/auth.ts: eager validation at module load (throws synchronously if prod missing AUTH_SECRET)
+  [3] src/app/api/auth/login/route.ts: token returned in JSON response alongside cookie
+  [4] src/app/api/auth/register/route.ts: same as login
+  [5] NEW src/lib/auth-storage.ts: in-memory + localStorage token storage (mw-auth-token key)
+  [6] src/lib/api.ts: api() and downloadFile() attach "Authorization: Bearer <token>" if available
+  [7] src/components/auth-screen.tsx: stores token via setStoredToken() on success;
+      useEffect checks session via Authorization header first, falls back to cookie
+  [8] src/app/page.tsx: useEffect uses Authorization header when token exists;
+      handleLogout clears stored token AND calls /api/auth/logout (clears cookie)
+  [9] src/components/settings-screen.tsx: handleReset uses Bearer header; logout clears token
+  [10] src/components/data-tools.tsx: handleExcelImport + handleBackupImport use Bearer header
+
+Smoke test (curl) - ALL PASS:
+  - POST /api/auth/register → 200 + token in JSON
+  - GET /api/auth/session (Bearer) → 200
+  - GET /api/transactions (Bearer) → 200
+  - GET /api/categories (Bearer) → 200
+  - GET /api/stats (Bearer) → 200
+  - GET /api/accounts (Bearer) → 200
+  - GET /api/auth/session (Cookie) → 200 (cookie also works now!)
+  - GET /api/transactions (Cookie) → 200
+
+Regenerated source-code.txt (182K, 31 files, P0.4 banner).
+Created source-code-P0.4-20261025-123938.txt (timestamped).
+Created source-code-P0.4-20261025-123938.zip.
+Refreshed source-code.zip.
+
+Stage Summary:
+- BOTH root causes fixed: stable secret across workers + Bearer fallback
+- All 6 previously-failing endpoints now return 200 with Bearer token
+- Cookie path also works now (because secret is stable)
+- Production still requires AUTH_SECRET env var (eagerly validated)
+- New URLs (cache-proof):
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4-20261025-123938.txt
+  - https://preview-chat-d940a26d-ab97-42dc-b29b-53491e59517a.space-z.ai/source-code-P0.4-20261025-123938.zip
+- User should hard-refresh preview, log out (if logged in with stale state), then log in fresh.

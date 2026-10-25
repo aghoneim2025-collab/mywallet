@@ -11,6 +11,7 @@ import { BudgetScreen } from '@/components/budget-screen';
 import { TransactionModal } from '@/components/transaction-modal';
 import { TransferModal } from '@/components/transfer-modal';
 import { AuthScreen } from '@/components/auth-screen';
+import { getStoredToken, setStoredToken } from '@/lib/auth-storage';
 
 export default function Home() {
   const [authed, setAuthed] = useState(false);
@@ -19,12 +20,20 @@ export default function Home() {
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
   const [transferModal, setTransferModal] = useState(false);
 
-  // Check auth on mount
+  // Check auth on mount - try stored Bearer token first, fall back to cookie
   useEffect(() => {
-    fetch('/api/auth/session')
+    const stored = getStoredToken();
+    const fetchOpts: RequestInit = stored
+      ? { headers: { Authorization: `Bearer ${stored}` } }
+      : {};
+    fetch('/api/auth/session', fetchOpts)
       .then(r => r.json())
       .then(d => {
         if (d.data) setAuthed(true);
+        else {
+          // Session has no data — clear any stale token
+          setStoredToken(null);
+        }
       })
       .catch(() => {})
       .finally(() => setChecking(false));
@@ -37,6 +46,14 @@ export default function Home() {
 
   const [reloadKey, setReloadKey] = useState(0);
   const handleSaved = () => setReloadKey(k => k + 1);
+
+  const handleLogout = () => {
+    // Clear stored token client-side + call logout API (clears cookie)
+    setStoredToken(null);
+    fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    setAuthed(false);
+    setActiveTab('home');
+  };
 
   // Show loading while checking auth
   if (checking) {
@@ -63,7 +80,7 @@ export default function Home() {
         {activeTab === 'reports' && <ReportsScreen key={`r-${reloadKey}`} />}
         {activeTab === 'settings' && (
           <>
-            <SettingsScreen onLogout={() => { setAuthed(false); setActiveTab('home'); }} />
+            <SettingsScreen onLogout={handleLogout} />
             <div className="px-4 pb-4">
               <BudgetScreen key={`b-${reloadKey}`} />
             </div>

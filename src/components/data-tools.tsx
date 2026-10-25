@@ -6,6 +6,7 @@ import { Download, Upload, FileSpreadsheet, Database, Cloud, Loader2 } from 'luc
 import { useT } from '@/hooks/use-t';
 import { downloadFile } from '@/lib/api';
 import { toast } from 'sonner';
+import { getStoredToken } from '@/lib/auth-storage';
 
 export function DataTools() {
   const { t, lang } = useT();
@@ -28,7 +29,12 @@ export function DataTools() {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      const res = await fetch('/api/excel?action=import', { method: 'POST', body: fd });
+      const token = getStoredToken();
+      const res = await fetch('/api/excel?action=import', {
+        method: 'POST',
+        body: fd,
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       toast.success(data.message || `${data.imported} imported`);
@@ -59,7 +65,12 @@ export function DataTools() {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      const res = await fetch('/api/backup?action=import', { method: 'POST', body: fd });
+      const token = getStoredToken();
+      const res = await fetch('/api/backup?action=import', {
+        method: 'POST',
+        body: fd,
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       const { accounts, categories, transactions, budgets } = data.imported;

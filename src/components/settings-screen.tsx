@@ -10,6 +10,7 @@ import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
 import { toast } from 'sonner';
+import { getStoredToken, setStoredToken } from '@/lib/auth-storage';
 import type { Currency } from '@/lib/currency';
 import { CategoriesManager } from '@/components/categories-manager';
 import { DataTools } from '@/components/data-tools';
@@ -48,7 +49,11 @@ export function SettingsScreen({ onLogout }: { onLogout?: () => void }) {
   const handleReset = async () => {
     if (!confirm(t('confirmReset'))) return;
     try {
-      const res = await fetch('/api/reset', { method: 'POST' });
+      const token = getStoredToken();
+      const res = await fetch('/api/reset', {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       toast.success(lang === 'ar'
@@ -232,6 +237,8 @@ export function SettingsScreen({ onLogout }: { onLogout?: () => void }) {
           <Button
             variant="outline"
             onClick={async () => {
+              // Clear stored token client-side + call logout API to clear cookie
+              setStoredToken(null);
               await fetch('/api/auth/logout', { method: 'POST' });
               onLogout();
             }}

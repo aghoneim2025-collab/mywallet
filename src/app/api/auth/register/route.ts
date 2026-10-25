@@ -32,8 +32,9 @@ export async function POST(req: NextRequest) {
     });
 
     const token = generateToken(result.id);
-    // Return user data WITHOUT token in JSON (cookie only)
-    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name } });
+    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
+    // See login/route.ts for rationale.
+    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     console.error('Register error:', err);

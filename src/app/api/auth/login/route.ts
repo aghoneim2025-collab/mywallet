@@ -13,8 +13,11 @@ export async function POST(req: NextRequest) {
     if (!valid) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
 
     const token = generateToken(user.id);
-    // Return user data WITHOUT token in JSON (cookie only)
-    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name } });
+    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
+    // Token in JSON is needed for environments where cookies don't propagate
+    // (e.g., shared preview proxies). Client stores it in localStorage and
+    // sends it via Authorization: Bearer header on API calls.
+    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     console.error('Login error:', err);

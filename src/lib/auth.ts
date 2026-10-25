@@ -1,27 +1,41 @@
 /**
  * Secure authentication - bcrypt + HMAC-signed tokens
- * P0.2 fixes: stable dev secret, startup validation, timingSafeEqual
+ * P0.4 fix: stable dev secret across all worker processes.
+ *
+ * History:
+ *   - P0.1: Math.random() per call → tokens always invalid in next request
+ *   - P0.2: randomBytes(32) at module load → still broken because Next.js dev
+ *           runs MULTIPLE worker processes, each with its own randomBytes,
+ *           so tokens generated in worker A can't be verified in worker B
+ *   - P0.4: deterministic dev secret derived from a known string. In
+ *           production, AUTH_SECRET must be explicitly set (>=32 chars).
  */
 import bcrypt from 'bcryptjs';
-import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 
-// Validate AUTH_SECRET at module load time
 const TOKEN_SECRET = process.env.AUTH_SECRET;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// In production: AUTH_SECRET is REQUIRED (fail fast at startup)
-// In development: generate a STABLE random secret (once per process, not per call)
-const DEV_SECRET = randomBytes(32).toString('hex');
+// P0.4: Stable, deterministic dev secret so all workers share the same key.
+// This is NOT secure for production — only used when AUTH_SECRET is unset
+// in development. In production, AUTH_SECRET is REQUIRED.
+const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +
+  'do-not-use-in-prod-' + (process.env.NODE_ENV || 'development');
+
+// Eagerly validate at module load time so the process fails fast
+// if production is missing AUTH_SECRET (instead of failing on first request).
+if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
+  throw new Error(
+    'AUTH_SECRET must be set to a random string of at least 32 characters in production. ' +
+    'Generate one with: openssl rand -hex 32'
+  );
+}
 
 function getSecret(): string {
-  if (isProduction) {
-    if (!TOKEN_SECRET || TOKEN_SECRET.length < 32) {
-      throw new Error('AUTH_SECRET must be set to a random string of at least 32 characters in production');
-    }
-    return TOKEN_SECRET;
-  }
-  // Dev: use stable secret (generated once at module load, not per call)
-  return TOKEN_SECRET || DEV_SECRET;
+  // In production, TOKEN_SECRET is guaranteed to be set (validated at module load)
+  if (isProduction) return TOKEN_SECRET!;
+  // Dev: use AUTH_SECRET if set, else deterministic DEV_SECRET (shared across workers)
+  return TOKEN_SECRET && TOKEN_SECRET.length >= 32 ? TOKEN_SECRET : DEV_SECRET;
 }
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days

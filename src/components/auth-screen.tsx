@@ -8,6 +8,7 @@ import { Wallet, Mail, Lock, User, Loader2 } from 'lucide-react';
 import { useSettings } from '@/lib/store';
 import { useT } from '@/hooks/use-t';
 import { toast } from 'sonner';
+import { setStoredToken, getStoredToken } from '@/lib/auth-storage';
 
 export function AuthScreen({ onAuth }: { onAuth: () => void }) {
   const { lang, setLang } = useSettings();
@@ -19,8 +20,23 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
   const [loading, setLoading] = useState(false);
   const [formMsg, setFormMsg] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
-  // Check if already logged in
+  // Check if already logged in (via stored token OR session cookie)
   useEffect(() => {
+    // First, try sending a stored token via Authorization header to /api/auth/session
+    // This works even when cookies don't propagate (e.g., shared preview proxies).
+    const stored = getStoredToken();
+    if (stored) {
+      fetch('/api/auth/session', {
+        headers: { Authorization: `Bearer ${stored}` }
+      })
+        .then(r => r.json())
+        .then(d => {
+          if (d.data) onAuth();
+        })
+        .catch(() => {});
+      return;
+    }
+    // Fall back to cookie-based session check
     fetch('/api/auth/session')
       .then(r => r.json())
       .then(d => {
@@ -54,6 +70,11 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
       if (!res.ok) {
         const errMsg = data.error || (lang === 'ar' ? 'فشل العملية' : 'Authentication failed');
         throw new Error(errMsg);
+      }
+
+      // Store the token from response (works even when cookies don't propagate)
+      if (data?.data?.token) {
+        setStoredToken(data.data.token);
       }
 
       const successMsg = mode === 'login'

@@ -19,6 +19,8 @@ const FILES: string[] = [
   'src/lib/store.ts',
   'src/lib/utils.ts',
   'src/lib/currency.ts',
+  'src/lib/auth-storage.ts',
+  'src/lib/api.ts',
   'src/app/layout.tsx',
   'src/app/page.tsx',
   'src/app/globals.css',
@@ -43,46 +45,81 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.3 Auth UX Fix) ===
-=== Fixed: Sonner Toaster was never mounted - toasts never appeared ===
-=== Fixed: Added inline error/success messages in auth screen as backup ===
-=== VERSION: P0.3 (auth UX bug fix) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.4 Auth Flow Fixed) ===
+=== Fixed: Bearer token added, stable dev secret across workers ===
+=== VERSION: P0.4 (auth flow + multi-worker secret) ===
 === BUILD: ${new Date().toISOString()} ===
 
-WHAT CHANGED IN P0.3:
-  [1] layout.tsx: Added <SonnerToaster position="top-center" richColors closeButton />
-      (Before: only shadcn <Toaster /> was mounted; Sonner toasts went nowhere)
-  [2] auth-screen.tsx: Added inline formMsg state for error/success display
-      as a backup so the user sees feedback even if Sonner fails
-  [3] auth-screen.tsx: Better error messages in both ar/en, success messages
-      distinguish login vs register, setTimeout 400ms before onAuth() so
-      the user can see the success message
+ROOT CAUSE OF "Unauthorized" RUNTIME ERROR REPORTED BY USER:
+  User registered/logged in → home screen mounted → fetch /api/stats etc → 401.
+  Server-side debugging showed two compounding bugs:
 
-ROOT CAUSE OF "no message" BUG REPORTED BY USER:
-  - 11 components import { toast } from 'sonner' (auth-screen, settings-screen,
-    transaction-modal, transfer-modal, reports-screen, categories-manager,
-    accounts-screen, budget-screen, data-tools, categories-screen, sw-registrar)
-  - layout.tsx mounted only shadcn/ui <Toaster /> (NOT sonner)
-  - Therefore every toast.success/error call went into the void
-  - User registered (server returned 200, cookie set) but saw NOTHING
-  - User logged in (server returned 200, cookie set) but saw NOTHING
-  - Auth actually WORKED - just no visible feedback
+  BUG #1: unstable DEV_SECRET across worker processes
+    - P0.2 fix used randomBytes(32) at module load (stable per worker)
+    - BUT Next.js dev runs MULTIPLE workers, each with its own randomBytes
+    - Token generated in worker A → verified in worker B → signature mismatch → 401
+    - Even with cookie: cookie was set with worker A's signature,
+      verified against worker B's signature → 401
 
-CONFIRMED API BEHAVIOR (curl-tested):
-  - POST /api/auth/register with new email   → HTTP 200, {data: {id, email, name}}, Set-Cookie
-  - POST /api/auth/login with valid creds    → HTTP 200, {data: {id, email, name}}, Set-Cookie
-  - POST /api/auth/register with dup email   → HTTP 409, {error: "Email already registered"}
-  - POST /api/auth/login with bad password   → HTTP 401, {error: "Invalid email or password"}
-  - GET  /api/auth/session (no cookie)       → HTTP 200, {data: null}
-  - GET  /api/auth/session (with cookie)      → HTTP 200, {data: {id, email, name}}
+  BUG #2: no Bearer token fallback for shared preview proxies
+    - Some preview proxies strip Set-Cookie headers
+    - Even if cookie was set, it wasn't always propagated
+    - No fallback existed (token was removed from JSON response in P0.1)
+
+WHAT CHANGED IN P0.4:
+  [1] auth.ts: replaced randomBytes(32) with a DETERMINISTIC dev secret
+      (string concatenation; only used when AUTH_SECRET env is unset in dev).
+      Now all workers compute the same secret → token verification succeeds
+      regardless of which worker served the request.
+  [2] auth.ts: eager validation at module load (throws synchronously if
+      production is missing AUTH_SECRET or it's <32 chars).
+  [3] auth.ts: getSecret() returns deterministic DEV_SECRET only in dev;
+      production still requires AUTH_SECRET env var.
+  [4] login/route.ts + register/route.ts: token is ALSO returned in JSON
+      response (alongside the HttpOnly cookie). This is needed for the
+      Bearer token fallback below.
+  [5] NEW src/lib/auth-storage.ts: simple in-memory + localStorage token
+      storage. Stores token client-side so it survives page refresh.
+  [6] src/lib/api.ts: api() and downloadFile() now attach
+      "Authorization: Bearer <token>" header when a stored token exists.
+  [7] auth-screen.tsx: on successful login/register, stores the token from
+      JSON response via setStoredToken(). useEffect checks session via
+      Authorization header first, falls back to cookie.
+  [8] page.tsx: useEffect session check uses Authorization header when
+      stored token exists. Logout clears both stored token AND cookie.
+  [9] settings-screen.tsx + data-tools.tsx: raw fetch calls updated to
+      attach Authorization header when token is available.
+
+CONFIRMED WORKING (curl-tested):
+  - POST /api/auth/register → 200, returns {data:{id,email,name,token}}
+  - POST /api/auth/login    → 200, returns {data:{id,email,name,token}}
+  - GET  /api/auth/session (with Bearer) → 200, returns {data:{id,...}}
+  - GET  /api/transactions  (with Bearer) → 200, returns {data:[...]}
+  - GET  /api/categories    (with Bearer) → 200, returns {data:[10 items]}
+  - GET  /api/stats         (with Bearer) → 200, returns full stats object
+  - GET  /api/accounts      (with Bearer) → 200, returns {data:[...]}
+  - Cookie-based auth ALSO still works (verified)
+
+SECURITY TRADE-OFFS (intentional, documented):
+  - Token returned in JSON: needed for Bearer fallback. XSS risk accepted
+    for personal finance app used by one user at a time.
+  - Token stored in localStorage: persists across refresh (good UX), XSS
+    readable (same risk as cookie for this app's threat model).
+  - Cookie still set HttpOnly + SameSite=Lax: defense in depth — works
+    when proxy doesn't strip Set-Cookie, Bearer fallback works when it does.
+  - DEV_SECRET is deterministic string: NOT secure for prod (clearly marked).
+  - Production MUST set AUTH_SECRET env var (32+ chars). Validated at startup.
+
+PREVIOUS P0.3 FIX STILL IN PLACE:
+  - layout.tsx: <SonnerToaster position="top-center" richColors closeButton />
+    mounted alongside shadcn <Toaster />.
+  - auth-screen.tsx: inline formMsg state for error/success display as backup.
 
 PREVIOUS P0.2 FIXES STILL IN PLACE:
-  [1] Stable dev secret: DEV_SECRET = randomBytes(32).toString('hex') at module load
-  [2] AUTH_SECRET validation: in production, throws if missing or <32 chars
-  [3] transactions limit: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
-  [4] backup export: only known fields, no spread, no accountName/categoryName leak
-  [5] backup import: only known fields + 10MB size limit + version check
-  [6] reset: deletes only Transaction + Budget (tables with userId in schema)
+  [1] transactions limit: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
+  [2] backup export: only known fields, no spread, no accountName/categoryName leak
+  [3] backup import: only known fields + 10MB size limit + version check
+  [4] reset: deletes only Transaction + Budget (tables with userId in schema)
 
 ============================================================
 `;

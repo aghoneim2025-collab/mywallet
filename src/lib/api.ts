@@ -1,4 +1,6 @@
 // Simple fetch wrapper
+import { getStoredToken } from './auth-storage';
+
 const baseUrl = '';
 
 export async function api<T>(
@@ -16,9 +18,19 @@ export async function api<T>(
     if (qs) url += `?${qs}`;
   }
 
+  // Attach Bearer token if available (fallback for when cookies don't propagate)
+  const token = getStoredToken();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(rest?.headers as Record<string, string> || {}),
+  };
+  if (token && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const res = await fetch(`${baseUrl}${url}`, {
-    headers: { 'Content-Type': 'application/json', ...(rest?.headers || {}) },
     ...rest,
+    headers,
   });
 
   if (!res.ok) {
@@ -31,7 +43,10 @@ export async function api<T>(
 
 // Helper: download a file (for CSV export)
 export async function downloadFile(url: string, filename: string) {
-  const res = await fetch(url);
+  const token = getStoredToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(url, { headers });
   const blob = await res.blob();
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');

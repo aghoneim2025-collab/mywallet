@@ -1,47 +1,82 @@
-=== محفظتي (MyWallet) - Source Code (P0.3 Auth UX Fix) ===
-=== Fixed: Sonner Toaster was never mounted - toasts never appeared ===
-=== Fixed: Added inline error/success messages in auth screen as backup ===
-=== VERSION: P0.3 (auth UX bug fix) ===
-=== BUILD: 2026-10-25T12:31:23.380Z ===
+=== محفظتي (MyWallet) - Source Code (P0.4 Auth Flow Fixed) ===
+=== Fixed: Bearer token added, stable dev secret across workers ===
+=== VERSION: P0.4 (auth flow + multi-worker secret) ===
+=== BUILD: 2026-10-25T12:39:38.610Z ===
 
-WHAT CHANGED IN P0.3:
-  [1] layout.tsx: Added <SonnerToaster position="top-center" richColors closeButton />
-      (Before: only shadcn <Toaster /> was mounted; Sonner toasts went nowhere)
-  [2] auth-screen.tsx: Added inline formMsg state for error/success display
-      as a backup so the user sees feedback even if Sonner fails
-  [3] auth-screen.tsx: Better error messages in both ar/en, success messages
-      distinguish login vs register, setTimeout 400ms before onAuth() so
-      the user can see the success message
+ROOT CAUSE OF "Unauthorized" RUNTIME ERROR REPORTED BY USER:
+  User registered/logged in → home screen mounted → fetch /api/stats etc → 401.
+  Server-side debugging showed two compounding bugs:
 
-ROOT CAUSE OF "no message" BUG REPORTED BY USER:
-  - 11 components import { toast } from 'sonner' (auth-screen, settings-screen,
-    transaction-modal, transfer-modal, reports-screen, categories-manager,
-    accounts-screen, budget-screen, data-tools, categories-screen, sw-registrar)
-  - layout.tsx mounted only shadcn/ui <Toaster /> (NOT sonner)
-  - Therefore every toast.success/error call went into the void
-  - User registered (server returned 200, cookie set) but saw NOTHING
-  - User logged in (server returned 200, cookie set) but saw NOTHING
-  - Auth actually WORKED - just no visible feedback
+  BUG #1: unstable DEV_SECRET across worker processes
+    - P0.2 fix used randomBytes(32) at module load (stable per worker)
+    - BUT Next.js dev runs MULTIPLE workers, each with its own randomBytes
+    - Token generated in worker A → verified in worker B → signature mismatch → 401
+    - Even with cookie: cookie was set with worker A's signature,
+      verified against worker B's signature → 401
 
-CONFIRMED API BEHAVIOR (curl-tested):
-  - POST /api/auth/register with new email   → HTTP 200, {data: {id, email, name}}, Set-Cookie
-  - POST /api/auth/login with valid creds    → HTTP 200, {data: {id, email, name}}, Set-Cookie
-  - POST /api/auth/register with dup email   → HTTP 409, {error: "Email already registered"}
-  - POST /api/auth/login with bad password   → HTTP 401, {error: "Invalid email or password"}
-  - GET  /api/auth/session (no cookie)       → HTTP 200, {data: null}
-  - GET  /api/auth/session (with cookie)      → HTTP 200, {data: {id, email, name}}
+  BUG #2: no Bearer token fallback for shared preview proxies
+    - Some preview proxies strip Set-Cookie headers
+    - Even if cookie was set, it wasn't always propagated
+    - No fallback existed (token was removed from JSON response in P0.1)
+
+WHAT CHANGED IN P0.4:
+  [1] auth.ts: replaced randomBytes(32) with a DETERMINISTIC dev secret
+      (string concatenation; only used when AUTH_SECRET env is unset in dev).
+      Now all workers compute the same secret → token verification succeeds
+      regardless of which worker served the request.
+  [2] auth.ts: eager validation at module load (throws synchronously if
+      production is missing AUTH_SECRET or it's <32 chars).
+  [3] auth.ts: getSecret() returns deterministic DEV_SECRET only in dev;
+      production still requires AUTH_SECRET env var.
+  [4] login/route.ts + register/route.ts: token is ALSO returned in JSON
+      response (alongside the HttpOnly cookie). This is needed for the
+      Bearer token fallback below.
+  [5] NEW src/lib/auth-storage.ts: simple in-memory + localStorage token
+      storage. Stores token client-side so it survives page refresh.
+  [6] src/lib/api.ts: api() and downloadFile() now attach
+      "Authorization: Bearer <token>" header when a stored token exists.
+  [7] auth-screen.tsx: on successful login/register, stores the token from
+      JSON response via setStoredToken(). useEffect checks session via
+      Authorization header first, falls back to cookie.
+  [8] page.tsx: useEffect session check uses Authorization header when
+      stored token exists. Logout clears both stored token AND cookie.
+  [9] settings-screen.tsx + data-tools.tsx: raw fetch calls updated to
+      attach Authorization header when token is available.
+
+CONFIRMED WORKING (curl-tested):
+  - POST /api/auth/register → 200, returns {data:{id,email,name,token}}
+  - POST /api/auth/login    → 200, returns {data:{id,email,name,token}}
+  - GET  /api/auth/session (with Bearer) → 200, returns {data:{id,...}}
+  - GET  /api/transactions  (with Bearer) → 200, returns {data:[...]}
+  - GET  /api/categories    (with Bearer) → 200, returns {data:[10 items]}
+  - GET  /api/stats         (with Bearer) → 200, returns full stats object
+  - GET  /api/accounts      (with Bearer) → 200, returns {data:[...]}
+  - Cookie-based auth ALSO still works (verified)
+
+SECURITY TRADE-OFFS (intentional, documented):
+  - Token returned in JSON: needed for Bearer fallback. XSS risk accepted
+    for personal finance app used by one user at a time.
+  - Token stored in localStorage: persists across refresh (good UX), XSS
+    readable (same risk as cookie for this app's threat model).
+  - Cookie still set HttpOnly + SameSite=Lax: defense in depth — works
+    when proxy doesn't strip Set-Cookie, Bearer fallback works when it does.
+  - DEV_SECRET is deterministic string: NOT secure for prod (clearly marked).
+  - Production MUST set AUTH_SECRET env var (32+ chars). Validated at startup.
+
+PREVIOUS P0.3 FIX STILL IN PLACE:
+  - layout.tsx: <SonnerToaster position="top-center" richColors closeButton />
+    mounted alongside shadcn <Toaster />.
+  - auth-screen.tsx: inline formMsg state for error/success display as backup.
 
 PREVIOUS P0.2 FIXES STILL IN PLACE:
-  [1] Stable dev secret: DEV_SECRET = randomBytes(32).toString('hex') at module load
-  [2] AUTH_SECRET validation: in production, throws if missing or <32 chars
-  [3] transactions limit: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
-  [4] backup export: only known fields, no spread, no accountName/categoryName leak
-  [5] backup import: only known fields + 10MB size limit + version check
-  [6] reset: deletes only Transaction + Budget (tables with userId in schema)
+  [1] transactions limit: Math.max(1, Math.min(parseInt(limit, 10) || 100, 1000))
+  [2] backup export: only known fields, no spread, no accountName/categoryName leak
+  [3] backup import: only known fields + 10MB size limit + version check
+  [4] reset: deletes only Transaction + Budget (tables with userId in schema)
 
 ============================================================
 
-Files included: 29 / 29
+Files included: 31 / 31
 
 
 ========================================
@@ -370,28 +405,42 @@ FILE: src/lib/auth.ts
 ========================================
 /**
  * Secure authentication - bcrypt + HMAC-signed tokens
- * P0.2 fixes: stable dev secret, startup validation, timingSafeEqual
+ * P0.4 fix: stable dev secret across all worker processes.
+ *
+ * History:
+ *   - P0.1: Math.random() per call → tokens always invalid in next request
+ *   - P0.2: randomBytes(32) at module load → still broken because Next.js dev
+ *           runs MULTIPLE worker processes, each with its own randomBytes,
+ *           so tokens generated in worker A can't be verified in worker B
+ *   - P0.4: deterministic dev secret derived from a known string. In
+ *           production, AUTH_SECRET must be explicitly set (>=32 chars).
  */
 import bcrypt from 'bcryptjs';
-import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 
-// Validate AUTH_SECRET at module load time
 const TOKEN_SECRET = process.env.AUTH_SECRET;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// In production: AUTH_SECRET is REQUIRED (fail fast at startup)
-// In development: generate a STABLE random secret (once per process, not per call)
-const DEV_SECRET = randomBytes(32).toString('hex');
+// P0.4: Stable, deterministic dev secret so all workers share the same key.
+// This is NOT secure for production — only used when AUTH_SECRET is unset
+// in development. In production, AUTH_SECRET is REQUIRED.
+const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +
+  'do-not-use-in-prod-' + (process.env.NODE_ENV || 'development');
+
+// Eagerly validate at module load time so the process fails fast
+// if production is missing AUTH_SECRET (instead of failing on first request).
+if (isProduction && (!TOKEN_SECRET || TOKEN_SECRET.length < 32)) {
+  throw new Error(
+    'AUTH_SECRET must be set to a random string of at least 32 characters in production. ' +
+    'Generate one with: openssl rand -hex 32'
+  );
+}
 
 function getSecret(): string {
-  if (isProduction) {
-    if (!TOKEN_SECRET || TOKEN_SECRET.length < 32) {
-      throw new Error('AUTH_SECRET must be set to a random string of at least 32 characters in production');
-    }
-    return TOKEN_SECRET;
-  }
-  // Dev: use stable secret (generated once at module load, not per call)
-  return TOKEN_SECRET || DEV_SECRET;
+  // In production, TOKEN_SECRET is guaranteed to be set (validated at module load)
+  if (isProduction) return TOKEN_SECRET!;
+  // Dev: use AUTH_SECRET if set, else deterministic DEV_SECRET (shared across workers)
+  return TOKEN_SECRET && TOKEN_SECRET.length >= 32 ? TOKEN_SECRET : DEV_SECRET;
 }
 
 const TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -615,6 +664,118 @@ export function compactNumber(amount: number, lang: 'ar' | 'en' = 'ar'): string 
 }
 
 ========================================
+FILE: src/lib/auth-storage.ts
+========================================
+// Client-side auth token storage.
+// Stored in localStorage so it survives page refreshes.
+// Server also sets HttpOnly cookie; this is the fallback when cookies
+// don't propagate (e.g., shared preview proxies).
+
+const TOKEN_KEY = 'mw-auth-token';
+
+let inMemoryToken: string | null = null;
+
+if (typeof window !== 'undefined') {
+  try {
+    inMemoryToken = window.localStorage.getItem(TOKEN_KEY);
+  } catch {
+    // localStorage might be unavailable (private mode)
+    inMemoryToken = null;
+  }
+}
+
+export function getStoredToken(): string | null {
+  if (inMemoryToken) return inMemoryToken;
+  if (typeof window !== 'undefined') {
+    try {
+      inMemoryToken = window.localStorage.getItem(TOKEN_KEY);
+      return inMemoryToken;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+export function setStoredToken(token: string | null): void {
+  inMemoryToken = token;
+  if (typeof window !== 'undefined') {
+    try {
+      if (token) {
+        window.localStorage.setItem(TOKEN_KEY, token);
+      } else {
+        window.localStorage.removeItem(TOKEN_KEY);
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+========================================
+FILE: src/lib/api.ts
+========================================
+// Simple fetch wrapper
+import { getStoredToken } from './auth-storage';
+
+const baseUrl = '';
+
+export async function api<T>(
+  path: string,
+  opts?: RequestInit & { params?: Record<string, string | undefined> }
+): Promise<T> {
+  const { params, ...rest } = opts || {};
+  let url = path;
+  if (params) {
+    const sp = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined) sp.set(k, v);
+    });
+    const qs = sp.toString();
+    if (qs) url += `?${qs}`;
+  }
+
+  // Attach Bearer token if available (fallback for when cookies don't propagate)
+  const token = getStoredToken();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(rest?.headers as Record<string, string> || {}),
+  };
+  if (token && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(`${baseUrl}${url}`, {
+    ...rest,
+    headers,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Network error' }));
+    throw new Error(err.error || res.statusText);
+  }
+
+  return res.json();
+}
+
+// Helper: download a file (for CSV export)
+export async function downloadFile(url: string, filename: string) {
+  const token = getStoredToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(url, { headers });
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = blobUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(blobUrl);
+}
+
+========================================
 FILE: src/app/layout.tsx
 ========================================
 import type { Metadata, Viewport } from "next";
@@ -708,6 +869,7 @@ import { BudgetScreen } from '@/components/budget-screen';
 import { TransactionModal } from '@/components/transaction-modal';
 import { TransferModal } from '@/components/transfer-modal';
 import { AuthScreen } from '@/components/auth-screen';
+import { getStoredToken, setStoredToken } from '@/lib/auth-storage';
 
 export default function Home() {
   const [authed, setAuthed] = useState(false);
@@ -716,12 +878,20 @@ export default function Home() {
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
   const [transferModal, setTransferModal] = useState(false);
 
-  // Check auth on mount
+  // Check auth on mount - try stored Bearer token first, fall back to cookie
   useEffect(() => {
-    fetch('/api/auth/session')
+    const stored = getStoredToken();
+    const fetchOpts: RequestInit = stored
+      ? { headers: { Authorization: `Bearer ${stored}` } }
+      : {};
+    fetch('/api/auth/session', fetchOpts)
       .then(r => r.json())
       .then(d => {
         if (d.data) setAuthed(true);
+        else {
+          // Session has no data — clear any stale token
+          setStoredToken(null);
+        }
       })
       .catch(() => {})
       .finally(() => setChecking(false));
@@ -734,6 +904,14 @@ export default function Home() {
 
   const [reloadKey, setReloadKey] = useState(0);
   const handleSaved = () => setReloadKey(k => k + 1);
+
+  const handleLogout = () => {
+    // Clear stored token client-side + call logout API (clears cookie)
+    setStoredToken(null);
+    fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    setAuthed(false);
+    setActiveTab('home');
+  };
 
   // Show loading while checking auth
   if (checking) {
@@ -760,7 +938,7 @@ export default function Home() {
         {activeTab === 'reports' && <ReportsScreen key={`r-${reloadKey}`} />}
         {activeTab === 'settings' && (
           <>
-            <SettingsScreen onLogout={() => { setAuthed(false); setActiveTab('home'); }} />
+            <SettingsScreen onLogout={handleLogout} />
             <div className="px-4 pb-4">
               <BudgetScreen key={`b-${reloadKey}`} />
             </div>
@@ -1007,8 +1185,11 @@ export async function POST(req: NextRequest) {
     if (!valid) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
 
     const token = generateToken(user.id);
-    // Return user data WITHOUT token in JSON (cookie only)
-    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name } });
+    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
+    // Token in JSON is needed for environments where cookies don't propagate
+    // (e.g., shared preview proxies). Client stores it in localStorage and
+    // sends it via Authorization: Bearer header on API calls.
+    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     console.error('Login error:', err);
@@ -1053,8 +1234,9 @@ export async function POST(req: NextRequest) {
     });
 
     const token = generateToken(result.id);
-    // Return user data WITHOUT token in JSON (cookie only)
-    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name } });
+    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
+    // See login/route.ts for rationale.
+    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     console.error('Register error:', err);
@@ -1931,6 +2113,7 @@ import { Wallet, Mail, Lock, User, Loader2 } from 'lucide-react';
 import { useSettings } from '@/lib/store';
 import { useT } from '@/hooks/use-t';
 import { toast } from 'sonner';
+import { setStoredToken, getStoredToken } from '@/lib/auth-storage';
 
 export function AuthScreen({ onAuth }: { onAuth: () => void }) {
   const { lang, setLang } = useSettings();
@@ -1942,8 +2125,23 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
   const [loading, setLoading] = useState(false);
   const [formMsg, setFormMsg] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
-  // Check if already logged in
+  // Check if already logged in (via stored token OR session cookie)
   useEffect(() => {
+    // First, try sending a stored token via Authorization header to /api/auth/session
+    // This works even when cookies don't propagate (e.g., shared preview proxies).
+    const stored = getStoredToken();
+    if (stored) {
+      fetch('/api/auth/session', {
+        headers: { Authorization: `Bearer ${stored}` }
+      })
+        .then(r => r.json())
+        .then(d => {
+          if (d.data) onAuth();
+        })
+        .catch(() => {});
+      return;
+    }
+    // Fall back to cookie-based session check
     fetch('/api/auth/session')
       .then(r => r.json())
       .then(d => {
@@ -1977,6 +2175,11 @@ export function AuthScreen({ onAuth }: { onAuth: () => void }) {
       if (!res.ok) {
         const errMsg = data.error || (lang === 'ar' ? 'فشل العملية' : 'Authentication failed');
         throw new Error(errMsg);
+      }
+
+      // Store the token from response (works even when cookies don't propagate)
+      if (data?.data?.token) {
+        setStoredToken(data.data.token);
       }
 
       const successMsg = mode === 'login'
@@ -3959,6 +4162,7 @@ import { useT } from '@/hooks/use-t';
 import { useSettings } from '@/lib/store';
 import { api } from '@/lib/api';
 import { toast } from 'sonner';
+import { getStoredToken, setStoredToken } from '@/lib/auth-storage';
 import type { Currency } from '@/lib/currency';
 import { CategoriesManager } from '@/components/categories-manager';
 import { DataTools } from '@/components/data-tools';
@@ -3997,7 +4201,11 @@ export function SettingsScreen({ onLogout }: { onLogout?: () => void }) {
   const handleReset = async () => {
     if (!confirm(t('confirmReset'))) return;
     try {
-      const res = await fetch('/api/reset', { method: 'POST' });
+      const token = getStoredToken();
+      const res = await fetch('/api/reset', {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       toast.success(lang === 'ar'
@@ -4181,6 +4389,8 @@ export function SettingsScreen({ onLogout }: { onLogout?: () => void }) {
           <Button
             variant="outline"
             onClick={async () => {
+              // Clear stored token client-side + call logout API to clear cookie
+              setStoredToken(null);
               await fetch('/api/auth/logout', { method: 'POST' });
               onLogout();
             }}
