@@ -62,8 +62,10 @@ copy_dir_filtered "$ROOT/prisma"   "$STAGE/prisma"
 copy_dir_filtered "$ROOT/scripts"  "$STAGE/scripts"
 
 # 2. Copy top-level config files (explicit allowlist, not globs).
-for f in package.json next.config.ts tsconfig.json tailwind.config.ts \
-         postcss.config.mjs components.json; do
+# P0.18: include package-lock.json (requested by user for full review)
+for f in package.json package-lock.json next.config.ts tsconfig.json \
+         tailwind.config.ts postcss.config.mjs components.json \
+         eslint.config.mjs; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$STAGE/"
 done
 
