@@ -1,42 +1,36 @@
-// P0.13: backfill script for legacy transactions with null snapshot fields.
-// Run once after deploying P0.12 to populate sourceAmount/destAmount/exchangeRateUsed
-// for all pre-existing transactions.
+// P0.13/P0.14: backfill script for legacy transactions with null snapshot fields.
 //
-// Strategy: use CURRENT exchange rates to compute the snapshot. This means
-// the snapshot reflects the current rate, not the historical rate at the
-// time of the original transaction. For transactions where the rate hasn't
-// changed, this is correct. For transactions where the rate has changed,
-// the snapshot is "best-effort" — better than nothing, but not perfect.
+// ChatGPT found two critical issues in the original P0.13 version:
+//
+//   BUG 1 (math): the conversion was INVERTED.
+//     rates[X] = "1 unit of X = how many EGP" (per src/lib/currency.ts:6)
+//     To convert `amount` from `from` to `to`:
+//       amount → EGP → to
+//       = amount * rates[from] / rates[to]
+//     The original script did `amount * (rates[to] / rates[from])` —
+//     the inverse. E.g., 100 USD → SAR should be ~373.08, but the
+//     script produced ~26.80.
+//
+//   BUG 2 (semantic): even with the math fixed, using CURRENT rates
+//     doesn't recover the historical rate that was used when the
+//     transaction was created. So backfilling multi-currency
+//     transactions would store a WRONG snapshot that would then be
+//     used for "idempotent" reversal → silently corrupt balances.
+//
+// FIX: only backfill transactions where currency === account.currency
+// (no conversion was needed → snapshot = raw amount, always correct).
+// For multi-currency legacy transactions, leave sourceAmount as null
+// and let the API layer REJECT the reversal (see transactions/[id]/route.ts).
 //
 // To run: `npx tsx scripts/backfill-snapshots.ts`
-//
-// After running, the legacy null fallback in transactions/[id]/route.ts
-// should never be hit (all transactions will have snapshots).
 
 import { PrismaClient } from '@prisma/client';
-import bcrypt from 'bcryptjs';
+import { convert, type Currency } from '../src/lib/currency';
 
 const prisma = new PrismaClient();
 
-// Import the currency conversion + types
-// (Inline here to avoid module path issues)
-const DEFAULT_EXCHANGE_RATES: Record<string, number> = {
-  EGP: 1,
-  SAR: 13,
-  USD: 48.5,
-  EUR: 52,
-  AED: 13.2,
-};
-
-function convert(amount: number, from: string, to: string): number {
-  if (from === to) return amount;
-  const fromRate = DEFAULT_EXCHANGE_RATES[from] ?? 1;
-  const toRate = DEFAULT_EXCHANGE_RATES[to] ?? 1;
-  return amount * (toRate / fromRate);
-}
-
 async function backfill() {
-  console.log('=== P0.13 backfill: snapshot fields for legacy transactions ===');
+  console.log('=== P0.14 backfill: snapshot fields for legacy transactions ===');
 
   // Find all transactions with null sourceAmount
   const legacy = await prisma.transaction.findMany({
@@ -45,54 +39,73 @@ async function backfill() {
   });
   console.log(`Found ${legacy.length} transactions with null sourceAmount`);
 
-  let updated = 0;
-  let skipped = 0;
+  let sameCurrencyUpdated = 0;
+  let multiCurrencySkipped = 0;
+  let errored = 0;
+
   for (const t of legacy) {
     if (!t.account) {
       console.warn(`Transaction ${t.id}: account not found, skipping`);
-      skipped++;
+      errored++;
       continue;
     }
 
-    // Compute sourceAmount: amount converted to source account's currency
-    const sourceAmount = t.currency === t.account.currency
-      ? t.amount
-      : convert(t.amount, t.currency, t.account.currency);
+    // P0.14: only backfill SAME-currency transactions.
+    // For these, sourceAmount = amount (no conversion needed → always correct).
+    // For MULTI-currency transactions, we cannot know the historical rate
+    // → leave sourceAmount null → API layer will REJECT the reversal.
+    if (t.currency === t.account.currency) {
+      // Same currency → snapshot is trivially correct
+      const sourceAmount = t.amount;
+      const exchangeRateUsed = null;  // no conversion was needed
 
-    if (!Number.isFinite(sourceAmount)) {
-      console.warn(`Transaction ${t.id}: conversion produced NaN, skipping`);
-      skipped++;
-      continue;
-    }
-
-    const exchangeRateUsed = t.currency === t.account.currency ? null : (sourceAmount / t.amount);
-
-    // For transfers, compute destAmount too
-    let destAmount: number | null = null;
-    if (t.toAccountId && t.toAccount) {
-      destAmount = t.currency === t.toAccount.currency
-        ? t.amount
-        : convert(t.amount, t.currency, t.toAccount.currency);
-      if (!Number.isFinite(destAmount)) {
-        console.warn(`Transaction ${t.id} (transfer): destAmount conversion produced NaN, setting null`);
-        destAmount = null;
+      // For transfers with same-currency destination
+      let destAmount: number | null = null;
+      if (t.toAccountId && t.toAccount) {
+        if (t.currency === t.toAccount.currency) {
+          destAmount = t.amount;  // same-currency transfer
+        } else {
+          // Cross-currency transfer — destAmount can't be safely computed
+          // without historical rate. Leave null. API layer will reject.
+          destAmount = null;
+        }
       }
+
+      await prisma.transaction.update({
+        where: { id: t.id },
+        data: { sourceAmount, destAmount, exchangeRateUsed },
+      });
+      sameCurrencyUpdated++;
+      continue;
     }
 
-    await prisma.transaction.update({
-      where: { id: t.id },
-      data: { sourceAmount, destAmount, exchangeRateUsed },
-    });
-    updated++;
+    // Multi-currency transaction — cannot safely backfill.
+    // Leave sourceAmount null. The API layer (transactions/[id]/route.ts)
+    // will REJECT any attempt to PUT/DELETE this transaction, forcing
+    // the user to manually reconcile or accept the current rates.
+    console.warn(
+      `Transaction ${t.id}: multi-currency (tx=${t.currency}, account=${t.account.currency}). ` +
+      `Cannot safely backfill without historical rate. Leaving sourceAmount=null. ` +
+      `API will reject PUT/DELETE — user must manually reconcile.`
+    );
+    multiCurrencySkipped++;
   }
 
   console.log(`\nBackfill complete:`);
-  console.log(`  Updated: ${updated}`);
-  console.log(`  Skipped: ${skipped}`);
+  console.log(`  Same-currency updated: ${sameCurrencyUpdated}`);
+  console.log(`  Multi-currency skipped (left null for safety): ${multiCurrencySkipped}`);
+  console.log(`  Errored: ${errored}`);
 
   // Verify
   const remaining = await prisma.transaction.count({ where: { sourceAmount: null } });
   console.log(`  Remaining null sourceAmount: ${remaining}`);
+
+  // Sanity check the convert() function (defensive — catches if someone
+  // breaks src/lib/currency.ts in the future)
+  console.log(`\nSanity check on convert():`);
+  console.log(`  100 USD → SAR: ${convert(100, 'USD', 'SAR')} (expected ~373.08)`);
+  console.log(`  100 SAR → USD: ${convert(100, 'SAR', 'USD')} (expected ~26.80)`);
+  console.log(`  100 EGP → SAR: ${convert(100, 'EGP', 'SAR')} (expected ~7.69)`);
 
   await prisma.$disconnect();
 }

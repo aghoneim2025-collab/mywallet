@@ -56,20 +56,32 @@ export async function POST(req: NextRequest) {
     console.log('logout: revoked', revokedHashes.length, 'token(s) with hashes:', revokedHashes);
   }
 
-  // P0.13: Always clear BOTH cookie names — the prod cookie (`__Host-auth-token`)
-  // and the dev cookie (`auth-token`). Without this, the cookie wasn't being
-  // cleared in production after P0.12 changed the name.
+  // P0.13/P0.14: clear BOTH cookie names with proper attributes.
+  // For __Host- cookies to be properly deleted, the deletion Set-Cookie
+  // MUST include: Secure + Path=/ + no Domain (matches the __Host- prefix
+  // requirements). NextResponse.cookies.delete() doesn't preserve these
+  // attributes — it just sets the cookie to empty with Expires=1970.
+  // So we use response.headers.append('Set-Cookie', ...) with the
+  // full attribute string.
   const response = NextResponse.json(
     revocationFailed
       ? { success: false, error: 'Logout failed: token revocation failed. Stolen tokens may still be valid. Please try again.' }
       : { success: true },
     { status: revocationFailed ? 500 : 200 },
   );
-  // Dev cookie (no __Host- prefix)
-  response.cookies.delete('auth-token');
-  // Prod cookie (with __Host- prefix — only used when isProduction)
+
+  // Dev cookie: `auth-token` (no Secure needed for HTTP localhost)
+  response.headers.append(
+    'Set-Cookie',
+    `auth-token=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+  );
+
+  // Prod cookie: `__Host-auth-token` (requires Secure + Path=/ + no Domain)
   if (isProduction) {
-    response.cookies.delete('__Host-auth-token');
+    response.headers.append(
+      'Set-Cookie',
+      `__Host-auth-token=; HttpOnly; SameSite=Strict; Secure; Max-Age=0; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+    );
   }
   return response;
 }

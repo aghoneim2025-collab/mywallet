@@ -27,12 +27,53 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
   try {
     const userId = await requireAuthAsync(req);
     const { id } = await params;
-    const existing = await db.transaction.findFirst({ where: { id, userId } });
+    // Include account + toAccount so we can check currency mismatch for P0.14
+    const existing = await db.transaction.findFirst({
+      where: { id, userId },
+      include: { account: true, toAccount: true },
+    });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
     // REJECT editing TRANSFER via this route
     if (existing.type === 'TRANSFER' as any) {
       return NextResponse.json({ error: 'Cannot edit transfer. Delete and recreate.' }, { status: 400 });
+    }
+
+    // P0.14: Validate that the legacy transaction CAN be safely reversed.
+    // If snapshot is null AND the transaction's currency differs from the
+    // account's currency, we cannot reverse safely (we don't know the
+    // historical exchange rate). REJECT the operation — do NOT silently
+    // use raw amount (would corrupt account balance).
+    if (
+      (existing.sourceAmount === null || existing.sourceAmount === undefined) &&
+      existing.currency !== existing.account?.currency
+    ) {
+      return NextResponse.json(
+        {
+          error: `Cannot edit this legacy multi-currency transaction (id=${id}): ` +
+            `the original exchange rate snapshot is missing, so reversal would ` +
+            `be unsafe. Please delete this transaction and recreate it, or ` +
+            `manually adjust the account balance instead.`,
+        },
+        { status: 400 },
+      );
+    }
+    // Also check for legacy TRANSFER with null destAmount where destination
+    // currency differs from source.
+    if (
+      existing.toAccountId &&
+      (existing.destAmount === null || existing.destAmount === undefined) &&
+      existing.toAccount &&
+      existing.currency !== existing.toAccount.currency
+    ) {
+      return NextResponse.json(
+        {
+          error: `Cannot edit this legacy multi-currency transfer (id=${id}): ` +
+            `the destination exchange rate snapshot is missing. ` +
+            `Please delete and recreate.`,
+        },
+        { status: 400 },
+      );
     }
 
     const body = await req.json();
@@ -71,33 +112,26 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
     // ATOMIC: reverse old (using snapshot, NOT re-convert) + apply new
     const updated = await db.$transaction(async (tx) => {
-      // P0.13: snapshot fields are required for idempotent reversal.
-      // Pre-P0.12 transactions have null sourceAmount — we CANNOT
-      // safely reverse them using current rates (could be wrong).
-      // Instead of silently using a wrong amount, we:
-      //   (1) Try the snapshot (correct path).
-      //   (2) If snapshot is null: log a warning + fall back to amount
-      //       WITHOUT conversion (only correct if no currency conversion
-      //       was originally applied). This is the best we can do without
-      //       a backfill.
-      //   (3) TODO: write a backfill script to populate snapshots for
-      //       all legacy transactions using current rates.
+      // P0.13/P0.14: snapshot fields are required for idempotent reversal.
+      // For same-currency transactions, snapshot = amount (always recoverable).
+      // For multi-currency transactions, snapshot is the EXACT amount applied
+      // at create time — without it, we'd have to re-convert with CURRENT
+      // rates, which would be wrong if rates changed between create and edit.
+      //
+      // P0.14 fix: the legacy fallback was previously logging a warning
+      // and using raw `amount` — which is wrong for multi-currency txns.
+      // Now the PUT handler REJECTS multi-currency legacy txns above (before
+      // reaching this $transaction). So here, we only handle:
+      //   (1) txns WITH snapshot → use snapshot (correct path)
+      //   (2) txns WITHOUT snapshot but where currency === account.currency
+      //       (snapshot = amount, no conversion needed)
       const reverseAmount = (() => {
         if (existing.sourceAmount !== null && existing.sourceAmount !== undefined) {
-          // Correct path: use snapshot
-          return existing.sourceAmount;
+          return existing.sourceAmount;  // correct path
         }
-        // Legacy fallback: use raw amount (no conversion). This is only
-        // correct if the original transaction had no currency conversion.
-        // For transactions WITH conversion, this may produce a wrong
-        // account balance — but it's the best we can do without historical
-        // rate data. Log a warning so we know which transactions are affected.
-        console.warn(
-          'transactions/[id] PUT: legacy transaction with null sourceAmount. ' +
-          'Falling back to raw amount (may be incorrect if currency conversion was originally applied). ' +
-          'Run backfill script to fix.',
-          { txId: id, amount: existing.amount, currency: existing.currency }
-        );
+        // Reaching here means snapshot is null BUT currency === account.currency
+        // (the multi-currency case was rejected above). For same-currency,
+        // snapshot = amount, so this is safe.
         return existing.amount;
       })();
       const oldDelta = existing.type === 'INCOME' ? -reverseAmount : reverseAmount;
@@ -133,33 +167,59 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
   try {
     const userId = await requireAuthAsync(req);
     const { id } = await params;
-    const existing = await db.transaction.findFirst({ where: { id, userId } });
+    // Include account + toAccount so we can check currency mismatch
+    const existing = await db.transaction.findFirst({
+      where: { id, userId },
+      include: { account: true, toAccount: true },
+    });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
+    // P0.14: REJECT deletion of legacy multi-currency transactions without snapshot.
+    // Using raw `amount` would silently corrupt the account balance.
+    // See the matching check in PUT above.
+    if (
+      (existing.sourceAmount === null || existing.sourceAmount === undefined) &&
+      existing.account &&
+      existing.currency !== existing.account.currency
+    ) {
+      return NextResponse.json(
+        {
+          error: `Cannot delete this legacy multi-currency transaction (id=${id}): ` +
+            `the original exchange rate snapshot is missing, so reversal would ` +
+            `be unsafe. Please manually adjust the account balance, or contact support.`,
+        },
+        { status: 400 },
+      );
+    }
+    // Also check transfer destination
+    if (
+      existing.toAccountId &&
+      (existing.destAmount === null || existing.destAmount === undefined) &&
+      existing.toAccount &&
+      existing.currency !== existing.toAccount.currency
+    ) {
+      return NextResponse.json(
+        {
+          error: `Cannot delete this legacy multi-currency transfer (id=${id}): ` +
+            `the destination exchange rate snapshot is missing. ` +
+            `Please manually adjust the destination account balance.`,
+        },
+        { status: 400 },
+      );
+    }
+
     if (existing.type === 'TRANSFER' as any && existing.toAccountId) {
-      // ATOMIC: reverse both accounts using snapshot (or legacy fallback with warning)
+      // ATOMIC: reverse both accounts using snapshot (or same-currency fallback)
       await db.$transaction(async (tx) => {
         const [src, dst] = await Promise.all([
           tx.account.findFirst({ where: { id: existing.accountId, userId } }),
           tx.account.findFirst({ where: { id: existing.toAccountId!, userId } }),
         ]);
-        // P0.13: use snapshot if available; else log warning + fall back to raw amount
-        const srcAmount = existing.sourceAmount ?? (() => {
-          console.warn(
-            'transactions/[id] DELETE transfer: legacy transaction with null sourceAmount. ' +
-            'Falling back to raw amount (may be incorrect if currency conversion was originally applied).',
-            { txId: id }
-          );
-          return existing.amount;
-        })();
-        const dstAmount = existing.destAmount ?? (() => {
-          console.warn(
-            'transactions/[id] DELETE transfer: legacy transaction with null destAmount. ' +
-            'Falling back to raw amount (may be incorrect if currency conversion was originally applied).',
-            { txId: id }
-          );
-          return existing.amount;
-        })();
+        // P0.14: multi-currency null-snapshot case was rejected above.
+        // Here we either have a snapshot, OR it's a same-currency txn
+        // (snapshot = amount).
+        const srcAmount = existing.sourceAmount ?? existing.amount;
+        const dstAmount = existing.destAmount ?? existing.amount;
         if (src) {
           await tx.account.update({ where: { id: src.id }, data: { balance: { increment: srcAmount } } });
         }
@@ -171,19 +231,13 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
       return NextResponse.json({ success: true });
     }
 
-    // Normal: ATOMIC reverse (using snapshot, or legacy fallback with warning) + delete
+    // Normal: ATOMIC reverse (using snapshot, or same-currency fallback) + delete
     await db.$transaction(async (tx) => {
       const acc = await tx.account.findFirst({ where: { id: existing.accountId, userId } });
       if (acc) {
-        // P0.13: use snapshot if available; else log warning + fall back to raw amount
-        const reverseAmount = existing.sourceAmount ?? (() => {
-          console.warn(
-            'transactions/[id] DELETE: legacy transaction with null sourceAmount. ' +
-            'Falling back to raw amount (may be incorrect if currency conversion was originally applied).',
-            { txId: id }
-          );
-          return existing.amount;
-        })();
+        // P0.14: snapshot OR same-currency fallback (multi-currency null
+        // was rejected above).
+        const reverseAmount = existing.sourceAmount ?? existing.amount;
         const delta = existing.type === 'INCOME' ? -reverseAmount : reverseAmount;
         await tx.account.update({ where: { id: acc.id }, data: { balance: { increment: delta } } });
       }
