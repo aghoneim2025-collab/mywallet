@@ -58,7 +58,8 @@ export async function POST(req: NextRequest) {
     });
 
     const token = generateToken(result.id);
-    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name, token } });
+    // P0.12: do NOT return token in JSON body. See login/route.ts for rationale.
+    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     // P0.11: don't leak err.message

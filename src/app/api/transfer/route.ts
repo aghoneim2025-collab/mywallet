@@ -99,6 +99,10 @@ export async function POST(req: NextRequest) {
           userId,
           date: date ? new Date(date) : new Date(),
           note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
+          // P0.12: snapshot fields for idempotent reversal
+          sourceAmount,
+          destAmount,
+          exchangeRateUsed: sourceAmount === amt ? null : (sourceAmount / amt),
         },
         include: { account: true, category: true, toAccount: true },
       });

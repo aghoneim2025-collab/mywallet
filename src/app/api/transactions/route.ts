@@ -95,7 +95,13 @@ export async function POST(req: NextRequest) {
     // Sanity check on converted amount
     if (!Number.isFinite(delta)) return badRequest('Currency conversion failed (invalid rate?)');
 
-    // ATOMIC: update balance + create transaction
+    // P0.12: snapshot the conversion for idempotent reversal later.
+    // When this transaction is edited or deleted, we'll use sourceAmount
+    // (the EXACT amount applied) instead of re-running convert() with
+    // CURRENT rates (which could have changed).
+    const exchangeRateUsed = txCurrency === account.currency ? null : (amountInAccountCurrency / amt);
+
+    // ATOMIC: update balance + create transaction (with snapshot)
     const transaction = await db.$transaction(async (tx) => {
       await tx.account.update({ where: { id: accountId }, data: { balance: { increment: delta } } });
       return tx.transaction.create({
@@ -105,6 +111,10 @@ export async function POST(req: NextRequest) {
           date: date ? new Date(date) : new Date(),
           note: note ? String(note).slice(0, 500) : null,
           tags: tags ? String(tags).slice(0, 200) : null,
+          // P0.12: snapshot fields
+          sourceAmount: amountInAccountCurrency,
+          destAmount: null,  // not a transfer
+          exchangeRateUsed,
         },
         include: { account: true, category: true },
       });

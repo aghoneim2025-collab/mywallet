@@ -1,7 +1,16 @@
-// Simple fetch wrapper
-import { getStoredToken } from './auth-storage';
-
-const baseUrl = '';
+// P0.4/P0.12: simple fetch wrapper.
+//
+// P0.12 changes: no longer attaches `Authorization: Bearer <token>` header.
+// The JWT now lives in the HttpOnly cookie (set by /api/auth/login +
+// /api/auth/register). The browser automatically sends cookies for
+// same-origin requests, so no client-side intervention is needed.
+//
+// `credentials: 'same-origin'` is the default for fetch in modern browsers,
+// which is what we want — cookies are sent on same-origin requests only.
+//
+// Future: if we ever add cross-origin API access (e.g., a mobile app),
+// add `credentials: 'include'` AND ensure the server sets
+// `Access-Control-Allow-Credentials: true` + an explicit origin (NOT *).
 
 export async function api<T>(
   path: string,
@@ -18,19 +27,9 @@ export async function api<T>(
     if (qs) url += `?${qs}`;
   }
 
-  // Attach Bearer token if available (fallback for when cookies don't propagate)
-  const token = getStoredToken();
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(rest?.headers as Record<string, string> || {}),
-  };
-  if (token && !headers['Authorization']) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const res = await fetch(`${baseUrl}${url}`, {
+  const res = await fetch(url, {
     ...rest,
-    headers,
+    headers: { 'Content-Type': 'application/json', ...(rest?.headers || {}) },
   });
 
   if (!res.ok) {
@@ -41,12 +40,14 @@ export async function api<T>(
   return res.json();
 }
 
-// Helper: download a file (for CSV export)
+// Helper: download a file (for CSV/Excel export).
+// Cookies are sent automatically (same-origin).
 export async function downloadFile(url: string, filename: string) {
-  const token = getStoredToken();
-  const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-  const res = await fetch(url, { headers });
+  const res = await fetch(url);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Network error' }));
+    throw new Error(err.error || res.statusText);
+  }
   const blob = await res.blob();
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');

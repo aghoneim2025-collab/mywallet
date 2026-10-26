@@ -112,21 +112,33 @@ enum CategoryType {
 }
 
 // ===== Transaction (المعاملة: مصروف أو دخل أو تحويل) =====
+// P0.12: added `sourceAmount` + `destAmount` + `exchangeRateUsed` to
+// snapshot the conversion at create time. This way, editing/deleting a
+// transaction reverses the EXACT amount that was applied — even if
+// exchange rates change between create and delete.
+//   sourceAmount: amount actually applied to the source account (in account.currency)
+//   destAmount: amount applied to destination account (only for TRANSFER; else null)
+//   exchangeRateUsed: snapshot of the rate used (source/target or tx/account)
+//                    null if no conversion was needed
 model Transaction {
-  id            String   @id @default(cuid())
-  type          CategoryType
-  amount        Float
-  currency      Currency
-  accountId     String
-  categoryId    String
-  toAccountId   String?
-  date          DateTime  @default(now())
-  note          String?
-  tags          String?
-  transferPairId String?
-  userId        String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id              String   @id @default(cuid())
+  type            CategoryType
+  amount          Float
+  currency        Currency
+  accountId       String
+  categoryId      String
+  toAccountId     String?
+  date            DateTime  @default(now())
+  note            String?
+  tags            String?
+  transferPairId  String?
+  // P0.12: snapshot fields for idempotent reversal
+  sourceAmount    Float?
+  destAmount      Float?
+  exchangeRateUsed Float?
+  userId          String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   user         User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
   account      Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)

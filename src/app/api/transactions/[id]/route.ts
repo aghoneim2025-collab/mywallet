@@ -3,6 +3,13 @@ import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, badRequest } from '@/lib/validate';
+
+// P0.12 fixes:
+//   - Use the snapshot fields (sourceAmount, destAmount, exchangeRateUsed)
+//     for reversal — re-running convert() with CURRENT rates was wrong.
+//   - Validate input (NaN/Infinity, currency enum).
+//   - Add userId filter when reading the old account (was: IDOR risk).
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -29,17 +36,20 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     }
 
     const body = await req.json();
-    const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
+    const { type, amount, currency, accountId, categoryId, date, note, tags } = body || {};
     const newType = type || existing.type;
-    if (!['EXPENSE', 'INCOME'].includes(newType)) {
-      return NextResponse.json({ error: 'Type must be EXPENSE or INCOME' }, { status: 400 });
+    if (newType !== 'EXPENSE' && newType !== 'INCOME') {
+      return badRequest('Type must be EXPENSE or INCOME');
     }
-    const newAmount = Number(amount ?? existing.amount);
-    if (!newAmount || newAmount <= 0 || !isFinite(newAmount)) {
-      return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
+    // P0.11: validate amount via parseMoney
+    const amtResult = parseMoney(amount ?? existing.amount, { allowZero: false, allowNegative: false });
+    if (!amtResult.ok) return badRequest(amtResult.error);
+    const newAmount = amtResult.value;
+    if (currency !== undefined && !isCurrency(currency)) {
+      return badRequest('Invalid currency');
     }
 
-    // Verify BOTH account AND category ownership
+    // Verify BOTH account AND category ownership (IDOR defense)
     const newAccountId = accountId || existing.accountId;
     const newCategoryId = categoryId || existing.categoryId;
     const [newAccount, newCategory] = await Promise.all([
@@ -49,33 +59,55 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     if (!newAccount) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
     if (!newCategory) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
     if (newCategory.type !== newType) {
-      return NextResponse.json({ error: 'Category type mismatch' }, { status: 400 });
+      return badRequest('Category type mismatch');
     }
 
-    const newTxCurrency = (currency || existing.currency) as Currency;
+    const newTxCurrency: Currency = currency || existing.currency;
     const newAmountInAcc = newTxCurrency === newAccount.currency
-      ? newAmount : convert(newAmount, newTxCurrency, newAccount.currency as Currency);
+      ? newAmount : convert(newAmount, newTxCurrency, newAccount.currency);
     const newDelta = newType === 'INCOME' ? newAmountInAcc : -newAmountInAcc;
+    if (!Number.isFinite(newDelta)) return badRequest('Currency conversion failed');
+    const newExchangeRateUsed = newTxCurrency === newAccount.currency ? null : (newAmountInAcc / newAmount);
 
-    // ATOMIC: reverse old + apply new
+    // ATOMIC: reverse old (using snapshot, NOT re-convert) + apply new
     const updated = await db.$transaction(async (tx) => {
-      // Reverse old
-      const oldAcc = await tx.account.findUnique({ where: { id: existing.accountId } });
-      if (oldAcc) {
-        const oldAmt = existing.currency === oldAcc.currency
-          ? existing.amount : convert(existing.amount, existing.currency as Currency, oldAcc.currency as Currency);
-        const oldDelta = existing.type === 'INCOME' ? -oldAmt : oldAmt;
-        await tx.account.update({ where: { id: existing.accountId }, data: { balance: { increment: oldDelta } } });
+      // P0.12: use snapshot (sourceAmount) for reversal, not re-convert.
+      // This is the whole point of the snapshot fields — reversal is
+      // idempotent even if rates changed between create and update.
+      if (existing.sourceAmount !== null && existing.sourceAmount !== undefined) {
+        const oldDelta = existing.type === 'INCOME' ? -existing.sourceAmount : existing.sourceAmount;
+        await tx.account.update({
+          where: { id: existing.accountId },
+          data: { balance: { increment: oldDelta } },
+        });
+      } else {
+        // Fallback for transactions created before P0.12 snapshot fields existed.
+        // Re-convert using CURRENT rates (legacy behavior — may drift if rates changed).
+        const oldAcc = await tx.account.findFirst({ where: { id: existing.accountId, userId } });
+        if (oldAcc) {
+          const oldAmt = existing.currency === oldAcc.currency
+            ? existing.amount : convert(existing.amount, existing.currency, oldAcc.currency);
+          const oldDelta = existing.type === 'INCOME' ? -oldAmt : oldAmt;
+          await tx.account.update({ where: { id: existing.accountId }, data: { balance: { increment: oldDelta } } });
+        }
       }
-      // Apply new
+      // Apply new (with fresh snapshot)
       await tx.account.update({ where: { id: newAccount.id }, data: { balance: { increment: newDelta } } });
-      return tx.transaction.update({ where: { id }, data: {
-        type: newType, amount: newAmount, currency: newTxCurrency,
-        accountId: newAccount.id, categoryId: newCategory.id,
-        date: date ? new Date(date) : existing.date,
-        note: note !== undefined ? note : existing.note,
-        tags: tags !== undefined ? tags : existing.tags,
-      }, include: { account: true, category: true, toAccount: true } });
+      return tx.transaction.update({
+        where: { id },
+        data: {
+          type: newType, amount: newAmount, currency: newTxCurrency,
+          accountId: newAccount.id, categoryId: newCategory.id,
+          date: date ? new Date(date) : existing.date,
+          note: note !== undefined ? (note ? String(note).slice(0, 500) : null) : existing.note,
+          tags: tags !== undefined ? (tags ? String(tags).slice(0, 200) : null) : existing.tags,
+          // P0.12: refresh snapshot fields
+          sourceAmount: newAmountInAcc,
+          destAmount: null,
+          exchangeRateUsed: newExchangeRateUsed,
+        },
+        include: { account: true, category: true, toAccount: true },
+      });
     });
     return NextResponse.json({ data: updated });
   } catch (err: any) {
@@ -91,20 +123,20 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
     if (existing.type === 'TRANSFER' as any && existing.toAccountId) {
-      // ATOMIC: reverse both accounts
+      // ATOMIC: reverse both accounts using snapshot
       await db.$transaction(async (tx) => {
         const [src, dst] = await Promise.all([
           tx.account.findFirst({ where: { id: existing.accountId, userId } }),
           tx.account.findFirst({ where: { id: existing.toAccountId!, userId } }),
         ]);
         if (src) {
-          const amt = existing.currency === src.currency ? existing.amount
-            : convert(existing.amount, existing.currency as Currency, src.currency as Currency);
+          // P0.12: use snapshot
+          const amt = existing.sourceAmount ?? existing.amount;
           await tx.account.update({ where: { id: src.id }, data: { balance: { increment: amt } } });
         }
         if (dst) {
-          const amt = existing.currency === dst.currency ? existing.amount
-            : convert(existing.amount, existing.currency as Currency, dst.currency as Currency);
+          // P0.12: use snapshot
+          const amt = existing.destAmount ?? existing.amount;
           await tx.account.update({ where: { id: dst.id }, data: { balance: { increment: -amt } } });
         }
         await tx.transaction.delete({ where: { id } });
@@ -112,12 +144,12 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
       return NextResponse.json({ success: true });
     }
 
-    // Normal: ATOMIC reverse + delete
+    // Normal: ATOMIC reverse (using snapshot) + delete
     await db.$transaction(async (tx) => {
       const acc = await tx.account.findFirst({ where: { id: existing.accountId, userId } });
       if (acc) {
-        const amt = existing.currency === acc.currency ? existing.amount
-          : convert(existing.amount, existing.currency as Currency, acc.currency as Currency);
+        // P0.12: use snapshot
+        const amt = existing.sourceAmount ?? existing.amount;
         const delta = existing.type === 'INCOME' ? -amt : amt;
         await tx.account.update({ where: { id: acc.id }, data: { balance: { increment: delta } } });
       }

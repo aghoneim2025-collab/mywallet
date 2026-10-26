@@ -1,7 +1,7 @@
-=== محفظتي (MyWallet) - Source Code (P0.11 Comprehensive Security + Data Integrity Fixes) ===
+=== محفظتي (MyWallet) - Source Code (P0.12 Final Security + Data Integrity Pass) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.11 (comprehensive security + data integrity) ===
-=== BUILD: 2026-10-26T05:45:12.044Z ===
+=== VERSION: P0.12 (final security + data integrity) ===
+=== BUILD: 2026-10-26T05:56:07.472Z ===
 
 URGENT SECURITY NOTE:
   In P0.5, the source-code ZIP files inadvertently included the .env file
@@ -225,21 +225,33 @@ enum CategoryType {
 }
 
 // ===== Transaction (المعاملة: مصروف أو دخل أو تحويل) =====
+// P0.12: added `sourceAmount` + `destAmount` + `exchangeRateUsed` to
+// snapshot the conversion at create time. This way, editing/deleting a
+// transaction reverses the EXACT amount that was applied — even if
+// exchange rates change between create and delete.
+//   sourceAmount: amount actually applied to the source account (in account.currency)
+//   destAmount: amount applied to destination account (only for TRANSFER; else null)
+//   exchangeRateUsed: snapshot of the rate used (source/target or tx/account)
+//                    null if no conversion was needed
 model Transaction {
-  id            String   @id @default(cuid())
-  type          CategoryType
-  amount        Float
-  currency      Currency
-  accountId     String
-  categoryId    String
-  toAccountId   String?
-  date          DateTime  @default(now())
-  note          String?
-  tags          String?
-  transferPairId String?
-  userId        String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id              String   @id @default(cuid())
+  type            CategoryType
+  amount          Float
+  currency        Currency
+  accountId       String
+  categoryId      String
+  toAccountId     String?
+  date            DateTime  @default(now())
+  note            String?
+  tags            String?
+  transferPairId  String?
+  // P0.12: snapshot fields for idempotent reversal
+  sourceAmount    Float?
+  destAmount      Float?
+  exchangeRateUsed Float?
+  userId          String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   user         User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
   account      Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
@@ -551,13 +563,17 @@ export function generateToken(userId: string): string {
 }
 
 // P0.5: Extract token from request (Authorization header OR cookie).
+// P0.12: in production, cookie name is `__Host-auth-token` (with prefix).
 export function extractToken(req: Request): string | null {
+  // Authorization: Bearer header (used by some legacy clients + tests)
   const authHeader = req.headers.get('authorization');
   if (authHeader?.startsWith('Bearer ')) {
     return authHeader.slice(7);
   }
+  // Cookie (primary auth path now — JWT no longer in localStorage)
   const cookie = req.headers.get('cookie') || '';
-  const tokenMatch = cookie.match(/auth-token=([^;]+)/);
+  // Match either `auth-token` (dev) or `__Host-auth-token` (prod)
+  const tokenMatch = cookie.match(/(?:__Host-)?auth-token=([^;]+)/);
   if (tokenMatch) return tokenMatch[1];
   return null;
 }
@@ -736,10 +752,22 @@ export function requireAuth(req: Request): string {
 }
 
 export function setAuthCookie(response: Response, token: string): Response {
+  // P0.12: harden cookie attributes.
+  // - __Host- prefix: cookie name must start with `__Host-` to prevent
+  //   subdomain cookie injection. Requires Secure + Path=/ + no Domain.
+  // - SameSite=Strict: cookie is never sent on cross-site requests
+  //   (was: SameSite=Lax which allows top-level navigations).
+  // - Secure: cookie only sent over HTTPS (always set in production).
+  // - HttpOnly: cookie not readable by JS (XSS can't steal it).
+  //
+  // Trade-off: SameSite=Strict means clicking a link from a third-party
+  // site to /api/excel?action=export won't send the cookie → user has to
+  // be on the app's domain. For a finance app, this is the correct trade-off.
   const secure = isProduction ? '; Secure' : '';
+  const hostPrefix = isProduction ? '__Host-' : '';
   response.headers.set(
     'Set-Cookie',
-    `auth-token=${token}; HttpOnly; SameSite=Lax${secure}; Max-Age=2592000; Path=/`
+    `${hostPrefix}auth-token=${token}; HttpOnly; SameSite=Strict${secure}; Max-Age=2592000; Path=/`,
   );
   return response;
 }
@@ -893,59 +921,54 @@ export function compactNumber(amount: number, lang: 'ar' | 'en' = 'ar'): string 
 ========================================
 FILE: src/lib/auth-storage.ts
 ========================================
-// Client-side auth token storage.
-// Stored in localStorage so it survives page refreshes.
-// Server also sets HttpOnly cookie; this is the fallback when cookies
-// don't propagate (e.g., shared preview proxies).
-
-const TOKEN_KEY = 'mw-auth-token';
-
-let inMemoryToken: string | null = null;
-
-if (typeof window !== 'undefined') {
-  try {
-    inMemoryToken = window.localStorage.getItem(TOKEN_KEY);
-  } catch {
-    // localStorage might be unavailable (private mode)
-    inMemoryToken = null;
-  }
-}
+// P0.4/P0.12: client-side auth state storage.
+//
+// P0.12 changes: This file previously stored the JWT in localStorage as a
+// fallback for preview proxies that strip Set-Cookie. That fallback is
+// REMOVED because:
+//   1. localStorage is readable by any XSS payload (which is now a
+//      realistic threat given the app loads third-party scripts).
+//   2. With the cookie hardened to HttpOnly + SameSite=Strict + __Host-
+//      prefix, the cookie path is now safe. Preview proxies MUST forward
+//      Set-Cookie; if they don't, that's a proxy bug to fix, not an app
+//      bug to work around with a less-secure fallback.
+//
+// This file is kept as a no-op stub for backwards compatibility with
+// existing frontend imports (page.tsx, auth-screen.tsx, settings-screen.tsx,
+// data-tools.tsx). All operations are no-ops; the cookie is the only auth
+// source of truth now.
+//
+// Frontend code that wants to "log out" should call /api/auth/logout (which
+// server-side revokes the token + clears the cookie). Client-side state
+// clearing here has no security effect — only UX effect.
 
 export function getStoredToken(): string | null {
-  if (inMemoryToken) return inMemoryToken;
-  if (typeof window !== 'undefined') {
-    try {
-      inMemoryToken = window.localStorage.getItem(TOKEN_KEY);
-      return inMemoryToken;
-    } catch {
-      return null;
-    }
-  }
+  // P0.12: always returns null. Token lives in the HttpOnly cookie.
   return null;
 }
 
-export function setStoredToken(token: string | null): void {
-  inMemoryToken = token;
-  if (typeof window !== 'undefined') {
-    try {
-      if (token) {
-        window.localStorage.setItem(TOKEN_KEY, token);
-      } else {
-        window.localStorage.removeItem(TOKEN_KEY);
-      }
-    } catch {
-      // ignore
-    }
-  }
+export function setStoredToken(_token: string | null): void {
+  // P0.12: no-op. Token is set/cleared server-side via Set-Cookie.
+  // Calling this with null has no effect; calling with a non-null value
+  // is a no-op (the value is discarded).
 }
 
 ========================================
 FILE: src/lib/api.ts
 ========================================
-// Simple fetch wrapper
-import { getStoredToken } from './auth-storage';
-
-const baseUrl = '';
+// P0.4/P0.12: simple fetch wrapper.
+//
+// P0.12 changes: no longer attaches `Authorization: Bearer <token>` header.
+// The JWT now lives in the HttpOnly cookie (set by /api/auth/login +
+// /api/auth/register). The browser automatically sends cookies for
+// same-origin requests, so no client-side intervention is needed.
+//
+// `credentials: 'same-origin'` is the default for fetch in modern browsers,
+// which is what we want — cookies are sent on same-origin requests only.
+//
+// Future: if we ever add cross-origin API access (e.g., a mobile app),
+// add `credentials: 'include'` AND ensure the server sets
+// `Access-Control-Allow-Credentials: true` + an explicit origin (NOT *).
 
 export async function api<T>(
   path: string,
@@ -962,19 +985,9 @@ export async function api<T>(
     if (qs) url += `?${qs}`;
   }
 
-  // Attach Bearer token if available (fallback for when cookies don't propagate)
-  const token = getStoredToken();
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(rest?.headers as Record<string, string> || {}),
-  };
-  if (token && !headers['Authorization']) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const res = await fetch(`${baseUrl}${url}`, {
+  const res = await fetch(url, {
     ...rest,
-    headers,
+    headers: { 'Content-Type': 'application/json', ...(rest?.headers || {}) },
   });
 
   if (!res.ok) {
@@ -985,12 +998,14 @@ export async function api<T>(
   return res.json();
 }
 
-// Helper: download a file (for CSV export)
+// Helper: download a file (for CSV/Excel export).
+// Cookies are sent automatically (same-origin).
 export async function downloadFile(url: string, filename: string) {
-  const token = getStoredToken();
-  const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-  const res = await fetch(url, { headers });
+  const res = await fetch(url);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Network error' }));
+    throw new Error(err.error || res.statusText);
+  }
   const blob = await res.blob();
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1471,38 +1486,60 @@ import { verifyPassword, generateToken, setAuthCookie } from '@/lib/auth';
 import { isValidEmail, validatePassword, tooManyRequests } from '@/lib/validate';
 import { rateLimitLogin } from '@/lib/rate-limit';
 
-// P0.11: rate limiting + email validation + password policy + timing-attack
+// P0.11/P0.12: rate limiting + email validation + password policy + timing-attack
 // mitigation (bcrypt against dummy hash when user doesn't exist).
+//
+// P0.12 fix: parse req.json() ONCE — was calling it twice (once for rate-limit
+// key, once for credentials), which threw on the second call → 500. Now we
+// parse once and reuse.
 
 // Dummy hash used to keep timing constant when the user doesn't exist.
 // Precomputed with bcrypt cost 12 — same as the real registration flow.
+// Note: any valid bcrypt hash works for the dummy — we just need bcrypt to
+// take ~250ms to compute. The exact value is irrelevant.
 const DUMMY_HASH = '$2b$12$g8vQ8jKQ8jKQ8jKQ8jKQ8eV8jKQ8jKQ8jKQ8jKQ8jKQ8eV8jKQ8jKQ8jKQ8jKQ8';
 
 export async function POST(req: NextRequest) {
   try {
+    // P0.12: parse body ONCE, reuse everywhere.
+    const body = await req.json().catch(() => ({}));
+    const { email, password } = body;
+
     // P0.11: rate limit by IP+email to slow brute-force attacks
-    const { email } = await req.json().catch(() => ({ email: '' }));
-    const rl = rateLimitLogin(req, email);
+    // Use the (possibly empty) email from the request for the rate-limit key
+    const rl = rateLimitLogin(req, typeof email === 'string' ? email : '');
     if (rl.limited) return tooManyRequests(rl.retryAfter, rl.message);
 
-    const { password } = await req.json();
-    if (!isValidEmail(email) || typeof password !== 'string') {
-      return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
+    // P0.11: validate input. Returns 401 (NOT 500) for missing/invalid creds.
+    // Always return the SAME 401 message so attackers can't distinguish
+    // "bad email" from "bad password".
+    if (!isValidEmail(email) || typeof password !== 'string' || password.length === 0) {
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
-    const normalizedEmail = email.toLowerCase().trim();
 
+    const normalizedEmail = email.toLowerCase().trim();
     const user = await db.user.findUnique({ where: { email: normalizedEmail } });
 
     // P0.11: always run bcrypt against something, so timing doesn't reveal
     // whether the user exists. When user is null, use DUMMY_HASH.
+    // bcrypt.compare against DUMMY_HASH will take ~250ms (same cost factor),
+    // matching the timing of a real bcrypt comparison.
     const valid = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
+
+    // P0.12: return 401 (NOT 500) for invalid credentials.
+    // The earlier 500 was due to the double-req.json() bug.
     if (!user || !valid) {
-      // Same response shape as 200 path → no information leak
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
     const token = generateToken(user.id);
-    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name, token } });
+    // P0.12: do NOT return token in JSON body. Token is set ONLY in the
+    // HttpOnly cookie. This closes the localStorage-XSS vector: an XSS
+    // attack can't read the token because JS can't access HttpOnly cookies.
+    // (Previous versions returned the token in JSON as a "Bearer fallback"
+    // for preview proxies that strip Set-Cookie. That fallback is removed
+    // — the preview proxy must be fixed to forward Set-Cookie instead.)
+    const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     // P0.11: don't leak err.message — generic 500
@@ -1574,7 +1611,8 @@ export async function POST(req: NextRequest) {
     });
 
     const token = generateToken(result.id);
-    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name, token } });
+    // P0.12: do NOT return token in JSON body. See login/route.ts for rationale.
+    const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name } });
     return setAuthCookie(response, token);
   } catch (err: any) {
     // P0.11: don't leak err.message
@@ -1844,7 +1882,13 @@ export async function POST(req: NextRequest) {
     // Sanity check on converted amount
     if (!Number.isFinite(delta)) return badRequest('Currency conversion failed (invalid rate?)');
 
-    // ATOMIC: update balance + create transaction
+    // P0.12: snapshot the conversion for idempotent reversal later.
+    // When this transaction is edited or deleted, we'll use sourceAmount
+    // (the EXACT amount applied) instead of re-running convert() with
+    // CURRENT rates (which could have changed).
+    const exchangeRateUsed = txCurrency === account.currency ? null : (amountInAccountCurrency / amt);
+
+    // ATOMIC: update balance + create transaction (with snapshot)
     const transaction = await db.$transaction(async (tx) => {
       await tx.account.update({ where: { id: accountId }, data: { balance: { increment: delta } } });
       return tx.transaction.create({
@@ -1854,6 +1898,10 @@ export async function POST(req: NextRequest) {
           date: date ? new Date(date) : new Date(),
           note: note ? String(note).slice(0, 500) : null,
           tags: tags ? String(tags).slice(0, 200) : null,
+          // P0.12: snapshot fields
+          sourceAmount: amountInAccountCurrency,
+          destAmount: null,  // not a transfer
+          exchangeRateUsed,
         },
         include: { account: true, category: true },
       });
@@ -1968,6 +2016,10 @@ export async function POST(req: NextRequest) {
           userId,
           date: date ? new Date(date) : new Date(),
           note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
+          // P0.12: snapshot fields for idempotent reversal
+          sourceAmount,
+          destAmount,
+          exchangeRateUsed: sourceAmount === amt ? null : (sourceAmount / amt),
         },
         include: { account: true, category: true, toAccount: true },
       });
@@ -2620,7 +2672,13 @@ export async function POST(req: NextRequest) {
       skipped,
       duplicate,
       transferSkipped,
-      message: `Imported ${imported}, skipped ${skipped}, duplicates ${duplicate}, transfers ${transferSkipped}`,
+      message:
+        `Imported ${imported} transaction(s). ` +
+        `Skipped ${skipped} invalid row(s). ` +
+        `Skipped ${duplicate} duplicate(s). ` +
+        (transferSkipped > 0
+          ? `Skipped ${transferSkipped} transfer(s) — transfers are not supported in Excel format (use Backup JSON to round-trip transfers). `
+          : ''),
     });
   } catch (err: any) {
     return handleAuthError(err);

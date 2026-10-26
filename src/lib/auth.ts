@@ -154,13 +154,17 @@ export function generateToken(userId: string): string {
 }
 
 // P0.5: Extract token from request (Authorization header OR cookie).
+// P0.12: in production, cookie name is `__Host-auth-token` (with prefix).
 export function extractToken(req: Request): string | null {
+  // Authorization: Bearer header (used by some legacy clients + tests)
   const authHeader = req.headers.get('authorization');
   if (authHeader?.startsWith('Bearer ')) {
     return authHeader.slice(7);
   }
+  // Cookie (primary auth path now — JWT no longer in localStorage)
   const cookie = req.headers.get('cookie') || '';
-  const tokenMatch = cookie.match(/auth-token=([^;]+)/);
+  // Match either `auth-token` (dev) or `__Host-auth-token` (prod)
+  const tokenMatch = cookie.match(/(?:__Host-)?auth-token=([^;]+)/);
   if (tokenMatch) return tokenMatch[1];
   return null;
 }
@@ -339,10 +343,22 @@ export function requireAuth(req: Request): string {
 }
 
 export function setAuthCookie(response: Response, token: string): Response {
+  // P0.12: harden cookie attributes.
+  // - __Host- prefix: cookie name must start with `__Host-` to prevent
+  //   subdomain cookie injection. Requires Secure + Path=/ + no Domain.
+  // - SameSite=Strict: cookie is never sent on cross-site requests
+  //   (was: SameSite=Lax which allows top-level navigations).
+  // - Secure: cookie only sent over HTTPS (always set in production).
+  // - HttpOnly: cookie not readable by JS (XSS can't steal it).
+  //
+  // Trade-off: SameSite=Strict means clicking a link from a third-party
+  // site to /api/excel?action=export won't send the cookie → user has to
+  // be on the app's domain. For a finance app, this is the correct trade-off.
   const secure = isProduction ? '; Secure' : '';
+  const hostPrefix = isProduction ? '__Host-' : '';
   response.headers.set(
     'Set-Cookie',
-    `auth-token=${token}; HttpOnly; SameSite=Lax${secure}; Max-Age=2592000; Path=/`
+    `${hostPrefix}auth-token=${token}; HttpOnly; SameSite=Strict${secure}; Max-Age=2592000; Path=/`,
   );
   return response;
 }

@@ -273,7 +273,13 @@ export async function POST(req: NextRequest) {
       skipped,
       duplicate,
       transferSkipped,
-      message: `Imported ${imported}, skipped ${skipped}, duplicates ${duplicate}, transfers ${transferSkipped}`,
+      message:
+        `Imported ${imported} transaction(s). ` +
+        `Skipped ${skipped} invalid row(s). ` +
+        `Skipped ${duplicate} duplicate(s). ` +
+        (transferSkipped > 0
+          ? `Skipped ${transferSkipped} transfer(s) — transfers are not supported in Excel format (use Backup JSON to round-trip transfers). `
+          : ''),
     });
   } catch (err: any) {
     return handleAuthError(err);

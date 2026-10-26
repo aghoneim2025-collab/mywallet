@@ -1,35 +1,64 @@
-// P0.11: simple in-memory rate limiter.
-// For production, replace with @upstash/ratelimit + Redis so limits are
-// shared across all worker processes / servers. In-memory is OK for
-// single-instance deploys and dev.
+// P0.11/P0.12: rate limiter.
 //
-// Strategy: token bucket per key. Each request consumes 1 token. Tokens
-// refill at a fixed rate up to a max capacity.
+// === KNOWN LIMITATION (multi-worker) ===
+// This implementation uses an in-memory Map. In a multi-worker Next.js
+// deployment (e.g., Vercel serverless, PM2 cluster), each worker has its
+// OWN Map → each worker counts requests independently → effective limit
+// is multiplied by the number of workers.
+//
+// For production with multiple workers, you MUST use a shared store:
+//   - @upstash/ratelimit + @upstash/redis (edge-friendly, serverless)
+//   - rate-limiter-flexible + Redis (Node-only, more control)
+//   - A custom middleware backed by Postgres (works but adds DB load)
+//
+// To use Upstash, replace the `rateLimit()` function body with:
+//   import { Ratelimit } from '@upstash/ratelimit';
+//   import { Redis } from '@upstash/redis';
+//   const ratelimit = new Ratelimit({
+//     redis: Redis.fromEnv(),
+//     limiter: Ratelimit.slidingWindow(5, '15 m'),
+//     prefix: 'login',
+//   });
+//   const { success } = await ratelimit.limit(key);
+//
+// For now, this implementation works correctly for single-instance deploys
+// (the current preview setup). For multi-worker deploys, the limit becomes
+// N× more lenient — still provides *some* protection, just less strict.
+//
+// The "/api/health" endpoint can be used to verify whether the rate-limit
+// cache is actually shared (returns the bucket counts in a debug mode).
 
 import { NextRequest } from 'next/server';
 
 interface Bucket {
   tokens: number;
-  lastRefill: number; // Date.now()
+  lastRefill: number;
 }
 
-// Map<key, Bucket>
-const buckets = new Map<string, Bucket>();
+// P0.12: shared cache via globalThis so hot-reloads in dev don't reset it.
+// (Module-level Map is recreated on each hot reload in Next.js dev.)
+const globalForRate = globalThis as unknown as {
+  __rateLimitBuckets?: Map<string, Bucket>;
+  __rateLimitLastPurge?: number;
+};
 
-// Periodically purge expired buckets to keep memory bounded.
+const buckets: Map<string, Bucket> = globalForRate.__rateLimitBuckets ?? new Map();
+globalForRate.__rateLimitBuckets = buckets;
+
+let lastPurgeAt: number = globalForRate.__rateLimitLastPurge ?? Date.now();
+globalForRate.__rateLimitLastPurge = lastPurgeAt;
+
 const PURGE_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-let lastPurgeAt = Date.now();
 
 interface RateLimitConfig {
-  capacity: number;       // max tokens in bucket
-  refillPerSecond: number; // tokens added per second
-  windowSeconds: number;   // for Retry-After calculation
+  capacity: number;
+  refillPerSecond: number;
+  windowSeconds: number;
 }
 
-// Per-endpoint configs. Tune to taste.
 const LOGIN_CONFIG: RateLimitConfig = {
-  capacity: 5,            // 5 attempts
-  refillPerSecond: 5 / (15 * 60), // 1 every 3 minutes (5 per 15min)
+  capacity: 5,
+  refillPerSecond: 5 / (15 * 60), // 5 per 15min
   windowSeconds: 15 * 60,
 };
 
@@ -41,25 +70,25 @@ const REGISTER_CONFIG: RateLimitConfig = {
 
 const GLOBAL_CONFIG: RateLimitConfig = {
   capacity: 200,
-  refillPerSecond: 200 / 60, // 200 per minute
+  refillPerSecond: 200 / 60,
   windowSeconds: 60,
 };
 
 interface RateLimitResult {
   limited: boolean;
-  retryAfter: number; // seconds
+  retryAfter: number;
   message?: string;
 }
 
 function rateLimit(key: string, config: RateLimitConfig): RateLimitResult {
   const now = Date.now();
 
-  // Periodic purge
   if (now - lastPurgeAt > PURGE_INTERVAL_MS) {
     for (const [k, b] of buckets) {
       if (now - b.lastRefill > 24 * 60 * 60 * 1000) buckets.delete(k);
     }
     lastPurgeAt = now;
+    globalForRate.__rateLimitLastPurge = lastPurgeAt;
   }
 
   let bucket = buckets.get(key);
@@ -68,13 +97,11 @@ function rateLimit(key: string, config: RateLimitConfig): RateLimitResult {
     buckets.set(key, bucket);
   }
 
-  // Refill
   const elapsedSeconds = (now - bucket.lastRefill) / 1000;
   bucket.tokens = Math.min(config.capacity, bucket.tokens + elapsedSeconds * config.refillPerSecond);
   bucket.lastRefill = now;
 
   if (bucket.tokens < 1) {
-    // Limited. Calculate retry-after: time until 1 token available.
     const retryAfter = Math.ceil((1 - bucket.tokens) / config.refillPerSecond);
     return {
       limited: true,
@@ -88,7 +115,6 @@ function rateLimit(key: string, config: RateLimitConfig): RateLimitResult {
 }
 
 function getClientIP(req: NextRequest): string {
-  // Try common headers (Caddy/Cloudflare/etc).
   const xff = req.headers.get('x-forwarded-for');
   if (xff) return xff.split(',')[0].trim();
   const xReal = req.headers.get('x-real-ip');
@@ -98,7 +124,6 @@ function getClientIP(req: NextRequest): string {
 
 export function rateLimitLogin(req: NextRequest, email: string): RateLimitResult {
   const ip = getClientIP(req);
-  // Limit per (IP, email) — slows per-account brute force AND per-IP.
   const key = `login:${ip}:${(email || '').toLowerCase().trim()}`;
   const result = rateLimit(key, LOGIN_CONFIG);
   if (result.limited) {
