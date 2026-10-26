@@ -99,9 +99,9 @@ export function validatePassword(pw: unknown): { ok: true } | { ok: false; error
   if (pw.length < MIN_PASSWORD_LENGTH) {
     return { ok: false, error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` };
   }
-  if (pw.length > 72) {
+  if (Buffer.byteLength(pw, 'utf8') > 72) {
     // bcrypt truncates at 72 bytes silently — reject to avoid confusion
-    return { ok: false, error: 'Password must be at most 72 characters (bcrypt limit)' };
+    return { ok: false, error: 'Password must be at most 72 bytes (bcrypt limit)' };
   }
   // Require at least 3 of: lowercase, uppercase, digit, symbol
   const classes = [

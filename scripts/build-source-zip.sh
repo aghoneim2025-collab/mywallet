@@ -9,7 +9,7 @@
 #     private key markers, etc. (P0.9 only matched one regex.)
 set -e
 
-ROOT=/home/z/my-project
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
 OUT="$ROOT/public/source-code-P0.10-${TIMESTAMP}.zip"
 STAGE=$(mktemp -d /tmp/source-stage.XXXXXX)

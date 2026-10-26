@@ -47,6 +47,18 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       data.currency = currency;
     }
     if (balance !== undefined) {
+      // P0.19: block direct balance rewrite if account has transactions.
+      // This prevents detaching the running balance from the transaction ledger.
+      // If the user wants to adjust the balance, they should create a reconciliation
+      // transaction (or delete all transactions first).
+      const txCount = await db.transaction.count({ where: { accountId: id } });
+      if (txCount > 0) {
+        return NextResponse.json(
+          { error: `Cannot change balance directly: account has ${txCount} transaction(s). ` +
+            'Create a reconciliation transaction instead, or delete the transactions first.' },
+          { status: 400 },
+        );
+      }
       const r = parseMoney(balance, { allowZero: true, allowNegative: true });
       if (!r.ok) return badRequest(r.error);
       data.balance = r.value;

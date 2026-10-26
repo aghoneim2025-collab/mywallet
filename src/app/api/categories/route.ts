@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { parseString, isCategoryType, badRequest } from '@/lib/validate';
 
 // GET /api/categories - user-scoped
 export async function GET(req: NextRequest) {

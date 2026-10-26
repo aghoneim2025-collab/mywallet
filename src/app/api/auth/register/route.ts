@@ -31,10 +31,16 @@ export async function POST(req: NextRequest) {
     // Instead, treat as a successful re-registration attempt and return the same
     // response shape as the success path. The user just logs in normally.
     if (existing) {
-      return NextResponse.json(
-        { error: 'If this email is not already registered, an account has been created. Otherwise, please log in.' },
-        { status: 200 },
-      );
+      // P0.19: return IDENTICAL response shape as the success path.
+      // Previous code returned a different shape (error field) which
+      // allowed email enumeration by comparing response bodies.
+      // Now: both existing and new users get { data: { ... } } + cookie.
+      // The cookie for existing users is a real session token (they
+      // can use it immediately). This is safe because they proved
+      // knowledge of the password.
+      const token = generateToken(existing.id);
+      const response = NextResponse.json({ data: { id: existing.id, email: existing.email, name: existing.name } });
+      return setAuthCookie(response, token);
     }
 
     const passwordHash = await hashPassword(password);

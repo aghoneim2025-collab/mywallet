@@ -31,16 +31,24 @@ export async function GET(req: NextRequest) {
       app: 'mywallet',
       exportedAt: new Date().toISOString(),
       data: {
-        // P0.11: export WITHOUT primary keys — on import, fresh cuids are generated.
-        // This prevents a malicious backup from setting arbitrary PKs.
-        accounts: accounts.map(({ name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) =>
-          ({ name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
-        categories: categories.map(({ nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) =>
-          ({ nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
-        transactions: transactions.map(({ type, amount, currency, date, note, tags, transferPairId, createdAt, updatedAt }) =>
-          ({ type, amount, currency, date, note, tags, transferPairId, createdAt, updatedAt })),
-        budgets: budgets.map(({ month, limit, currency, createdAt, updatedAt }) =>
-          ({ month, limit, currency, createdAt, updatedAt })),
+        // P0.19 fix: export WITH ids so import can resolve FK references.
+        // Previously stripped ids → import couldn't map accountId/categoryId
+        // → all transactions + budgets silently skipped on restore.
+        // The ids are safe to include because:
+        //   (1) export is user-specific (only their own data)
+        //   (2) import creates NEW records with fresh Prisma cuids, then
+        //       maps old-id → new-id for FK resolution
+        //   (3) the old ids are just map keys, not actual DB FK values
+        accounts: accounts.map(({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) =>
+          ({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
+        categories: categories.map(({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) =>
+          ({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
+        // P0.19: also export snapshot fields (sourceAmount, destAmount, exchangeRateUsed)
+        // so multi-currency transactions can be reversed after restore.
+        transactions: transactions.map(({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, sourceAmount, destAmount, exchangeRateUsed, createdAt, updatedAt }) =>
+          ({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, sourceAmount, destAmount, exchangeRateUsed, createdAt, updatedAt })),
+        budgets: budgets.map(({ id, categoryId, month, limit, currency, createdAt, updatedAt }) =>
+          ({ id, categoryId, month, limit, currency, createdAt, updatedAt })),
       },
     };
 
@@ -198,6 +206,10 @@ export async function POST(req: NextRequest) {
             note: t.note ? String(t.note).slice(0, 500) : null,
             tags: t.tags ? String(t.tags).slice(0, 200) : null,
             transferPairId: t.transferPairId ? String(t.transferPairId).slice(0, 50) : null,
+            // P0.19: restore snapshot fields so multi-currency reversal works
+            sourceAmount: t.sourceAmount !== undefined && t.sourceAmount !== null ? Number(t.sourceAmount) : null,
+            destAmount: t.destAmount !== undefined && t.destAmount !== null ? Number(t.destAmount) : null,
+            exchangeRateUsed: t.exchangeRateUsed !== undefined && t.exchangeRateUsed !== null ? Number(t.exchangeRateUsed) : null,
             userId,
           },
         });

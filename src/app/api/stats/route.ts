@@ -3,6 +3,7 @@ import { db } from '@/lib/db';
 import { getServerExchangeRates, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { isCurrency, parseDate, badRequest } from '@/lib/validate';
 
 // GET /api/stats?month=YYYY-MM&baseCurrency=EGP
 export async function GET(req: NextRequest) {
@@ -10,7 +11,10 @@ export async function GET(req: NextRequest) {
     const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
-    const baseCurrency = (url.searchParams.get('baseCurrency') || 'EGP') as Currency;
+    if (month && !/^\d{4}-\d{2}$/.test(month)) return badRequest('Invalid month format (expected YYYY-MM)');
+    const baseCurrencyRaw = url.searchParams.get('baseCurrency') || 'EGP';
+    if (!isCurrency(baseCurrencyRaw)) return badRequest('Invalid baseCurrency');
+    const baseCurrency = baseCurrencyRaw as Currency;
 
     let start: Date, end: Date;
     if (month) {

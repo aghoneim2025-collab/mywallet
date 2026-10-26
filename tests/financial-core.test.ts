@@ -34,14 +34,8 @@ import {
 import { convertServer, DEFAULT_EXCHANGE_RATES } from '../src/lib/currency';
 
 // Use a separate test DB so we don't pollute production
-const TEST_DB_URL = 'file:./db/test.db';
-process.env.DATABASE_URL = TEST_DB_URL;
-process.env.NODE_ENV = 'development';
-process.env.AUTH_SECRET = 'test-secret-32-chars-minimum-aaaaaaaaaaaaaaa';
-
-const prisma = new PrismaClient({
-  datasources: { db: { url: TEST_DB_URL } },
-});
+// Env vars are set in vitest.config.ts (DATABASE_URL, AUTH_SECRET, NODE_ENV)
+const prisma = new PrismaClient();
 
 let testUserId: string;
 let testAccountId: string;
@@ -53,8 +47,16 @@ let expenseCategoryId: string;
 let transferCategoryId: string;
 
 beforeAll(async () => {
-  // Push schema to test DB
-  // (uses the same schema as production)
+  // P0.19: auto-push schema to test DB (no manual step needed)
+  const { execSync } = require('child_process');
+  try {
+    execSync('npx prisma db push --skip-generate', {
+      stdio: 'pipe',
+      env: { ...process.env },
+    });
+  } catch (e) {
+    // May already be in sync
+  }
   await prisma.$connect();
 });
 
