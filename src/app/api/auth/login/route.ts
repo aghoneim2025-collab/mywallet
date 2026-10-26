@@ -11,11 +11,21 @@ import { rateLimitLogin } from '@/lib/rate-limit';
 // key, once for credentials), which threw on the second call → 500. Now we
 // parse once and reuse.
 
-// Dummy hash used to keep timing constant when the user doesn't exist.
-// Precomputed with bcrypt cost 12 — same as the real registration flow.
-// Note: any valid bcrypt hash works for the dummy — we just need bcrypt to
-// take ~250ms to compute. The exact value is irrelevant.
-const DUMMY_HASH = '$2b$12$g8vQ8jKQ8jKQ8jKQ8jKQ8eV8jKQ8jKQ8jKQ8jKQ8jKQ8eV8jKQ8jKQ8jKQ8jKQ8';
+// P0.13: DUMMY_HASH is a REAL bcrypt hash (cost 12, 60 chars).
+// P0.12 used a 64-char string that wasn't a valid bcrypt hash →
+// bcryptjs's early length check returned false in <1ms instead of
+// doing the expensive bcrypt computation (~250ms). This made login
+// with non-existent email MUCH faster than login with existing email
+// + wrong password → timing-attack email enumeration was still possible.
+//
+// The fix: use a hash that bcryptjs will actually try to verify against,
+// so the comparison takes ~250ms regardless of whether the user exists.
+//
+// The hash below was generated with `bcrypt.hashSync('dummy-password-for-timing-attack-mitigation-only', 12)`.
+// It doesn't matter what password it hashes (no one can ever "match" it
+// for a real login) — what matters is that bcrypt.compare takes the
+// same time as a real hash.
+const DUMMY_HASH = '$2b$12$xULoKaEdpcsZZTCcMRZgrOOnGj6UwIOGro1JRK9AD6WNabxLev7Yq';
 
 export async function POST(req: NextRequest) {
   try {

@@ -26,7 +26,8 @@ const nodeEnv = process.env.NODE_ENV;
 const isDev = nodeEnv === 'development';
 const isProd = nodeEnv === 'production' || (!isDev);  // treat unknown as prod
 // Keep backward-compat name for existing imports:
-const isProduction = isProd;
+// P0.13: exported for use by logout route (to know which cookie to delete)
+export const isProduction = isProd;
 
 // P0.4: Stable, deterministic dev secret so all workers share the same key.
 const DEV_SECRET = 'dev-only-secret-please-set-AUTH_SECRET-in-production-env-min-32-chars-' +

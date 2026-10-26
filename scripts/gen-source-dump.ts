@@ -45,9 +45,9 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.12 Final Security + Data Integrity Pass) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.13 Final Critical Fixes) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.12 (final security + data integrity) ===
+=== VERSION: P0.13 (timing attack + cookie cleanup + migration) ===
 === BUILD: ${new Date().toISOString()} ===
 
 URGENT SECURITY NOTE:
