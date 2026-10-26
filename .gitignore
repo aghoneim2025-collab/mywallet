@@ -52,3 +52,13 @@ prompt
 server.log
 # Skills directory
 /skills/
+# Database files
+/db/
+*.db
+*.db-journal
+
+# Build artifacts
+/download/
+/public/source-code*.zip
+/public/source-code*.txt
+/public/source-code.txt
