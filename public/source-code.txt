@@ -1,7 +1,7 @@
-=== محفظتي (MyWallet) - Source Code (P0.9 Stricter NODE_ENV + DB Outage 503 + ZIP Allowlist) ===
-=== Fixed: NODE_ENV strict check, DB outage returns 503, ZIP uses file-level allowlist ===
-=== VERSION: P0.9 (NODE_ENV strict + 503 + ZIP allowlist) ===
-=== BUILD: 2026-10-25T13:47:44.295Z ===
+=== محفظتي (MyWallet) - Source Code (P0.10 Centralized Error Handler + Service UI + Strict ZIP) ===
+=== Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
+=== VERSION: P0.10 (centralized errors + service UI + strict ZIP) ===
+=== BUILD: 2026-10-26T05:09:33.765Z ===
 
 URGENT SECURITY NOTE:
   In P0.5, the source-code ZIP files inadvertently included the .env file
@@ -1139,7 +1139,7 @@ export default function RootLayout({
 FILE: src/app/page.tsx
 ========================================
 'use client';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { BottomNav, type TabKey } from '@/components/bottom-nav';
 import { FAB } from '@/components/fab';
 import { HomeScreen } from '@/components/home-screen';
@@ -1153,45 +1153,58 @@ import { TransferModal } from '@/components/transfer-modal';
 import { AuthScreen } from '@/components/auth-screen';
 import { getStoredToken, setStoredToken } from '@/lib/auth-storage';
 
+// P0.10: typed session-check result so we can distinguish the four cases
+// the API now returns:
+//   - 'authed'        → 200 with user data → user is logged in
+//   - 'unauth'        → 200 with null data → session really ended (clear token)
+//   - 'db-down'       → 503 → DB unreachable, keep token, show retry UI
+//   - 'server-error'  → 500 → unexpected, keep token, show retry UI
+type SessionState = 'loading' | 'authed' | 'unauth' | 'db-down' | 'server-error';
+
 export default function Home() {
-  const [authed, setAuthed] = useState(false);
-  const [checking, setChecking] = useState(true);
+  // P0.10: replaced `authed: boolean` + `checking: boolean` with a single
+  // typed state. This makes it impossible to accidentally render the auth
+  // screen when the DB is down (was the P0.9 bug — `authed=false` + `checking=false`
+  // fell through to the AuthScreen, even though we should have shown "retry").
+  const [session, setSession] = useState<SessionState>('loading');
   const [activeTab, setActiveTab] = useState<TabKey>('home');
   const [txModal, setTxModal] = useState<{ open: boolean; type: 'EXPENSE' | 'INCOME'; initial?: any }>({ open: false, type: 'EXPENSE' });
   const [transferModal, setTransferModal] = useState(false);
 
-  // Check auth on mount - try stored Bearer token first, fall back to cookie.
-  // P0.9: distinguish 503 (DB outage) from 200-with-null-data (session ended).
-  // On 503, we DON'T clear the stored token — the token may be perfectly
-  // valid, the DB is just temporarily unreachable. The user can retry
-  // later without re-logging in. On 200 with null data, the session
-  // has actually ended (token revoked or invalid) → clear it.
-  useEffect(() => {
+  const checkSession = useCallback(async () => {
+    setSession('loading');
     const stored = getStoredToken();
     const fetchOpts: RequestInit = stored
       ? { headers: { Authorization: `Bearer ${stored}` } }
       : {};
-    fetch('/api/auth/session', fetchOpts)
-      .then(async r => {
-        // P0.9: 503 = DB outage. Don't clear token. Show "service down" UI.
-        if (r.status === 503) {
-          console.warn('Session check: 503 (DB unavailable). Keeping token; user can retry.');
-          // Don't set authed — leave user on loading state, they can refresh.
-          return null;
-        }
-        return r.json();
-      })
-      .then(d => {
-        if (!d) return;  // 503 case
-        if (d.data) setAuthed(true);
-        else {
-          // Session has no data — clear any stale token.
-          setStoredToken(null);
-        }
-      })
-      .catch(() => {})
-      .finally(() => setChecking(false));
+    try {
+      const r = await fetch('/api/auth/session', fetchOpts);
+      if (r.status === 503) {
+        // DB outage. Keep token, show retry UI.
+        setSession('db-down');
+        return;
+      }
+      if (r.status === 500) {
+        // Unexpected server error. Keep token, show retry UI.
+        setSession('server-error');
+        return;
+      }
+      const d = await r.json();
+      if (d.data) {
+        setSession('authed');
+      } else {
+        // 200 with null data → real session ended. Clear token.
+        setStoredToken(null);
+        setSession('unauth');
+      }
+    } catch {
+      // Network error (server unreachable). Keep token, show retry UI.
+      setSession('server-error');
+    }
   }, []);
+
+  // Check auth on mount.
+  useEffect(() => { checkSession(); }, [checkSession]);
 
   const openAddExpense = () => setTxModal({ open: true, type: 'EXPENSE' });
   const openAddIncome = () => setTxModal({ open: true, type: 'INCOME' });
@@ -1202,15 +1215,14 @@ export default function Home() {
   const handleSaved = () => setReloadKey(k => k + 1);
 
   const handleLogout = () => {
-    // Clear stored token client-side + call logout API (clears cookie)
     setStoredToken(null);
     fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
-    setAuthed(false);
+    setSession('unauth');
     setActiveTab('home');
   };
 
-  // Show loading while checking auth
-  if (checking) {
+  // P0.10: loading state — spinner only.
+  if (session === 'loading') {
     return (
       <div className="min-h-screen flex items-center justify-center bg-blue-600">
         <div className="w-12 h-12 border-4 border-white/30 border-t-white rounded-full animate-spin" />
@@ -1218,11 +1230,53 @@ export default function Home() {
     );
   }
 
-  // Show auth screen if not logged in
-  if (!authed) {
-    return <AuthScreen onAuth={() => { setAuthed(true); setReloadKey(k => k + 1); }} />;
+  // P0.10: DB outage / server error UI — show a retry button, NOT the auth screen.
+  // Keeps the stored token intact so when the user retries and DB comes back,
+  // they're logged in automatically without re-entering credentials.
+  if (session === 'db-down' || session === 'server-error') {
+    const isDbDown = session === 'db-down';
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-4">
+        <div className="w-full max-w-sm text-center space-y-4">
+          <div className="w-20 h-20 rounded-3xl bg-amber-100 dark:bg-amber-950 flex items-center justify-center mx-auto">
+            <svg className="w-10 h-10 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-slate-900 dark:text-white">
+              {isDbDown ? 'الخدمة غير متاحة مؤقتًا' : 'حدث خطأ غير متوقع'}
+            </h2>
+            <p className="text-sm text-slate-600 dark:text-slate-400 mt-2">
+              {isDbDown
+                ? 'تعذّر الوصول إلى قاعدة البيانات. توكنك محفوظ — حاول مرة أخرى ولن تحتاج لإعادة تسجيل الدخول.'
+                : 'حدث خطأ في الخادم. توكنك محفوظ — حاول مرة أخرى ولن تحتاج لإعادة تسجيل الدخول.'}
+            </p>
+          </div>
+          <button
+            onClick={() => checkSession()}
+            className="w-full h-12 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium transition"
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      </div>
+    );
   }
 
+  // P0.10: 'unauth' → show auth screen.
+  if (session === 'unauth') {
+    return (
+      <AuthScreen
+        onAuth={() => {
+          setSession('authed');
+          setReloadKey(k => k + 1);
+        }}
+      />
+    );
+  }
+
+  // P0.10: 'authed' → main app.
   return (
     <div className="flex flex-col min-h-screen">
       <main className="flex-1 pb-24">
@@ -1647,31 +1701,41 @@ import { getUserIdFromRequestAsync, DbUnavailableError } from '@/lib/auth';
 // so the frontend can distinguish "session ended" (200 + data:null) from
 // "service is down, retry later" (503 + error). The frontend should NOT
 // clear the local token on 503 — only on 200 with null data.
+//
+// P0.10 fix: unexpected errors now return 500 (NOT 200 + null data).
+// Previously, ANY catch → 200 + null data → frontend treated as
+// "session ended" → cleared the token. This is wrong: an unexpected
+// server error doesn't mean the token is invalid. Return 500 so the
+// frontend keeps the token and shows "service error, retry" UI.
+// Only return 200 + null data when we KNOW the token is invalid
+// (signature check failed, token is in blacklist, expired, etc.).
 export async function GET(req: NextRequest) {
   let userId: string | null;
   try {
     userId = await getUserIdFromRequestAsync(req);
   } catch (e) {
     if (e instanceof DbUnavailableError) {
-      // DB is down. Don't claim the session is invalid — the token may be fine.
+      // DB is down. Token may be valid; don't claim session is invalid.
       return NextResponse.json(
         { data: null, error: 'Service unavailable: database unreachable. Please retry.' },
         { status: 503 },
       );
     }
-    // Unexpected error — log and treat as not logged in (safer default).
-    console.error('Unexpected error in /api/auth/session:', e);
-    return NextResponse.json({ data: null }, { status: 200 });
+    // P0.10: unexpected error → 500, NOT 200. Frontend keeps token.
+    console.error('Unexpected error in /api/auth/session (returning 500):', e);
+    return NextResponse.json(
+      { data: null, error: 'Internal server error. Please retry.' },
+      { status: 500 },
+    );
   }
 
   if (!userId) {
-    // Token missing, invalid, expired, or revoked.
+    // Token missing, invalid, expired, or revoked → real "session ended".
+    // Frontend WILL clear the token on this response (200 + null data).
     return NextResponse.json({ data: null }, { status: 200 });
   }
 
   // Token is valid + not revoked. Look up the user record.
-  // This is a SEPARATE DB call from the blacklist check, so we also
-  // need to handle DB errors here.
   let user;
   try {
     user = await db.user.findUnique({
@@ -1680,7 +1744,7 @@ export async function GET(req: NextRequest) {
     });
   } catch (e) {
     // DB error fetching the user. Return 503 so frontend doesn't clear token.
-    console.error('DB error fetching user in /api/auth/session:', e);
+    console.error('DB error fetching user in /api/auth/session (returning 503):', e);
     return NextResponse.json(
       { data: null, error: 'Service unavailable: database unreachable. Please retry.' },
       { status: 503 },
@@ -1690,6 +1754,7 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({ data: user });
 }
 
+
 ========================================
 FILE: src/app/api/transactions/route.ts
 ========================================
@@ -1697,6 +1762,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 export async function GET(req: NextRequest) {
   try {
@@ -1725,8 +1791,7 @@ export async function GET(req: NextRequest) {
     });
     return NextResponse.json({ data: transactions });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1777,8 +1842,7 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json({ data: transaction });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1789,6 +1853,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 export async function POST(req: NextRequest) {
   try {
@@ -1847,9 +1912,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ data: transfer });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    console.error('Transfer error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1859,6 +1922,7 @@ FILE: src/app/api/accounts/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // GET /api/accounts - user-scoped
 export async function GET(req: NextRequest) {
@@ -1867,8 +1931,7 @@ export async function GET(req: NextRequest) {
     const accounts = await db.account.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } });
     return NextResponse.json({ data: accounts });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1901,8 +1964,7 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json({ data: account });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1912,6 +1974,7 @@ FILE: src/app/api/categories/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // GET /api/categories - user-scoped
 export async function GET(req: NextRequest) {
@@ -1925,8 +1988,7 @@ export async function GET(req: NextRequest) {
     });
     return NextResponse.json({ data: categories });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1955,8 +2017,7 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json({ data: category });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -1967,6 +2028,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { EXCHANGE_RATES, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // GET /api/stats?month=YYYY-MM&baseCurrency=EGP
 export async function GET(req: NextRequest) {
@@ -2065,9 +2127,7 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    console.error('GET /api/stats error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2077,6 +2137,7 @@ FILE: src/app/api/budgets/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 export async function GET(req: NextRequest) {
   try {
@@ -2098,8 +2159,7 @@ export async function GET(req: NextRequest) {
     }
     return NextResponse.json({ data: budgets });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2128,8 +2188,7 @@ export async function POST(req: NextRequest) {
     const created = await db.budget.create({ data: { categoryId, month, limit: limitNum, currency: currency || 'EGP', userId }, include: { category: true } });
     return NextResponse.json({ data: created });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2144,8 +2203,7 @@ export async function DELETE(req: NextRequest) {
     await db.budget.delete({ where: { id } });
     return NextResponse.json({ success: true });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2155,6 +2213,7 @@ FILE: src/app/api/excel/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 import * as XLSX from 'xlsx';
 
 // GET /api/excel?action=export&month=YYYY-MM
@@ -2211,9 +2270,7 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    console.error('Excel export error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2331,9 +2388,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true, imported, skipped, message: `Imported ${imported}, skipped ${skipped}` });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    console.error('Excel import error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2343,6 +2398,7 @@ FILE: src/app/api/backup/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // GET /api/backup?action=export - user-scoped
 export async function GET(req: NextRequest) {
@@ -2379,8 +2435,7 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2469,8 +2524,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true, imported: result });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -2480,6 +2534,7 @@ FILE: src/app/api/reset/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // POST /api/reset - Delete user's transactions + budgets, reset account balances
 export async function POST(req: NextRequest) {
@@ -2507,8 +2562,7 @@ export async function POST(req: NextRequest) {
       message: `Deleted ${txCount} transactions, ${budgetCount} budgets. Accounts reset to 0. Categories kept.`,
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 

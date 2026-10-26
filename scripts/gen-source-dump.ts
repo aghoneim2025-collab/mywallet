@@ -45,9 +45,9 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.9 Stricter NODE_ENV + DB Outage 503 + ZIP Allowlist) ===
-=== Fixed: NODE_ENV strict check, DB outage returns 503, ZIP uses file-level allowlist ===
-=== VERSION: P0.9 (NODE_ENV strict + 503 + ZIP allowlist) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.10 Centralized Error Handler + Service UI + Strict ZIP) ===
+=== Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
+=== VERSION: P0.10 (centralized errors + service UI + strict ZIP) ===
 === BUILD: ${new Date().toISOString()} ===
 
 URGENT SECURITY NOTE:

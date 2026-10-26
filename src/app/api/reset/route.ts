@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // POST /api/reset - Delete user's transactions + budgets, reset account balances
 export async function POST(req: NextRequest) {
@@ -28,7 +29,6 @@ export async function POST(req: NextRequest) {
       message: `Deleted ${txCount} transactions, ${budgetCount} budgets. Accounts reset to 0. Categories kept.`,
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }

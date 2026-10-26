@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // GET /api/backup?action=export - user-scoped
 export async function GET(req: NextRequest) {
@@ -37,8 +38,7 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -127,7 +127,6 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true, imported: result });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }

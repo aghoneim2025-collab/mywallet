@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 
 // GET /api/accounts - user-scoped
 export async function GET(req: NextRequest) {
@@ -9,8 +10,7 @@ export async function GET(req: NextRequest) {
     const accounts = await db.account.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } });
     return NextResponse.json({ data: accounts });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -43,7 +43,6 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json({ data: account });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }

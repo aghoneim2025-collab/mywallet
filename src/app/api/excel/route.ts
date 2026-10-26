@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
+import { handleAuthError } from '@/lib/api-errors';
 import * as XLSX from 'xlsx';
 
 // GET /api/excel?action=export&month=YYYY-MM
@@ -57,9 +58,7 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    console.error('Excel export error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }
 
@@ -177,8 +176,6 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true, imported, skipped, message: `Imported ${imported}, skipped ${skipped}` });
   } catch (err: any) {
-    if (err.message === 'Unauthorized') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    console.error('Excel import error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return handleAuthError(err);
   }
 }

@@ -422,3 +422,80 @@ Stage Summary:
 - ZIP uses file-level allowlist (no directory copying) + case-statement filter
   that catches ALL .env* variants + post-zip verification.
 - .env.example no longer sets NODE_ENV (it's a deployment-time config).
+
+---
+Task ID: P0.10-centralized-errors-service-ui-strict-zip
+Agent: main
+Task: Address ChatGPT's P0.9 review concerns:
+  (1) /api/auth/session returns 200 with null data on unexpected errors
+      → frontend clears token (false "session ended")
+  (2) page.tsx on 503 keeps token but doesn't show service-down UI or retry
+  (3) Other API routes that use requireAuthAsync should distinguish
+      DbUnavailableError from auth failure (not generic 500)
+  (4) ZIP "strict allowlist" not quite strict:
+      - Copies all files from source dirs then excludes patterns
+      - Allows any .env.example inside those dirs (not just root)
+      - Secret value scan uses only one regex (AUTH_SECRET=[a-f0-9]{64})
+
+Work Log:
+- src/app/api/auth/session/route.ts:
+  - Changed unexpected-error catch from `200 + null data` to `500 + error msg`
+  - Frontend now keeps token on 500 (only clears on 200+null or 401)
+- NEW src/lib/api-errors.ts:
+  - handleAuthError(err) helper that distinguishes:
+      DbUnavailableError → 503 (Service Unavailable)
+      AuthInvalidError   → 401 (Unauthorized)
+      Error 'Unauthorized' → 401 (legacy compatibility)
+      Other errors       → 500 (Internal Server Error)
+  - All 12 API route files (23 call sites) now use handleAuthError(err)
+  - Wrote scripts/upgrade-to-handle-auth-error.ts + v2 for the migration
+- src/app/page.tsx:
+  - Replaced `authed: boolean` + `checking: boolean` with typed SessionState:
+      'loading' | 'authed' | 'unauth' | 'db-down' | 'server-error'
+  - Added proper Service-Down UI with retry button for 'db-down'/'server-error'
+  - The retry button calls checkSession() again (no token clear)
+  - Only 'unauth' shows the AuthScreen (real session ended)
+- scripts/build-source-zip.sh (rewrote with stricter allowlist):
+  - copy_dir_filtered now REJECTS .env.* inside source dirs (incl. nested .env.example)
+  - Root .env.example is added EXPLICITLY in step 3 (the only allowed .env*)
+  - Pre-zip scan #1: forbid all .env* except root .env.example
+  - Pre-zip scan #2: scan for multiple secret patterns:
+      - -----BEGIN PRIVATE KEY-----
+      - AUTH_SECRET=[64 hex]
+      - password_hash=...
+      - api_key=..., stripe_key=..., aws_secret=...
+  - Post-zip verification: walks ZIP file listing, applies forbidden-pattern
+    check to EVERY entry (catches anything that slipped through)
+  - Also rejects: *.pem, *.key, *.p12, *.pfx, *.crt, *.cer, id_rsa, etc.
+- .env.example:
+  - Was missing from disk (got deleted somehow), restored with full content
+- .env:
+  - AUTH_SECRET was missing (only DATABASE_URL present), regenerated + restored
+
+Verified by direct e2e test:
+  - POST /api/auth/register     → 200 + token ✅
+  - GET /api/auth/session       → 200 + user data ✅
+  - POST /api/auth/logout       → 200 { success: true } ✅
+  - Dev log: "logout: revoked 1 token(s) with hashes: [ '479f50febaf8' ]" ✅
+    (logged hash truncated to 12 chars, no userId payload)
+  - GET /api/transactions (revoked) → 401 { error: 'Unauthorized' } ✅
+    (using new centralized handleAuthError)
+
+Generated P0.10 timestamped files:
+- /home/z/my-project/public/source-code-P0.10-20261026-050923.zip
+- /home/z/my-project/public/source-code.txt (refreshed)
+- /home/z/my-project/public/source-code.zip (refreshed)
+
+Stage Summary:
+- All 4 critical P0.9 concerns fixed in P0.10.
+- /api/auth/session now returns 500 (not 200) on unexpected errors.
+- All 23 API call sites use centralized handleAuthError (consistent
+  DbUnavailableError → 503, AuthInvalidError → 401, others → 500).
+- page.tsx shows a proper "Service Unavailable" UI with retry button
+  on 503/500 (doesn't fall through to AuthScreen).
+- ZIP script:
+  - Only root-level .env.example allowed (catches nested sneaky files)
+  - Pre-zip scan #1: forbid all .env* except root .env.example
+  - Pre-zip scan #2: scan for multiple secret patterns (private keys,
+    AUTH_SECRET hex, password_hash, api keys, etc.)
+  - Post-zip verification: walk every ZIP entry, apply forbidden patterns
