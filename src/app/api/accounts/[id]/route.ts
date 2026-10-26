@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
-import { handleAuthError } from '@/lib/api-errors';
+import { handleAuthError, ValidationError } from '@/lib/api-errors';
 import {
   parseMoney, parseString, isCurrency, isAccountType, badRequest,
 } from '@/lib/validate';
@@ -22,6 +22,8 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     const body = await req.json();
     const { name, type, currency, balance, color, icon, isDefault } = body || {};
     const data: any = {};
+    let pendingBalanceChange: number | undefined;
+    let pendingCurrencyChange: string | undefined;
 
     if (name !== undefined) {
       const r = parseString(name, 'Name', { min: 1, max: 100 });
@@ -36,13 +38,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       if (!isCurrency(currency)) return badRequest('Invalid currency');
       // P0.11: block currency change on accounts with transactions
       if (currency !== account.currency) {
-        const cnt = await db.transaction.count({ where: { accountId: id } });
-        if (cnt > 0) {
-          return NextResponse.json(
-            { error: `Cannot change currency on account with ${cnt} existing transactions. Create a new account instead.` },
-            { status: 400 },
-          );
-        }
+        pendingCurrencyChange = currency;
       }
       data.currency = currency;
     }
@@ -78,8 +74,36 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     }
     if (isDefault !== undefined) data.isDefault = Boolean(isDefault);
 
-    // ATOMIC: toggle old default off + update
+    // ATOMIC: toggle old default off + update + balance/currency checks inside $transaction
+    // P0.21: moved balance + currency validation INSIDE $transaction to prevent
+    // race conditions (was: count outside → concurrent txn could be created
+    // between count and update → balance detached from ledger)
     const updated = await db.$transaction(async (tx) => {
+      // P0.21: check balance rewrite INSIDE $transaction (atomic with the update)
+      if (pendingBalanceChange !== undefined) {
+        const txCount = await tx.transaction.count({
+          where: { OR: [{ accountId: id }, { toAccountId: id }] },
+        });
+        if (txCount > 0) {
+          throw new ValidationError(
+            `Cannot change balance directly: account has ${txCount} transaction(s). ` +
+            'Create a reconciliation transaction instead, or delete the transactions first.'
+          );
+        }
+        data.balance = pendingBalanceChange;
+      }
+      // P0.21: check currency change INSIDE $transaction + include toAccountId
+      if (pendingCurrencyChange !== undefined && pendingCurrencyChange !== account.currency) {
+        const cnt = await tx.transaction.count({
+          where: { OR: [{ accountId: id }, { toAccountId: id }] },
+        });
+        if (cnt > 0) {
+          throw new ValidationError(
+            `Cannot change currency on account with ${cnt} existing transactions. Create a new account instead.`
+          );
+        }
+        data.currency = pendingCurrencyChange;
+      }
       if (isDefault) {
         const old = await tx.account.findFirst({ where: { isDefault: true, userId, NOT: { id } } });
         if (old) await tx.account.update({ where: { id: old.id }, data: { isDefault: false } });

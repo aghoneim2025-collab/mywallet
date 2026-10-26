@@ -1,24 +1,22 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
 
-// P0.20: HARD-CODED test DB — never use process.env.DATABASE_URL.
-// This prevents tests from accidentally wiping production data.
+// P0.21: capture the ORIGINAL DATABASE_URL BEFORE we override it.
+const originalDB = process.env.DATABASE_URL;
 const TEST_DB = 'file:./db/test.db';
 
-// Set env vars BEFORE any imports.
+// P0.21: safety guard — warn if the original DATABASE_URL pointed to a
+// non-test database. We override it below, so this is just a warning
+// (not fatal). The actual protection is the hardcode override.
+if (originalDB && !originalDB.includes('test') && !originalDB.includes('Test')) {
+  console.warn('WARNING: DATABASE_URL was "' + originalDB + '" (non-test).');
+  console.warn('Overriding to "' + TEST_DB + '" for tests.');
+}
+
+// Hardcode test DB — this ALWAYS wins, regardless of .env or shell env.
 const env = process.env as Record<string, string>;
 env.AUTH_SECRET = 'test-secret-32-chars-minimum-aaaaaaaaaaaaaaa';
 env.DATABASE_URL = TEST_DB;
-
-// P0.20: safety guard — refuse to run if DATABASE_URL was already
-// pointing to a non-test DB before we overrode it.
-const originalDB = env.DATABASE_URL;
-if (originalDB && !originalDB.includes('test') && !originalDB.includes('Test')) {
-  console.error('FATAL: Refusing to run tests — DATABASE_URL appears to point to a non-test database.');
-  console.error('DATABASE_URL was:', originalDB);
-  console.error('Tests would wipe this database. Override with TEST_DATABASE_URL or unset DATABASE_URL.');
-  process.exit(1);
-}
 
 export default defineConfig({
   test: {

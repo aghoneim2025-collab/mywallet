@@ -108,28 +108,77 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid backup format - missing data' }, { status: 400 });
     }
 
-    const { accounts = [], categories = [], transactions = [], budgets = [] } = backup.data;
-
-    // P0.20: validate data structure BEFORE deleting user's existing data.
-    // If arrays aren't arrays, or required fields are missing, we reject
-    // the import BEFORE touching the user's current data.
-    if (!Array.isArray(accounts) || !Array.isArray(categories) || !Array.isArray(transactions) || !Array.isArray(budgets)) {
-      return NextResponse.json({ error: 'Invalid backup format: data.accounts/categories/transactions/budgets must be arrays.' }, { status: 400 });
+    // P0.21: NO DEFAULTS — reject if any required array is missing.
+    // Previous code used `const { accounts = [], ... } = backup.data` which
+    // turned missing fields into empty arrays → passed validation → deleted
+    // user's data → returned success with 0 records restored.
+    const { accounts, categories, transactions, budgets } = backup.data;
+    if (accounts === undefined || categories === undefined || transactions === undefined || budgets === undefined) {
+      return NextResponse.json(
+        { error: 'Invalid backup: data.accounts, data.categories, data.transactions, data.budgets are all required. Got: ' +
+          `accounts=${typeof accounts}, categories=${typeof categories}, transactions=${typeof transactions}, budgets=${typeof budgets}` },
+        { status: 400 },
+      );
     }
-    // Verify transactions have the required FK fields (accountId, categoryId)
+    if (!Array.isArray(accounts) || !Array.isArray(categories) || !Array.isArray(transactions) || !Array.isArray(budgets)) {
+      return NextResponse.json({ error: 'Invalid backup format: accounts/categories/transactions/budgets must be arrays.' }, { status: 400 });
+    }
+
+    // P0.21: Pre-validate ALL FK references BEFORE the destructive delete.
+    // Build a set of account IDs + category IDs from the backup, then verify
+    // every transaction + budget FK resolves to one of them. If any FK is
+    // unresolvable → reject BEFORE touching user's data (not `continue` inside
+    // the $transaction after the delete).
+    const accountIdsInBackup = new Set(accounts.map((a: any) => a.id).filter(Boolean));
+    const categoryIdsInBackup = new Set(categories.map((c: any) => c.id).filter(Boolean));
+
+    // Verify accounts have IDs
+    for (const a of accounts) {
+      if (!a.id) {
+        return NextResponse.json({ error: 'Backup contains an account without an id field. Please re-export.' }, { status: 400 });
+      }
+    }
+    // Verify categories have IDs
+    for (const c of categories) {
+      if (!c.id) {
+        return NextResponse.json({ error: 'Backup contains a category without an id field. Please re-export.' }, { status: 400 });
+      }
+    }
+    // Verify every transaction FK resolves
     for (const t of transactions) {
       if (!t.accountId || !t.categoryId) {
         return NextResponse.json(
-          { error: 'Backup contains transactions missing accountId or categoryId. This looks like a v3 backup. Please export a fresh backup.' },
+          { error: 'Backup contains a transaction missing accountId or categoryId. Please re-export.' },
+          { status: 400 },
+        );
+      }
+      if (!accountIdsInBackup.has(t.accountId)) {
+        return NextResponse.json(
+          { error: `Backup transaction references accountId "${t.accountId}" which doesn't exist in the backup's accounts array. Backup is corrupt — please re-export.` },
+          { status: 400 },
+        );
+      }
+      if (!categoryIdsInBackup.has(t.categoryId)) {
+        return NextResponse.json(
+          { error: `Backup transaction references categoryId "${t.categoryId}" which doesn't exist in the backup's categories array. Backup is corrupt — please re-export.` },
+          { status: 400 },
+        );
+      }
+      if (t.toAccountId && !accountIdsInBackup.has(t.toAccountId)) {
+        return NextResponse.json(
+          { error: `Backup transaction references toAccountId "${t.toAccountId}" which doesn't exist in the backup's accounts array.` },
           { status: 400 },
         );
       }
     }
-    // Verify budgets have categoryId
+    // Verify every budget FK resolves
     for (const b of budgets) {
       if (!b.categoryId) {
+        return NextResponse.json({ error: 'Backup contains a budget missing categoryId. Please re-export.' }, { status: 400 });
+      }
+      if (!categoryIdsInBackup.has(b.categoryId)) {
         return NextResponse.json(
-          { error: 'Backup contains budgets missing categoryId. Please export a fresh backup.' },
+          { error: `Backup budget references categoryId "${b.categoryId}" which doesn't exist in the backup's categories array.` },
           { status: 400 },
         );
       }
@@ -203,34 +252,33 @@ export async function POST(req: NextRequest) {
         accCount++;
       }
 
-      // P0.11: IDOR defense — for each imported transaction, verify the FK
-      // references resolve to accounts/categories OWNED BY THIS USER
-      // (which they now are, because we just inserted them above).
-      // If an old ID doesn't appear in our map → reject that row (skipped).
+      // P0.21: ALL FKs were pre-validated BEFORE the delete. If we reach here,
+      // every transaction's accountId/categoryId/toAccountId resolves to
+      // an entry in our idMap. Use THROW (not continue) for any unexpected
+      // failure — this rolls back the entire $transaction (including the
+      // delete of old data), so the user's data is preserved.
       for (const t of transactions) {
-        // Resolve the foreign keys through our idMap.
-        // If the source ID is missing → cross-user reference attempt → skip.
-        const newAccountId = t.accountId ? accountIdMap.get(t.accountId) : undefined;
-        const newCategoryId = t.categoryId ? categoryIdMap.get(t.categoryId) : undefined;
+        const newAccountId = accountIdMap.get(t.accountId);
+        const newCategoryId = categoryIdMap.get(t.categoryId);
         const newToAccountId = t.toAccountId ? accountIdMap.get(t.toAccountId) : undefined;
 
+        // P0.21: THROW (not continue) — pre-validation should have caught this.
+        // If we reach here with an unresolvable FK, something went wrong.
         if (!newAccountId || !newCategoryId) {
-          // P0.11: skip rows whose FK references can't be resolved to the user's own data.
-          // This blocks the IDOR attack where a malicious backup references another user's account.
-          continue;
+          throw new Error(`Failed to resolve FK for transaction (accountId="${t.accountId}", categoryId="${t.categoryId}"). Pre-validation should have caught this. Backup may be corrupt.`);
         }
 
-        // Validate transaction type + currency
+        // Validate transaction type + currency — THROW (not continue)
         if (!['EXPENSE', 'INCOME', 'TRANSFER'].includes(t.type)) {
-          continue;
+          throw new Error(`Invalid transaction type: ${t.type}`);
         }
         if (!VALID_CURRENCIES.has(t.currency)) {
-          continue;
+          throw new Error(`Invalid transaction currency: ${t.currency}`);
         }
 
         const amt = Number(t.amount);
         if (!Number.isFinite(amt)) {
-          continue;
+          throw new Error(`Invalid transaction amount: ${t.amount}`);
         }
 
         await tx.transaction.create({
@@ -255,13 +303,23 @@ export async function POST(req: NextRequest) {
         txCount++;
       }
 
+      // P0.21: same pattern as transactions — THROW (not continue).
+      // Pre-validation already verified categoryId exists in the backup.
       for (const b of budgets) {
-        const newCategoryId = b.categoryId ? categoryIdMap.get(b.categoryId) : undefined;
-        if (!newCategoryId) continue;
-        if (!VALID_CURRENCIES.has(b.currency)) continue;
-        if (!/^\d{4}-\d{2}$/.test(b.month)) continue;
+        const newCategoryId = categoryIdMap.get(b.categoryId);
+        if (!newCategoryId) {
+          throw new Error(`Failed to resolve FK for budget (categoryId="${b.categoryId}"). Pre-validation should have caught this.`);
+        }
+        if (!VALID_CURRENCIES.has(b.currency)) {
+          throw new Error(`Invalid budget currency: ${b.currency}`);
+        }
+        if (!/^\d{4}-\d{2}$/.test(b.month)) {
+          throw new Error(`Invalid budget month: ${b.month}`);
+        }
         const lim = Number(b.limit);
-        if (!Number.isFinite(lim) || lim < 0) continue;
+        if (!Number.isFinite(lim) || lim < 0) {
+          throw new Error(`Invalid budget limit: ${b.limit}`);
+        }
 
         await tx.budget.create({
           data: {
