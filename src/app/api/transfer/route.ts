@@ -3,21 +3,40 @@ import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
 
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const body = await req.json();
-    const { fromAccountId, toAccountId, amount, currency, date, note } = body;
+    const { fromAccountId, toAccountId, amount, currency, date, note } = body || {};
 
-    if (!fromAccountId || !toAccountId || !amount || fromAccountId === toAccountId) {
-      return NextResponse.json({ error: 'Invalid transfer parameters' }, { status: 400 });
+    // P0.11: validate inputs first. Catches NaN/Infinity/missing/null.
+    if (typeof fromAccountId !== 'string' || fromAccountId.length < 10) {
+      return badRequest('Invalid fromAccountId');
+    }
+    if (typeof toAccountId !== 'string' || toAccountId.length < 10) {
+      return badRequest('Invalid toAccountId');
+    }
+    if (fromAccountId === toAccountId) {
+      return badRequest('Cannot transfer to the same account');
+    }
+    const amtResult = parseMoney(amount, { allowZero: false, allowNegative: false });
+    if (!amtResult.ok) return badRequest(amtResult.error);
+    const amt = amtResult.value;
+
+    // P0.11: validate currency enum (was: `(currency || ...) as Currency`)
+    if (currency !== undefined && !isCurrency(currency)) {
+      return badRequest('Invalid currency (must be EGP, SAR, USD, EUR, or AED)');
     }
 
-    const amt = Number(amount);
-    if (amt <= 0) return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
+    // P0.11: validate note length (was: no limit)
+    if (note !== undefined && note !== null) {
+      const noteResult = parseString(note, 'Note', { required: false, max: 500 });
+      if (!noteResult.ok) return badRequest(noteResult.error);
+    }
 
-    // Verify both accounts belong to user
+    // Verify both accounts belong to user (findFirst with userId — IDOR defense)
     const [sourceAccount, destAccount] = await Promise.all([
       db.account.findFirst({ where: { id: fromAccountId, userId } }),
       db.account.findFirst({ where: { id: toAccountId, userId } }),
@@ -25,23 +44,49 @@ export async function POST(req: NextRequest) {
     if (!sourceAccount) return NextResponse.json({ error: 'Source account not found' }, { status: 404 });
     if (!destAccount) return NextResponse.json({ error: 'Destination account not found' }, { status: 404 });
 
-    const txCurrency = (currency || sourceAccount.currency) as Currency;
+    const txCurrency: Currency = currency || sourceAccount.currency;
     const sourceAmount = txCurrency === sourceAccount.currency
-      ? amt : convert(amt, txCurrency, sourceAccount.currency as Currency);
+      ? amt : convert(amt, txCurrency, sourceAccount.currency);
     const destAmount = txCurrency === destAccount.currency
-      ? amt : convert(amt, txCurrency, destAccount.currency as Currency);
+      ? amt : convert(amt, txCurrency, destAccount.currency);
 
-    // ATOMIC: update both balances + create transaction
-    let transferCat = await db.category.findFirst({ where: { nameAr: 'تحويلات', userId } });
-    if (!transferCat) {
-      transferCat = await db.category.create({
-        data: { nameAr: 'تحويلات', nameEn: 'Transfers', type: 'EXPENSE', icon: 'arrow-right-left', color: '#64748B', userId },
-      });
+    // P0.11: sanity check on converted amounts (NaN/Infinity can come from convert())
+    if (!Number.isFinite(sourceAmount) || !Number.isFinite(destAmount)) {
+      return badRequest('Currency conversion failed (invalid rate?)');
     }
 
+    // P0.11: optional overdraft check (skip for LOAN accounts — they're meant to go negative)
+    if (sourceAccount.type !== 'LOAN' && sourceAccount.balance < sourceAmount) {
+      return NextResponse.json(
+        { error: `Insufficient balance in source account (have ${sourceAccount.balance}, need ${sourceAmount})` },
+        { status: 400 },
+      );
+    }
+
+    // ATOMIC: find-or-create transfer category + update balances + create transaction
+    // P0.11: moved category lookup inside $transaction to close the race
+    // (two concurrent transfers could both pass findFirst → both create → duplicate cats)
     const transfer = await db.$transaction(async (tx) => {
-      await tx.account.update({ where: { id: fromAccountId }, data: { balance: { increment: -sourceAmount } } });
-      await tx.account.update({ where: { id: toAccountId }, data: { balance: { increment: destAmount } } });
+      let transferCat = await tx.category.findFirst({
+        where: { nameAr: 'تحويلات', userId, type: 'TRANSFER' as any },
+      });
+      if (!transferCat) {
+        transferCat = await tx.category.create({
+          data: {
+            nameAr: 'تحويلات', nameEn: 'Transfers', type: 'TRANSFER' as any,
+            icon: 'arrow-right-left', color: '#64748B', userId,
+          },
+        });
+      }
+
+      await tx.account.update({
+        where: { id: fromAccountId },
+        data: { balance: { increment: -sourceAmount } },
+      });
+      await tx.account.update({
+        where: { id: toAccountId },
+        data: { balance: { increment: destAmount } },
+      });
 
       return tx.transaction.create({
         data: {
@@ -49,8 +94,8 @@ export async function POST(req: NextRequest) {
           amount: amt,
           currency: txCurrency,
           accountId: fromAccountId,
-          categoryId: transferCat!.id,
-          toAccountId: toAccountId,
+          categoryId: transferCat.id,
+          toAccountId,
           userId,
           date: date ? new Date(date) : new Date(),
           note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,

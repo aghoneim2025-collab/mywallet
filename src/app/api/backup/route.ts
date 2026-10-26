@@ -3,6 +3,18 @@ import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
 
+// P0.11 backup import hardening:
+//   - Strict version check: backup.version === 3
+//   - Validate ownership of every FK reference (accountId, categoryId, toAccountId)
+//     before creating the transaction → closes IDOR
+//   - Regenerate all primary keys (strip client-supplied IDs) — defense in depth
+//   - Validate currency + type enums per row
+//   - Bounded row counts (max 50000 transactions per backup)
+//   - Don't leak err.message to client
+
+const BACKUP_VERSION = 3;
+const MAX_ROWS = 50000;
+
 // GET /api/backup?action=export - user-scoped
 export async function GET(req: NextRequest) {
   try {
@@ -15,19 +27,20 @@ export async function GET(req: NextRequest) {
     ]);
 
     const backup = {
-      version: 3,
+      version: BACKUP_VERSION,
       app: 'mywallet',
       exportedAt: new Date().toISOString(),
       data: {
-        accounts: accounts.map(({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) => 
-          ({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
-        categories: categories.map(({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) => 
-          ({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
-        // Only export known Transaction fields (NO accountName/categoryName)
-        transactions: transactions.map(({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, userId: _uid, createdAt, updatedAt }) => 
-          ({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, createdAt, updatedAt })),
-        budgets: budgets.map(({ id, categoryId, month, limit, currency, createdAt, updatedAt }) => 
-          ({ id, categoryId, month, limit, currency, createdAt, updatedAt })),
+        // P0.11: export WITHOUT primary keys — on import, fresh cuids are generated.
+        // This prevents a malicious backup from setting arbitrary PKs.
+        accounts: accounts.map(({ name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) =>
+          ({ name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
+        categories: categories.map(({ nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) =>
+          ({ nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
+        transactions: transactions.map(({ type, amount, currency, date, note, tags, transferPairId, createdAt, updatedAt }) =>
+          ({ type, amount, currency, date, note, tags, transferPairId, createdAt, updatedAt })),
+        budgets: budgets.map(({ month, limit, currency, createdAt, updatedAt }) =>
+          ({ month, limit, currency, createdAt, updatedAt })),
       },
     };
 
@@ -42,15 +55,14 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
+// POST /api/backup?action=import - user-scoped, ATOMIC, with IDOR defense
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
-    
-    // Limit file size (10MB max)
+
     if (file.size > 10 * 1024 * 1024) {
       return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 400 });
     }
@@ -62,14 +74,26 @@ export async function POST(req: NextRequest) {
     } catch {
       return NextResponse.json({ error: 'Invalid JSON file' }, { status: 400 });
     }
-    
-    if (!backup?.data || !backup?.version) {
-      return NextResponse.json({ error: 'Invalid backup format - missing version or data' }, { status: 400 });
+
+    // P0.11: strict version check (was: truthy check that accepted v1, v999, "foo", etc.)
+    if (typeof backup?.version !== 'number' || backup.version !== BACKUP_VERSION) {
+      return NextResponse.json(
+        { error: `Unsupported backup version (expected ${BACKUP_VERSION}). Please export a fresh backup first.` },
+        { status: 400 },
+      );
+    }
+    if (!backup?.data || typeof backup.data !== 'object') {
+      return NextResponse.json({ error: 'Invalid backup format - missing data' }, { status: 400 });
     }
 
-    const { accounts, categories, transactions, budgets } = backup.data;
+    const { accounts = [], categories = [], transactions = [], budgets = [] } = backup.data;
 
-    // ATOMIC: delete old + restore new (only with known fields)
+    // P0.11: row count limits
+    if (transactions.length > MAX_ROWS || accounts.length > 1000 || categories.length > 1000 || budgets.length > 1000) {
+      return NextResponse.json({ error: `Backup exceeds row limits (max ${MAX_ROWS} transactions, 1000 each for accounts/categories/budgets)` }, { status: 400 });
+    }
+
+    // ATOMIC: delete old + restore new (with regenerated IDs + FK ownership validation)
     const result = await db.$transaction(async (tx) => {
       await tx.transaction.deleteMany({ where: { userId } });
       await tx.budget.deleteMany({ where: { userId } });
@@ -78,45 +102,123 @@ export async function POST(req: NextRequest) {
 
       let catCount = 0, accCount = 0, txCount = 0, budCount = 0;
 
-      for (const c of categories || []) {
-        await tx.category.create({
+      // Insert categories with FRESH IDs (Prisma auto-generates cuid).
+      // Map old ID → new ID so transactions can resolve categoryId.
+      const categoryIdMap = new Map<string, string>();
+      for (const c of categories) {
+        // Validate category type enum (allow EXPENSE, INCOME, TRANSFER for legacy)
+        if (!['EXPENSE', 'INCOME', 'TRANSFER'].includes(c.type)) {
+          throw new Error(`Invalid category type: ${c.type}`);
+        }
+        const created = await tx.category.create({
           data: {
-            id: c.id, nameAr: c.nameAr, nameEn: c.nameEn, type: c.type,
-            icon: c.icon || 'tag', color: c.color || '#10B981',
-            isDefault: c.isDefault || false, userId,
+            nameAr: String(c.nameAr || '').slice(0, 200),
+            nameEn: String(c.nameEn || '').slice(0, 200),
+            type: c.type,
+            icon: String(c.icon || 'tag').slice(0, 100),
+            color: String(c.color || '#10B981').slice(0, 20),
+            isDefault: Boolean(c.isDefault),
+            userId,
           },
         });
+        if (c.id) categoryIdMap.set(c.id, created.id);
         catCount++;
       }
-      for (const a of accounts || []) {
-        await tx.account.create({
+
+      const accountIdMap = new Map<string, string>();
+      const VALID_ACCOUNT_TYPES = new Set(['CASH', 'BANK', 'E_WALLET', 'CARD', 'SAVINGS', 'INVESTMENT', 'LOAN', 'EXTERNAL']);
+      const VALID_CURRENCIES = new Set(['EGP', 'SAR', 'USD', 'EUR', 'AED']);
+      for (const a of accounts) {
+        if (!VALID_ACCOUNT_TYPES.has(a.type)) {
+          throw new Error(`Invalid account type: ${a.type}`);
+        }
+        if (!VALID_CURRENCIES.has(a.currency)) {
+          throw new Error(`Invalid currency: ${a.currency}`);
+        }
+        // P0.11: validate balance is finite (no NaN/Infinity)
+        const bal = Number(a.balance);
+        if (!Number.isFinite(bal)) {
+          throw new Error('Account balance must be a finite number');
+        }
+        const created = await tx.account.create({
           data: {
-            id: a.id, name: a.name, type: a.type, currency: a.currency,
-            balance: a.balance || 0, color: a.color || '#2563EB',
-            icon: a.icon || 'wallet', isDefault: a.isDefault || false, userId,
+            name: String(a.name || '').slice(0, 200),
+            type: a.type,
+            currency: a.currency,
+            balance: bal,
+            color: String(a.color || '#2563EB').slice(0, 20),
+            icon: String(a.icon || 'wallet').slice(0, 100),
+            isDefault: Boolean(a.isDefault),
+            userId,
           },
         });
+        if (a.id) accountIdMap.set(a.id, created.id);
         accCount++;
       }
-      for (const t of transactions || []) {
+
+      // P0.11: IDOR defense — for each imported transaction, verify the FK
+      // references resolve to accounts/categories OWNED BY THIS USER
+      // (which they now are, because we just inserted them above).
+      // If an old ID doesn't appear in our map → reject that row (skipped).
+      for (const t of transactions) {
+        // Resolve the foreign keys through our idMap.
+        // If the source ID is missing → cross-user reference attempt → skip.
+        const newAccountId = t.accountId ? accountIdMap.get(t.accountId) : undefined;
+        const newCategoryId = t.categoryId ? categoryIdMap.get(t.categoryId) : undefined;
+        const newToAccountId = t.toAccountId ? accountIdMap.get(t.toAccountId) : undefined;
+
+        if (!newAccountId || !newCategoryId) {
+          // P0.11: skip rows whose FK references can't be resolved to the user's own data.
+          // This blocks the IDOR attack where a malicious backup references another user's account.
+          continue;
+        }
+
+        // Validate transaction type + currency
+        if (!['EXPENSE', 'INCOME', 'TRANSFER'].includes(t.type)) {
+          continue;
+        }
+        if (!VALID_CURRENCIES.has(t.currency)) {
+          continue;
+        }
+
+        const amt = Number(t.amount);
+        if (!Number.isFinite(amt)) {
+          continue;
+        }
+
         await tx.transaction.create({
           data: {
-            id: t.id, type: t.type, amount: t.amount, currency: t.currency,
-            accountId: t.accountId, categoryId: t.categoryId,
-            toAccountId: t.toAccountId || null,
+            type: t.type,
+            amount: amt,
+            currency: t.currency,
+            accountId: newAccountId,
+            categoryId: newCategoryId,
+            toAccountId: newToAccountId || null,
             date: new Date(t.date),
-            note: t.note || null, tags: t.tags || null,
-            transferPairId: t.transferPairId || null,
+            note: t.note ? String(t.note).slice(0, 500) : null,
+            tags: t.tags ? String(t.tags).slice(0, 200) : null,
+            transferPairId: t.transferPairId ? String(t.transferPairId).slice(0, 50) : null,
             userId,
           },
         });
         txCount++;
       }
-      for (const b of budgets || []) {
+
+      for (const b of budgets) {
+        const newCategoryId = b.categoryId ? categoryIdMap.get(b.categoryId) : undefined;
+        if (!newCategoryId) continue;
+        if (!VALID_CURRENCIES.has(b.currency)) continue;
+        if (!/^\d{4}-\d{2}$/.test(b.month)) continue;
+        const lim = Number(b.limit);
+        if (!Number.isFinite(lim) || lim < 0) continue;
+
         await tx.budget.create({
           data: {
-            id: b.id, categoryId: b.categoryId, month: b.month,
-            limit: b.limit, currency: b.currency || 'EGP', userId,
+            categoryId: newCategoryId,
+            month: b.month,
+            limit: lim,
+            currency: b.currency,
+            userId,
           },
         });
         budCount++;

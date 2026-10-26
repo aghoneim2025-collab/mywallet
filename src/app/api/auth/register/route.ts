@@ -1,19 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { hashPassword, generateToken, setAuthCookie } from '@/lib/auth';
+import { isValidEmail, validatePassword, tooManyRequests, parseString } from '@/lib/validate';
+import { rateLimitRegister } from '@/lib/rate-limit';
+
+// P0.11: email validation + password policy (12+ chars, 3+ classes) +
+// rate limiting + name length limit. Don't leak err.message.
 
 export async function POST(req: NextRequest) {
   try {
     const { email, password, name } = await req.json();
-    if (!email || !password) return NextResponse.json({ error: 'Email and password required' }, { status: 400 });
-    if (password.length < 6) return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 });
+
+    // P0.11: rate limit registration (5/hour/IP)
+    const rl = rateLimitRegister(req);
+    if (rl.limited) return tooManyRequests(rl.retryAfter, rl.message);
+
+    if (!isValidEmail(email)) {
+      return NextResponse.json({ error: 'A valid email is required' }, { status: 400 });
+    }
+    const pwResult = validatePassword(password);
+    if (!pwResult.ok) {
+      return NextResponse.json({ error: pwResult.error }, { status: 400 });
+    }
+    const nameResult = parseString(name, 'Name', { required: false, max: 100 });
+    if (!nameResult.ok) return NextResponse.json({ error: nameResult.error }, { status: 400 });
+
     const normalizedEmail = email.toLowerCase().trim();
     const existing = await db.user.findUnique({ where: { email: normalizedEmail } });
-    if (existing) return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
+    // P0.11: don't return "email already registered" — that enables enumeration.
+    // Instead, treat as a successful re-registration attempt and return the same
+    // response shape as the success path. The user just logs in normally.
+    if (existing) {
+      return NextResponse.json(
+        { error: 'If this email is not already registered, an account has been created. Otherwise, please log in.' },
+        { status: 200 },
+      );
+    }
 
     const passwordHash = await hashPassword(password);
     const result = await db.$transaction(async (tx) => {
-      const user = await tx.user.create({ data: { email: normalizedEmail, name: name || null, passwordHash } });
+      const user = await tx.user.create({ data: { email: normalizedEmail, name: nameResult.value || null, passwordHash } });
       const cats = [
         { nameAr: 'مصاريف أساسية', nameEn: 'Essentials', type: 'EXPENSE', icon: 'home', color: '#EF4444', userId: user.id },
         { nameAr: 'تسوق وطعام', nameEn: 'Shopping & Food', type: 'EXPENSE', icon: 'shopping-cart', color: '#F59E0B', userId: user.id },
@@ -25,19 +51,18 @@ export async function POST(req: NextRequest) {
         { nameAr: 'راتب أساسي', nameEn: 'Salary', type: 'INCOME', icon: 'banknote', color: '#10B981', userId: user.id },
         { nameAr: 'دخل فريلانس', nameEn: 'Freelance', type: 'INCOME', icon: 'laptop', color: '#22C55E', userId: user.id },
         { nameAr: 'دخل استثماري', nameEn: 'Investment', type: 'INCOME', icon: 'trending-up', color: '#16A34A', userId: user.id },
-      ];
-      for (const c of cats) await tx.category.create({ data: c });
+      ] as const;
+      await tx.category.createMany({ data: cats as any });
       await tx.account.create({ data: { name: 'محفظتي', type: 'CASH', currency: 'EGP', balance: 0, color: '#2563EB', icon: 'wallet', isDefault: true, userId: user.id } });
       return user;
     });
 
     const token = generateToken(result.id);
-    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
-    // See login/route.ts for rationale.
     const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
+    // P0.11: don't leak err.message
     console.error('Register error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

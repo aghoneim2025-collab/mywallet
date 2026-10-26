@@ -65,7 +65,7 @@ export function ReportsScreen() {
       } else {
         // Yearly: fetch 12 months stats in parallel
         const months: { month: string; income: number; expense: number; balance: number }[] = [];
-        const promises = [];
+        const promises: Promise<{ month: string; income: number; expense: number; balance: number }>[] = [];
         for (let m = 1; m <= 12; m++) {
           const mStr = `${year}-${String(m).padStart(2, '0')}`;
           promises.push(
@@ -122,6 +122,10 @@ export function ReportsScreen() {
   // #6: PDF Export
   const handleExportPDF = async () => {
     try {
+      if (!stat) {
+        toast.error(lang === 'ar' ? 'لا توجد بيانات للتصدير' : 'No data to export');
+        return;
+      }
       const { jsPDF } = await import('jspdf');
       const autoTable = (await import('jspdf-autotable')).default;
       const doc = new jsPDF();

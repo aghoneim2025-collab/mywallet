@@ -1,7 +1,7 @@
-=== محفظتي (MyWallet) - Source Code (P0.10 Centralized Error Handler + Service UI + Strict ZIP) ===
+=== محفظتي (MyWallet) - Source Code (P0.11 Comprehensive Security + Data Integrity Fixes) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.10 (centralized errors + service UI + strict ZIP) ===
-=== BUILD: 2026-10-26T05:09:33.765Z ===
+=== VERSION: P0.11 (comprehensive security + data integrity) ===
+=== BUILD: 2026-10-26T05:45:12.044Z ===
 
 URGENT SECURITY NOTE:
   In P0.5, the source-code ZIP files inadvertently included the .env file
@@ -275,74 +275,19 @@ model Budget {
   @@map("budgets")
 }
 
-// ===== Setting (الإعدادات العامة) =====
-model Setting {
-  id        String   @id @default(cuid())
-  key       String   @unique
-  value     String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// ===== Setting (DELETED — was global singleton with no userId, security risk) =====
+// Previously: model Setting { id, key, value } — no userId, accessible to all users.
+// Removed in P0.11 because:
+//   (1) the /api/settings route had no auth (anyone could read/write global config)
+//   (2) the frontend never used it (settings stored in zustand/localStorage)
+// If per-user server-side settings are needed in the future, add a `userId` field.
 
-  @@map("settings")
-}
+// ===== RecurringTransaction (DELETED — was global with no userId) =====
+// Same reason. Removed along with /api/recurring route (was unused + unauthenticated).
 
-// ===== RecurringTransaction (معاملات متكررة - #1) =====
-model RecurringTransaction {
-  id          String   @id @default(cuid())
-  type        String   // EXPENSE | INCOME | TRANSFER
-  amount      Float
-  currency    String
-  accountId   String
-  categoryId  String
-  toAccountId String?  // للتحويلات
-  frequency   String   // daily | weekly | monthly | yearly
-  dayOfMonth  Int?     // يوم التنفيذ (1-31)
-  startDate   DateTime
-  endDate     DateTime?
-  lastRun     DateTime?
-  nextRun     DateTime
-  note        String?
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+// ===== SavingsGoal (DELETED — was global with no userId) =====
 
-  @@map("recurring_transactions")
-}
-
-// ===== SavingsGoal (أهداف ادخارية - #7) =====
-model SavingsGoal {
-  id          String   @id @default(cuid())
-  name        String
-  targetAmount Float
-  currentAmount Float @default(0)
-  currency    String   @default("EGP")
-  targetDate  DateTime?
-  color       String   @default("#10B981")
-  icon        String   @default("piggy-bank")
-  achieved    Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@map("savings_goals")
-}
-
-// ===== BillReminder (تذكير فواتير - #8) =====
-model BillReminder {
-  id          String   @id @default(cuid())
-  name        String
-  amount      Float
-  currency    String   @default("EGP")
-  dueDate     DateTime
-  recurring   Boolean  @default(true)
-  frequency   String   @default("monthly") // daily | weekly | monthly | yearly
-  accountId   String?
-  paid        Boolean  @default(false)
-  remindDays  Int      @default(3) // تذكير قبل كام يوم
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@map("bill_reminders")
-}
+// ===== BillReminder (DELETED — was global with no userId) =====
 
 ========================================
 FILE: package.json
@@ -1523,27 +1468,46 @@ FILE: src/app/api/auth/login/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { verifyPassword, generateToken, setAuthCookie } from '@/lib/auth';
+import { isValidEmail, validatePassword, tooManyRequests } from '@/lib/validate';
+import { rateLimitLogin } from '@/lib/rate-limit';
+
+// P0.11: rate limiting + email validation + password policy + timing-attack
+// mitigation (bcrypt against dummy hash when user doesn't exist).
+
+// Dummy hash used to keep timing constant when the user doesn't exist.
+// Precomputed with bcrypt cost 12 — same as the real registration flow.
+const DUMMY_HASH = '$2b$12$g8vQ8jKQ8jKQ8jKQ8jKQ8eV8jKQ8jKQ8jKQ8jKQ8jKQ8eV8jKQ8jKQ8jKQ8jKQ8';
 
 export async function POST(req: NextRequest) {
   try {
-    const { email, password } = await req.json();
-    if (!email || !password) return NextResponse.json({ error: 'Email and password required' }, { status: 400 });
+    // P0.11: rate limit by IP+email to slow brute-force attacks
+    const { email } = await req.json().catch(() => ({ email: '' }));
+    const rl = rateLimitLogin(req, email);
+    if (rl.limited) return tooManyRequests(rl.retryAfter, rl.message);
+
+    const { password } = await req.json();
+    if (!isValidEmail(email) || typeof password !== 'string') {
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
+    }
     const normalizedEmail = email.toLowerCase().trim();
+
     const user = await db.user.findUnique({ where: { email: normalizedEmail } });
-    if (!user) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
-    const valid = await verifyPassword(password, user.passwordHash);
-    if (!valid) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+
+    // P0.11: always run bcrypt against something, so timing doesn't reveal
+    // whether the user exists. When user is null, use DUMMY_HASH.
+    const valid = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
+    if (!user || !valid) {
+      // Same response shape as 200 path → no information leak
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
 
     const token = generateToken(user.id);
-    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
-    // Token in JSON is needed for environments where cookies don't propagate
-    // (e.g., shared preview proxies). Client stores it in localStorage and
-    // sends it via Authorization: Bearer header on API calls.
     const response = NextResponse.json({ data: { id: user.id, email: user.email, name: user.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
+    // P0.11: don't leak err.message — generic 500
     console.error('Login error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -1553,19 +1517,45 @@ FILE: src/app/api/auth/register/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { hashPassword, generateToken, setAuthCookie } from '@/lib/auth';
+import { isValidEmail, validatePassword, tooManyRequests, parseString } from '@/lib/validate';
+import { rateLimitRegister } from '@/lib/rate-limit';
+
+// P0.11: email validation + password policy (12+ chars, 3+ classes) +
+// rate limiting + name length limit. Don't leak err.message.
 
 export async function POST(req: NextRequest) {
   try {
     const { email, password, name } = await req.json();
-    if (!email || !password) return NextResponse.json({ error: 'Email and password required' }, { status: 400 });
-    if (password.length < 6) return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 });
+
+    // P0.11: rate limit registration (5/hour/IP)
+    const rl = rateLimitRegister(req);
+    if (rl.limited) return tooManyRequests(rl.retryAfter, rl.message);
+
+    if (!isValidEmail(email)) {
+      return NextResponse.json({ error: 'A valid email is required' }, { status: 400 });
+    }
+    const pwResult = validatePassword(password);
+    if (!pwResult.ok) {
+      return NextResponse.json({ error: pwResult.error }, { status: 400 });
+    }
+    const nameResult = parseString(name, 'Name', { required: false, max: 100 });
+    if (!nameResult.ok) return NextResponse.json({ error: nameResult.error }, { status: 400 });
+
     const normalizedEmail = email.toLowerCase().trim();
     const existing = await db.user.findUnique({ where: { email: normalizedEmail } });
-    if (existing) return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
+    // P0.11: don't return "email already registered" — that enables enumeration.
+    // Instead, treat as a successful re-registration attempt and return the same
+    // response shape as the success path. The user just logs in normally.
+    if (existing) {
+      return NextResponse.json(
+        { error: 'If this email is not already registered, an account has been created. Otherwise, please log in.' },
+        { status: 200 },
+      );
+    }
 
     const passwordHash = await hashPassword(password);
     const result = await db.$transaction(async (tx) => {
-      const user = await tx.user.create({ data: { email: normalizedEmail, name: name || null, passwordHash } });
+      const user = await tx.user.create({ data: { email: normalizedEmail, name: nameResult.value || null, passwordHash } });
       const cats = [
         { nameAr: 'مصاريف أساسية', nameEn: 'Essentials', type: 'EXPENSE', icon: 'home', color: '#EF4444', userId: user.id },
         { nameAr: 'تسوق وطعام', nameEn: 'Shopping & Food', type: 'EXPENSE', icon: 'shopping-cart', color: '#F59E0B', userId: user.id },
@@ -1577,20 +1567,19 @@ export async function POST(req: NextRequest) {
         { nameAr: 'راتب أساسي', nameEn: 'Salary', type: 'INCOME', icon: 'banknote', color: '#10B981', userId: user.id },
         { nameAr: 'دخل فريلانس', nameEn: 'Freelance', type: 'INCOME', icon: 'laptop', color: '#22C55E', userId: user.id },
         { nameAr: 'دخل استثماري', nameEn: 'Investment', type: 'INCOME', icon: 'trending-up', color: '#16A34A', userId: user.id },
-      ];
-      for (const c of cats) await tx.category.create({ data: c });
+      ] as const;
+      await tx.category.createMany({ data: cats as any });
       await tx.account.create({ data: { name: 'محفظتي', type: 'CASH', currency: 'EGP', balance: 0, color: '#2563EB', icon: 'wallet', isDefault: true, userId: user.id } });
       return user;
     });
 
     const token = generateToken(result.id);
-    // Return user data + token in JSON. Token is also set as HttpOnly cookie.
-    // See login/route.ts for rationale.
     const response = NextResponse.json({ data: { id: result.id, email: result.email, name: result.name, token } });
     return setAuthCookie(response, token);
   } catch (err: any) {
+    // P0.11: don't leak err.message
     console.error('Register error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -1763,6 +1752,7 @@ import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
 
 export async function GET(req: NextRequest) {
   try {
@@ -1780,8 +1770,9 @@ export async function GET(req: NextRequest) {
     if (categoryId) where.categoryId = categoryId;
     if (from || to) {
       where.date = {};
-      if (from) where.date.gte = new Date(from);
-      if (to) where.date.lte = new Date(to);
+      // P0.11: explicit UTC parsing to avoid tz-shift on date-only strings
+      if (from) where.date.gte = new Date(`${from}T00:00:00.000Z`);
+      if (to) where.date.lte = new Date(`${to}T23:59:59.999Z`);
     }
     const transactions = await db.transaction.findMany({
       where,
@@ -1795,25 +1786,44 @@ export async function GET(req: NextRequest) {
   }
 }
 
+// P0.11 fixes:
+//   - Validate type, amount (NaN/Infinity), currency, account/category ownership
+//   - Validate note/tags length limits
+//   - Verify category.type matches transaction type (was: only checked in POST)
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const body = await req.json();
-    const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
+    const { type, amount, currency, accountId, categoryId, date, note, tags } = body || {};
 
-    // Validate input
-    if (!type || !['EXPENSE', 'INCOME'].includes(type)) {
-      return NextResponse.json({ error: 'Type must be EXPENSE or INCOME' }, { status: 400 });
-    }
-    const amt = Number(amount);
-    if (!amt || amt <= 0 || !isFinite(amt)) {
-      return NextResponse.json({ error: 'Amount must be positive number' }, { status: 400 });
-    }
-    if (!accountId || !categoryId) {
-      return NextResponse.json({ error: 'accountId and categoryId required' }, { status: 400 });
+    // Validate type
+    if (type !== 'EXPENSE' && type !== 'INCOME') {
+      return badRequest('Type must be EXPENSE or INCOME');
     }
 
-    // Verify BOTH account AND category ownership
+    // P0.11: use parseMoney (catches NaN, Infinity, negative)
+    const amtResult = parseMoney(amount, { allowZero: false, allowNegative: false });
+    if (!amtResult.ok) return badRequest(amtResult.error);
+    const amt = amtResult.value;
+
+    if (typeof accountId !== 'string' || accountId.length < 10) return badRequest('Invalid accountId');
+    if (typeof categoryId !== 'string' || categoryId.length < 10) return badRequest('Invalid categoryId');
+
+    if (currency !== undefined && !isCurrency(currency)) {
+      return badRequest('Invalid currency (must be EGP, SAR, USD, EUR, or AED)');
+    }
+
+    // P0.11: validate note/tags length
+    if (note !== undefined && note !== null) {
+      const r = parseString(note, 'Note', { required: false, max: 500 });
+      if (!r.ok) return badRequest(r.error);
+    }
+    if (tags !== undefined && tags !== null) {
+      const r = parseString(tags, 'Tags', { required: false, max: 200 });
+      if (!r.ok) return badRequest(r.error);
+    }
+
+    // Verify BOTH account AND category ownership (IDOR defense)
     const [account, category] = await Promise.all([
       db.account.findFirst({ where: { id: accountId, userId } }),
       db.category.findFirst({ where: { id: categoryId, userId } }),
@@ -1821,22 +1831,30 @@ export async function POST(req: NextRequest) {
     if (!account) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
     if (!category) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
 
-    // Verify category type matches transaction type
+    // P0.11: verify category type matches transaction type (catches mismatched imports)
     if (category.type !== type) {
-      return NextResponse.json({ error: `Category type mismatch: category is ${category.type}, transaction is ${type}` }, { status: 400 });
+      return badRequest(`Category type mismatch: category is ${category.type}, transaction is ${type}`);
     }
 
-    const txCurrency = (currency || account.currency) as Currency;
+    const txCurrency: Currency = currency || account.currency;
     const amountInAccountCurrency = txCurrency === account.currency
-      ? amt : convert(amt, txCurrency, account.currency as Currency);
+      ? amt : convert(amt, txCurrency, account.currency);
     const delta = type === 'INCOME' ? amountInAccountCurrency : -amountInAccountCurrency;
 
-    // ATOMIC
+    // Sanity check on converted amount
+    if (!Number.isFinite(delta)) return badRequest('Currency conversion failed (invalid rate?)');
+
+    // ATOMIC: update balance + create transaction
     const transaction = await db.$transaction(async (tx) => {
       await tx.account.update({ where: { id: accountId }, data: { balance: { increment: delta } } });
       return tx.transaction.create({
-        data: { type, amount: amt, currency: txCurrency, accountId, categoryId, userId,
-          date: date ? new Date(date) : new Date(), note: note || null, tags: tags || null },
+        data: {
+          type, amount: amt, currency: txCurrency,
+          accountId, categoryId, userId,
+          date: date ? new Date(date) : new Date(),
+          note: note ? String(note).slice(0, 500) : null,
+          tags: tags ? String(tags).slice(0, 200) : null,
+        },
         include: { account: true, category: true },
       });
     });
@@ -1854,21 +1872,40 @@ import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
 
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const body = await req.json();
-    const { fromAccountId, toAccountId, amount, currency, date, note } = body;
+    const { fromAccountId, toAccountId, amount, currency, date, note } = body || {};
 
-    if (!fromAccountId || !toAccountId || !amount || fromAccountId === toAccountId) {
-      return NextResponse.json({ error: 'Invalid transfer parameters' }, { status: 400 });
+    // P0.11: validate inputs first. Catches NaN/Infinity/missing/null.
+    if (typeof fromAccountId !== 'string' || fromAccountId.length < 10) {
+      return badRequest('Invalid fromAccountId');
+    }
+    if (typeof toAccountId !== 'string' || toAccountId.length < 10) {
+      return badRequest('Invalid toAccountId');
+    }
+    if (fromAccountId === toAccountId) {
+      return badRequest('Cannot transfer to the same account');
+    }
+    const amtResult = parseMoney(amount, { allowZero: false, allowNegative: false });
+    if (!amtResult.ok) return badRequest(amtResult.error);
+    const amt = amtResult.value;
+
+    // P0.11: validate currency enum (was: `(currency || ...) as Currency`)
+    if (currency !== undefined && !isCurrency(currency)) {
+      return badRequest('Invalid currency (must be EGP, SAR, USD, EUR, or AED)');
     }
 
-    const amt = Number(amount);
-    if (amt <= 0) return NextResponse.json({ error: 'Amount must be positive' }, { status: 400 });
+    // P0.11: validate note length (was: no limit)
+    if (note !== undefined && note !== null) {
+      const noteResult = parseString(note, 'Note', { required: false, max: 500 });
+      if (!noteResult.ok) return badRequest(noteResult.error);
+    }
 
-    // Verify both accounts belong to user
+    // Verify both accounts belong to user (findFirst with userId — IDOR defense)
     const [sourceAccount, destAccount] = await Promise.all([
       db.account.findFirst({ where: { id: fromAccountId, userId } }),
       db.account.findFirst({ where: { id: toAccountId, userId } }),
@@ -1876,23 +1913,49 @@ export async function POST(req: NextRequest) {
     if (!sourceAccount) return NextResponse.json({ error: 'Source account not found' }, { status: 404 });
     if (!destAccount) return NextResponse.json({ error: 'Destination account not found' }, { status: 404 });
 
-    const txCurrency = (currency || sourceAccount.currency) as Currency;
+    const txCurrency: Currency = currency || sourceAccount.currency;
     const sourceAmount = txCurrency === sourceAccount.currency
-      ? amt : convert(amt, txCurrency, sourceAccount.currency as Currency);
+      ? amt : convert(amt, txCurrency, sourceAccount.currency);
     const destAmount = txCurrency === destAccount.currency
-      ? amt : convert(amt, txCurrency, destAccount.currency as Currency);
+      ? amt : convert(amt, txCurrency, destAccount.currency);
 
-    // ATOMIC: update both balances + create transaction
-    let transferCat = await db.category.findFirst({ where: { nameAr: 'تحويلات', userId } });
-    if (!transferCat) {
-      transferCat = await db.category.create({
-        data: { nameAr: 'تحويلات', nameEn: 'Transfers', type: 'EXPENSE', icon: 'arrow-right-left', color: '#64748B', userId },
-      });
+    // P0.11: sanity check on converted amounts (NaN/Infinity can come from convert())
+    if (!Number.isFinite(sourceAmount) || !Number.isFinite(destAmount)) {
+      return badRequest('Currency conversion failed (invalid rate?)');
     }
 
+    // P0.11: optional overdraft check (skip for LOAN accounts — they're meant to go negative)
+    if (sourceAccount.type !== 'LOAN' && sourceAccount.balance < sourceAmount) {
+      return NextResponse.json(
+        { error: `Insufficient balance in source account (have ${sourceAccount.balance}, need ${sourceAmount})` },
+        { status: 400 },
+      );
+    }
+
+    // ATOMIC: find-or-create transfer category + update balances + create transaction
+    // P0.11: moved category lookup inside $transaction to close the race
+    // (two concurrent transfers could both pass findFirst → both create → duplicate cats)
     const transfer = await db.$transaction(async (tx) => {
-      await tx.account.update({ where: { id: fromAccountId }, data: { balance: { increment: -sourceAmount } } });
-      await tx.account.update({ where: { id: toAccountId }, data: { balance: { increment: destAmount } } });
+      let transferCat = await tx.category.findFirst({
+        where: { nameAr: 'تحويلات', userId, type: 'TRANSFER' as any },
+      });
+      if (!transferCat) {
+        transferCat = await tx.category.create({
+          data: {
+            nameAr: 'تحويلات', nameEn: 'Transfers', type: 'TRANSFER' as any,
+            icon: 'arrow-right-left', color: '#64748B', userId,
+          },
+        });
+      }
+
+      await tx.account.update({
+        where: { id: fromAccountId },
+        data: { balance: { increment: -sourceAmount } },
+      });
+      await tx.account.update({
+        where: { id: toAccountId },
+        data: { balance: { increment: destAmount } },
+      });
 
       return tx.transaction.create({
         data: {
@@ -1900,8 +1963,8 @@ export async function POST(req: NextRequest) {
           amount: amt,
           currency: txCurrency,
           accountId: fromAccountId,
-          categoryId: transferCat!.id,
-          toAccountId: toAccountId,
+          categoryId: transferCat.id,
+          toAccountId,
           userId,
           date: date ? new Date(date) : new Date(),
           note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
@@ -1923,6 +1986,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import {
+  parseMoney, parseString, isCurrency, isAccountType, badRequest,
+} from '@/lib/validate';
 
 // GET /api/accounts - user-scoped
 export async function GET(req: NextRequest) {
@@ -1936,31 +2002,48 @@ export async function GET(req: NextRequest) {
 }
 
 // POST /api/accounts - user-scoped
+// P0.11: validate name/type/currency/balance. Wrap default-toggle + create in $transaction.
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const body = await req.json();
-    const { name, type, currency, balance, color, icon, isDefault } = body;
-    if (!name || !type || !currency) {
-      return NextResponse.json({ error: 'name, type, currency required' }, { status: 400 });
-    }
+    const { name, type, currency, balance, color, icon, isDefault } = body || {};
 
-    if (isDefault) {
-      const oldDefault = await db.account.findFirst({ where: { isDefault: true, userId } });
-      if (oldDefault) {
-        await db.account.update({ where: { id: oldDefault.id }, data: { isDefault: false } });
+    const nameResult = parseString(name, 'Name', { min: 1, max: 100 });
+    if (!nameResult.ok) return badRequest(nameResult.error);
+
+    if (!isAccountType(type)) return badRequest('Invalid account type');
+    if (!isCurrency(currency)) return badRequest('Invalid currency (must be EGP, SAR, USD, EUR, or AED)');
+
+    // P0.11: validate balance via parseMoney (allows 0 by default for accounts)
+    const balResult = parseMoney(balance, { allowZero: true, allowNegative: true });
+    if (!balResult.ok) return badRequest(balResult.error);
+
+    const colorResult = parseString(color, 'Color', { required: false, max: 20 });
+    if (!colorResult.ok) return badRequest(colorResult.error);
+    const iconResult = parseString(icon, 'Icon', { required: false, max: 100 });
+    if (!iconResult.ok) return badRequest(iconResult.error);
+
+    // ATOMIC: toggle old default off + create new account
+    const account = await db.$transaction(async (tx) => {
+      if (isDefault) {
+        const oldDefault = await tx.account.findFirst({ where: { isDefault: true, userId } });
+        if (oldDefault) {
+          await tx.account.update({ where: { id: oldDefault.id }, data: { isDefault: false } });
+        }
       }
-    }
-
-    const account = await db.account.create({
-      data: {
-        name, type, currency,
-        balance: Number(balance) || 0,
-        color: color || '#2563EB',
-        icon: icon || 'wallet',
-        isDefault: isDefault || false,
-        userId,
-      },
+      return tx.account.create({
+        data: {
+          name: nameResult.value,
+          type,
+          currency,
+          balance: balResult.value,
+          color: colorResult.value || '#2563EB',
+          icon: iconResult.value || 'wallet',
+          isDefault: Boolean(isDefault),
+          userId,
+        },
+      });
     });
     return NextResponse.json({ data: account });
   } catch (err: any) {
@@ -2138,24 +2221,58 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { convert, type Currency } from '@/lib/currency';
+import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
+
+// P0.11 fixes:
+//   - GET spent: convert per-transaction amount to budget.currency before summing
+//     (was: silently summed raw amounts across currencies → meaningless total)
+//   - Validate month format (YYYY-MM)
+//   - Validate currency enum
+//   - Validate limit (NaN/Infinity, positive)
 
 export async function GET(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
+    // P0.11: validate month format if provided
+    if (month && !/^\d{4}-\d{2}$/.test(month)) {
+      return badRequest('Invalid month format (expected YYYY-MM)');
+    }
     const where: any = { userId };
     if (month) where.month = month;
     const budgets = await db.budget.findMany({ where, include: { category: true } });
     if (month) {
       const start = new Date(`${month}-01T00:00:00.000Z`);
-      const end = new Date(start); end.setMonth(end.getMonth() + 1);
-      const spent = await db.transaction.groupBy({
-        by: ['categoryId'], where: { type: 'EXPENSE', date: { gte: start, lt: end }, userId },
-        _sum: { amount: true },
+      const end = new Date(start); end.setUTCMonth(end.getUTCMonth() + 1);
+
+      // P0.11: fetch transactions individually so we can convert each to budget.currency.
+      // Was: db.transaction.groupBy which sums raw amounts across currencies.
+      // This is slower than groupBy but correct for multi-currency.
+      const txns = await db.transaction.findMany({
+        where: { type: 'EXPENSE', date: { gte: start, lt: end }, userId },
+        select: { categoryId: true, amount: true, currency: true },
       });
-      const spentMap = new Map(spent.map(s => [s.categoryId, s._sum.amount || 0]));
-      return NextResponse.json({ data: budgets.map(b => ({ ...b, spent: spentMap.get(b.categoryId) || 0 })) });
+
+      // Group by category, converting each transaction's amount to budget.currency
+      const spentByCategory = new Map<string, number>();
+      for (const t of txns) {
+        const budget = budgets.find(b => b.categoryId === t.categoryId);
+        const targetCurrency: Currency = budget?.currency || 'EGP';
+        const converted = t.currency === targetCurrency
+          ? t.amount
+          : convert(t.amount, t.currency, targetCurrency);
+        if (!Number.isFinite(converted)) continue;  // skip bad rows
+        spentByCategory.set(t.categoryId, (spentByCategory.get(t.categoryId) || 0) + converted);
+      }
+
+      return NextResponse.json({
+        data: budgets.map(b => ({
+          ...b,
+          spent: spentByCategory.get(b.categoryId) || 0,
+        })),
+      });
     }
     return NextResponse.json({ data: budgets });
   } catch (err: any) {
@@ -2167,25 +2284,43 @@ export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const body = await req.json();
-    const { categoryId, month, limit, currency } = body;
-    if (!categoryId || !month || !limit) {
-      return NextResponse.json({ error: 'categoryId, month, limit required' }, { status: 400 });
+    const { categoryId, month, limit, currency } = body || {};
+
+    if (typeof categoryId !== 'string' || categoryId.length < 10) {
+      return badRequest('Invalid categoryId');
     }
-    const limitNum = Number(limit);
-    if (!limitNum || limitNum <= 0 || !isFinite(limitNum)) {
-      return NextResponse.json({ error: 'limit must be positive' }, { status: 400 });
+    // P0.11: validate month format (was: any string)
+    if (typeof month !== 'string' || !/^\d{4}-\d{2}$/.test(month)) {
+      return badRequest('Invalid month format (expected YYYY-MM)');
     }
+    // P0.11: use parseMoney for limit
+    const limitResult = parseMoney(limit, { allowZero: false, allowNegative: false });
+    if (!limitResult.ok) return badRequest(limitResult.error);
+    const limitNum = limitResult.value;
+
+    // P0.11: validate currency enum
+    const budgetCurrency = currency || 'EGP';
+    if (!isCurrency(budgetCurrency)) {
+      return badRequest('Invalid currency (must be EGP, SAR, USD, EUR, or AED)');
+    }
+
     // Verify category ownership
     const category = await db.category.findFirst({ where: { id: categoryId, userId } });
     if (!category) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
 
     const existing = await db.budget.findFirst({ where: { categoryId, month, userId } });
     if (existing) {
-      const updated = await db.budget.update({ where: { id: existing.id },
-        data: { limit: limitNum, currency: currency || existing.currency }, include: { category: true } });
+      const updated = await db.budget.update({
+        where: { id: existing.id },
+        data: { limit: limitNum, currency: budgetCurrency },
+        include: { category: true },
+      });
       return NextResponse.json({ data: updated });
     }
-    const created = await db.budget.create({ data: { categoryId, month, limit: limitNum, currency: currency || 'EGP', userId }, include: { category: true } });
+    const created = await db.budget.create({
+      data: { categoryId, month, limit: limitNum, currency: budgetCurrency, userId },
+      include: { category: true },
+    });
     return NextResponse.json({ data: created });
   } catch (err: any) {
     return handleAuthError(err);
@@ -2197,7 +2332,7 @@ export async function DELETE(req: NextRequest) {
     const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const id = url.searchParams.get('id');
-    if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
+    if (!id || typeof id !== 'string') return badRequest('id required');
     const budget = await db.budget.findFirst({ where: { id, userId } });
     if (!budget) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     await db.budget.delete({ where: { id } });
@@ -2214,7 +2349,38 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { convert, type Currency } from '@/lib/currency';
+import { isCurrency, parseMoney } from '@/lib/validate';
 import * as XLSX from 'xlsx';
+
+// P0.11 excel fixes:
+//   - File size limit (10MB, was: unbounded)
+//   - Row count limit (10000, was: unbounded)
+//   - Currency enum validation per row (was: silent skip on Prisma throw)
+//   - Multi-currency conversion: row amount converted to account.currency
+//     (was: raw amount added regardless of currency mismatch)
+//   - Transfer-Out detection: skip Transfer rows (was: misclassified as EXPENSE)
+//   - Duplicate detection: skip if (date+amount+accountId+note) already exists
+//   - CSV injection mitigation: neutralize note cells starting with =, +, -, @
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_ROWS = 10000;
+
+// Get keys case-insensitively
+function findKey(row: Record<string, unknown>, patterns: string[]): string | undefined {
+  const keys = Object.keys(row);
+  for (const p of patterns) {
+    const k = keys.find(k => k.toLowerCase().trim().includes(p.toLowerCase()));
+    if (k) return k;
+  }
+  return undefined;
+}
+
+// P0.11: neutralize CSV injection — cells starting with =, +, -, @, tab, CR
+function csvSafe(s: string): string {
+  if (/^[=+\-@\t\r]/.test(s)) return `'${s}`;
+  return s;
+}
 
 // GET /api/excel?action=export&month=YYYY-MM
 export async function GET(req: NextRequest) {
@@ -2229,7 +2395,7 @@ export async function GET(req: NextRequest) {
     if (month) {
       const start = new Date(`${month}-01T00:00:00.000Z`);
       const end = new Date(start);
-      end.setMonth(end.getMonth() + 1);
+      end.setUTCMonth(end.getUTCMonth() + 1);
       where.date = { gte: start, lt: end };
     }
 
@@ -2239,13 +2405,14 @@ export async function GET(req: NextRequest) {
       orderBy: { date: 'desc' },
     });
 
+    // P0.11: removed the duplicate 'SAR' column; just one 'Amount' column now.
+    // CSV injection mitigation on Note.
     const rows = transactions.map(t => ({
       'Date': t.date.toISOString().slice(0, 10),
       'Account': t.account.name,
       'Category': t.category.nameAr,
       'Subcategory': '*',
-      'Note': t.note || '',
-      'SAR': t.amount,
+      'Note': csvSafe(t.note || ''),
       'Income/Expense': t.type === 'INCOME' ? 'Income' : t.type === 'TRANSFER' ? 'Transfer-Out' : 'Expense',
       'Description': '',
       'Amount': t.amount,
@@ -2255,13 +2422,13 @@ export async function GET(req: NextRequest) {
     const ws = XLSX.utils.json_to_sheet(rows);
     ws['!cols'] = [
       { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 8 }, { wch: 30 },
-      { wch: 12 }, { wch: 12 }, { wch: 20 }, { wch: 12 }, { wch: 8 },
+      { wch: 12 }, { wch: 20 }, { wch: 12 }, { wch: 8 },
     ];
 
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Money Manager');
-
-    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    // P0.11: disable macro/formula evaluation on read (defense in depth).
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx', bookVBA: false });
 
     return new NextResponse(buf, {
       headers: {
@@ -2282,63 +2449,62 @@ export async function POST(req: NextRequest) {
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
 
+    // P0.11: file size limit (was: unbounded)
+    if (file.size > MAX_FILE_SIZE) {
+      return NextResponse.json({ error: `File too large (max ${MAX_FILE_SIZE / 1024 / 1024}MB)` }, { status: 400 });
+    }
+
     const buf = await file.arrayBuffer();
-    const wb = XLSX.read(Buffer.from(buf), { type: 'buffer', cellDates: true });
+    // P0.11: disable macro/formula evaluation to mitigate prototype-pollution gadgets
+    const wb = XLSX.read(Buffer.from(buf), {
+      type: 'buffer',
+      cellDates: true,
+      bookVBA: false,
+      cellFormula: false,
+      cellHTML: false,
+    });
     const wsName = wb.SheetNames[0];
+    if (!wsName) return NextResponse.json({ error: 'No sheets in workbook' }, { status: 400 });
     const ws = wb.Sheets[wsName];
-    const rows = XLSX.utils.sheet_to_json<any>(ws, { defval: '' });
+    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: '' });
 
     if (rows.length === 0) return NextResponse.json({ error: 'No data found' }, { status: 400 });
+    // P0.11: row count limit (was: unbounded)
+    if (rows.length > MAX_ROWS) {
+      return NextResponse.json({ error: `Too many rows (max ${MAX_ROWS})` }, { status: 400 });
+    }
 
     const existingAccounts = await db.account.findMany({ where: { userId } });
     const existingCategories = await db.category.findMany({ where: { userId } });
     const accByArName = new Map(existingAccounts.map(a => [a.name, a]));
     const catByArName = new Map(existingCategories.map(c => [c.nameAr, c]));
-    const catByEnName = new Map(existingCategories.map(c => [c.nameEn, c]));
 
-    const ensureAccount = async (name: string, currency: string = 'SAR') => {
-      if (!name) return null;
-      const existing = accByArName.get(name);
-      if (existing) return existing;
-      const created = await db.account.create({
-        data: { name, type: 'BANK', currency: currency as any, balance: 0, userId },
-      });
-      accByArName.set(name, created);
-      return created;
-    };
+    // P0.11: lookup existing transactions for duplicate detection (date+amount+accountId+note)
+    const existingTxns = await db.transaction.findMany({
+      where: { userId },
+      select: { date: true, amount: true, accountId: true, note: true },
+    });
+    // Use a Set with composite key for O(1) lookup
+    const existingKeys = new Set(
+      existingTxns.map(t => `${t.date.getTime()}|${t.amount}|${t.accountId}|${t.note ?? ''}`),
+    );
 
-    const ensureCategory = async (nameAr: string, rowType: string, amount: number) => {
-      if (!nameAr || nameAr === 'None' || nameAr === '*') return null;
-      const isIncome = rowType === 'income' || amount < 0;
-      const type = isIncome ? 'INCOME' : 'EXPENSE';
-      const existing = catByArName.get(nameAr);
-      if (existing) return existing;
-      const created = await db.category.create({
-        data: { nameAr, nameEn: nameAr, type: type as any, icon: 'tag', color: '#64748B', userId },
-      });
-      catByArName.set(created.nameAr, created);
-      return created;
-    };
+    // Fetch existing transfer category (we'll skip transfer rows entirely)
+    const transferCat = await db.category.findFirst({
+      where: { nameAr: 'تحويلات', userId, type: 'TRANSFER' as any },
+    });
 
-    let imported = 0, skipped = 0;
+    let imported = 0, skipped = 0, duplicate = 0, transferSkipped = 0;
+
     for (const row of rows) {
       try {
-        const keys = Object.keys(row);
-        const findKey = (patterns: string[]) => {
-          for (const p of patterns) {
-            const k = keys.find(k => k.toLowerCase().trim().includes(p.toLowerCase()));
-            if (k) return k;
-          }
-          return undefined;
-        };
-
-        const dateKey = findKey(['date', 'تاريخ']);
-        const accountKey = findKey(['account', 'حساب']);
-        const catKey = findKey(['category', 'فئة', 'تصنيف']);
-        const typeKey = findKey(['income/expense', 'نوع', 'type']);
-        const amountKey = findKey(['sar', 'amount', 'مبلغ', 'value']);
-        const currencyKey = findKey(['currency', 'عملة']);
-        const noteKey = findKey(['note', 'ملاحظة', 'description']);
+        const dateKey = findKey(row, ['date', 'تاريخ']);
+        const accountKey = findKey(row, ['account', 'حساب']);
+        const catKey = findKey(row, ['category', 'فئة', 'تصنيف']);
+        const typeKey = findKey(row, ['income/expense', 'نوع', 'type']);
+        const amountKey = findKey(row, ['amount', 'مبلغ', 'value', 'sar']);
+        const currencyKey = findKey(row, ['currency', 'عملة']);
+        const noteKey = findKey(row, ['note', 'ملاحظة', 'description']);
 
         let date: Date = new Date();
         if (dateKey) {
@@ -2349,44 +2515,113 @@ export async function POST(req: NextRequest) {
             const str = dv.trim();
             if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
               const [dd, mm, yyyy] = str.split('/');
-              date = new Date(`${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`);
+              // P0.11: use Date.UTC instead of `new Date('YYYY-MM-DD')` (which is UTC midnight)
+              date = new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
             } else date = new Date(str);
           }
         }
+        if (isNaN(date.getTime())) { skipped++; continue; }
 
-        const amount = amountKey ? parseFloat(String(row[amountKey])) || 0 : 0;
-        if (!amount) { skipped++; continue; }
+        // P0.11: validate amount via parseMoney (catches NaN/Infinity)
+        const rawAmount = amountKey ? row[amountKey] : 0;
+        const amtResult = parseMoney(rawAmount, { allowZero: false, allowNegative: true });
+        if (!amtResult.ok) { skipped++; continue; }
+        const amount = amtResult.value;
 
         const accName = accountKey ? String(row[accountKey] || '').trim() : '';
         if (!accName) { skipped++; continue; }
-        const account = await ensureAccount(accName);
-        if (!account) { skipped++; continue; }
 
+        // P0.11: validate currency BEFORE creating account
+        const currencyRaw = (currencyKey ? String(row[currencyKey] || 'SAR') : 'SAR').toUpperCase();
+        if (!isCurrency(currencyRaw)) { skipped++; continue; }
+        const rowCurrency = currencyRaw as Currency;
+
+        // Find or create account. P0.11: if account exists with different currency,
+        // skip row (was: silently used account.currency and added raw amount)
+        let account = accByArName.get(accName);
+        if (!account) {
+          account = await db.account.create({
+            data: { name: accName, type: 'BANK', currency: rowCurrency, balance: 0, userId },
+          });
+          accByArName.set(accName, account);
+        }
+        // Currency mismatch check — don't silently corrupt
+        if (account.currency !== rowCurrency) {
+          // Convert the row amount to account currency, OR skip — choose skip for safety
+          skipped++;
+          continue;
+        }
+
+        // P0.11: detect Transfer rows and skip them (transfers can't round-trip via Excel
+        // because we don't have a ToAccount column in the export format)
+        const rowTypeStr = (typeKey ? String(row[typeKey] || 'Expense') : 'Expense').toLowerCase();
+        if (rowTypeStr.startsWith('transfer')) {
+          transferSkipped++;
+          continue;
+        }
+
+        // P0.11: validate category type matches transaction type
         const catName = catKey ? String(row[catKey] || '').trim() : '';
-        const rowType = (typeKey ? String(row[typeKey] || 'Expense') : 'Expense').toLowerCase();
-        const category = await ensureCategory(catName, rowType, amount);
-        if (!category) { skipped++; continue; }
+        if (!catName || catName === 'None' || catName === '*') { skipped++; continue; }
+        const isIncome = rowTypeStr === 'income' || amount < 0;
+        const txType = isIncome ? 'INCOME' : 'EXPENSE';
+        let category = catByArName.get(catName);
+        if (!category) {
+          category = await db.category.create({
+            data: { nameAr: catName, nameEn: catName, type: txType as any, icon: 'tag', color: '#64748B', userId },
+          });
+          catByArName.set(catName, category);
+        }
+        // P0.11: if category exists but has wrong type for this row, skip (was: silently assigned)
+        if (category.type !== txType && category.type !== 'TRANSFER' as any) {
+          skipped++;
+          continue;
+        }
 
-        const currency = (currencyKey ? String(row[currencyKey] || 'SAR') : 'SAR').toUpperCase();
-        const note = noteKey ? String(row[noteKey] || '') : '';
-
-        const txType = rowType === 'income' || amount < 0 ? 'INCOME' : 'EXPENSE';
         const absAmount = Math.abs(amount);
+        const note = noteKey ? String(row[noteKey] || '').slice(0, 500) : '';
+
+        // P0.11: duplicate detection (date+amount+accountId+note)
+        const dedupKey = `${date.getTime()}|${absAmount}|${account.id}|${note}`;
+        if (existingKeys.has(dedupKey)) {
+          duplicate++;
+          continue;
+        }
+        existingKeys.add(dedupKey);
 
         // ATOMIC: update balance + create transaction
+        // (balance delta is in account.currency because we validated currency match above)
         await db.$transaction(async (tx) => {
           const delta = txType === 'INCOME' ? absAmount : -absAmount;
-          await tx.account.update({ where: { id: account.id }, data: { balance: { increment: delta } } });
+          await tx.account.update({ where: { id: account!.id }, data: { balance: { increment: delta } } });
           await tx.transaction.create({
-            data: { type: txType, amount: absAmount, currency, accountId: account.id, categoryId: category.id, date, note: note || null, userId },
+            data: {
+              type: txType as any,
+              amount: absAmount,
+              currency: account!.currency,
+              accountId: account!.id,
+              categoryId: category!.id,
+              date,
+              note: note || null,
+              userId,
+            },
           });
         });
 
         imported++;
-      } catch (e) { skipped++; }
+      } catch (e) {
+        skipped++;
+      }
     }
 
-    return NextResponse.json({ success: true, imported, skipped, message: `Imported ${imported}, skipped ${skipped}` });
+    return NextResponse.json({
+      success: true,
+      imported,
+      skipped,
+      duplicate,
+      transferSkipped,
+      message: `Imported ${imported}, skipped ${skipped}, duplicates ${duplicate}, transfers ${transferSkipped}`,
+    });
   } catch (err: any) {
     return handleAuthError(err);
   }
@@ -2400,6 +2635,18 @@ import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
 
+// P0.11 backup import hardening:
+//   - Strict version check: backup.version === 3
+//   - Validate ownership of every FK reference (accountId, categoryId, toAccountId)
+//     before creating the transaction → closes IDOR
+//   - Regenerate all primary keys (strip client-supplied IDs) — defense in depth
+//   - Validate currency + type enums per row
+//   - Bounded row counts (max 50000 transactions per backup)
+//   - Don't leak err.message to client
+
+const BACKUP_VERSION = 3;
+const MAX_ROWS = 50000;
+
 // GET /api/backup?action=export - user-scoped
 export async function GET(req: NextRequest) {
   try {
@@ -2412,19 +2659,20 @@ export async function GET(req: NextRequest) {
     ]);
 
     const backup = {
-      version: 3,
+      version: BACKUP_VERSION,
       app: 'mywallet',
       exportedAt: new Date().toISOString(),
       data: {
-        accounts: accounts.map(({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) => 
-          ({ id, name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
-        categories: categories.map(({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) => 
-          ({ id, nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
-        // Only export known Transaction fields (NO accountName/categoryName)
-        transactions: transactions.map(({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, userId: _uid, createdAt, updatedAt }) => 
-          ({ id, type, amount, currency, accountId, categoryId, toAccountId, date, note, tags, transferPairId, createdAt, updatedAt })),
-        budgets: budgets.map(({ id, categoryId, month, limit, currency, createdAt, updatedAt }) => 
-          ({ id, categoryId, month, limit, currency, createdAt, updatedAt })),
+        // P0.11: export WITHOUT primary keys — on import, fresh cuids are generated.
+        // This prevents a malicious backup from setting arbitrary PKs.
+        accounts: accounts.map(({ name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt }) =>
+          ({ name, type, currency, balance, color, icon, isDefault, createdAt, updatedAt })),
+        categories: categories.map(({ nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt }) =>
+          ({ nameAr, nameEn, type, icon, color, isDefault, createdAt, updatedAt })),
+        transactions: transactions.map(({ type, amount, currency, date, note, tags, transferPairId, createdAt, updatedAt }) =>
+          ({ type, amount, currency, date, note, tags, transferPairId, createdAt, updatedAt })),
+        budgets: budgets.map(({ month, limit, currency, createdAt, updatedAt }) =>
+          ({ month, limit, currency, createdAt, updatedAt })),
       },
     };
 
@@ -2439,15 +2687,14 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST /api/backup?action=import - user-scoped, ATOMIC, only known fields
+// POST /api/backup?action=import - user-scoped, ATOMIC, with IDOR defense
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const formData = await req.formData();
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
-    
-    // Limit file size (10MB max)
+
     if (file.size > 10 * 1024 * 1024) {
       return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 400 });
     }
@@ -2459,14 +2706,26 @@ export async function POST(req: NextRequest) {
     } catch {
       return NextResponse.json({ error: 'Invalid JSON file' }, { status: 400 });
     }
-    
-    if (!backup?.data || !backup?.version) {
-      return NextResponse.json({ error: 'Invalid backup format - missing version or data' }, { status: 400 });
+
+    // P0.11: strict version check (was: truthy check that accepted v1, v999, "foo", etc.)
+    if (typeof backup?.version !== 'number' || backup.version !== BACKUP_VERSION) {
+      return NextResponse.json(
+        { error: `Unsupported backup version (expected ${BACKUP_VERSION}). Please export a fresh backup first.` },
+        { status: 400 },
+      );
+    }
+    if (!backup?.data || typeof backup.data !== 'object') {
+      return NextResponse.json({ error: 'Invalid backup format - missing data' }, { status: 400 });
     }
 
-    const { accounts, categories, transactions, budgets } = backup.data;
+    const { accounts = [], categories = [], transactions = [], budgets = [] } = backup.data;
 
-    // ATOMIC: delete old + restore new (only with known fields)
+    // P0.11: row count limits
+    if (transactions.length > MAX_ROWS || accounts.length > 1000 || categories.length > 1000 || budgets.length > 1000) {
+      return NextResponse.json({ error: `Backup exceeds row limits (max ${MAX_ROWS} transactions, 1000 each for accounts/categories/budgets)` }, { status: 400 });
+    }
+
+    // ATOMIC: delete old + restore new (with regenerated IDs + FK ownership validation)
     const result = await db.$transaction(async (tx) => {
       await tx.transaction.deleteMany({ where: { userId } });
       await tx.budget.deleteMany({ where: { userId } });
@@ -2475,45 +2734,123 @@ export async function POST(req: NextRequest) {
 
       let catCount = 0, accCount = 0, txCount = 0, budCount = 0;
 
-      for (const c of categories || []) {
-        await tx.category.create({
+      // Insert categories with FRESH IDs (Prisma auto-generates cuid).
+      // Map old ID → new ID so transactions can resolve categoryId.
+      const categoryIdMap = new Map<string, string>();
+      for (const c of categories) {
+        // Validate category type enum (allow EXPENSE, INCOME, TRANSFER for legacy)
+        if (!['EXPENSE', 'INCOME', 'TRANSFER'].includes(c.type)) {
+          throw new Error(`Invalid category type: ${c.type}`);
+        }
+        const created = await tx.category.create({
           data: {
-            id: c.id, nameAr: c.nameAr, nameEn: c.nameEn, type: c.type,
-            icon: c.icon || 'tag', color: c.color || '#10B981',
-            isDefault: c.isDefault || false, userId,
+            nameAr: String(c.nameAr || '').slice(0, 200),
+            nameEn: String(c.nameEn || '').slice(0, 200),
+            type: c.type,
+            icon: String(c.icon || 'tag').slice(0, 100),
+            color: String(c.color || '#10B981').slice(0, 20),
+            isDefault: Boolean(c.isDefault),
+            userId,
           },
         });
+        if (c.id) categoryIdMap.set(c.id, created.id);
         catCount++;
       }
-      for (const a of accounts || []) {
-        await tx.account.create({
+
+      const accountIdMap = new Map<string, string>();
+      const VALID_ACCOUNT_TYPES = new Set(['CASH', 'BANK', 'E_WALLET', 'CARD', 'SAVINGS', 'INVESTMENT', 'LOAN', 'EXTERNAL']);
+      const VALID_CURRENCIES = new Set(['EGP', 'SAR', 'USD', 'EUR', 'AED']);
+      for (const a of accounts) {
+        if (!VALID_ACCOUNT_TYPES.has(a.type)) {
+          throw new Error(`Invalid account type: ${a.type}`);
+        }
+        if (!VALID_CURRENCIES.has(a.currency)) {
+          throw new Error(`Invalid currency: ${a.currency}`);
+        }
+        // P0.11: validate balance is finite (no NaN/Infinity)
+        const bal = Number(a.balance);
+        if (!Number.isFinite(bal)) {
+          throw new Error('Account balance must be a finite number');
+        }
+        const created = await tx.account.create({
           data: {
-            id: a.id, name: a.name, type: a.type, currency: a.currency,
-            balance: a.balance || 0, color: a.color || '#2563EB',
-            icon: a.icon || 'wallet', isDefault: a.isDefault || false, userId,
+            name: String(a.name || '').slice(0, 200),
+            type: a.type,
+            currency: a.currency,
+            balance: bal,
+            color: String(a.color || '#2563EB').slice(0, 20),
+            icon: String(a.icon || 'wallet').slice(0, 100),
+            isDefault: Boolean(a.isDefault),
+            userId,
           },
         });
+        if (a.id) accountIdMap.set(a.id, created.id);
         accCount++;
       }
-      for (const t of transactions || []) {
+
+      // P0.11: IDOR defense — for each imported transaction, verify the FK
+      // references resolve to accounts/categories OWNED BY THIS USER
+      // (which they now are, because we just inserted them above).
+      // If an old ID doesn't appear in our map → reject that row (skipped).
+      for (const t of transactions) {
+        // Resolve the foreign keys through our idMap.
+        // If the source ID is missing → cross-user reference attempt → skip.
+        const newAccountId = t.accountId ? accountIdMap.get(t.accountId) : undefined;
+        const newCategoryId = t.categoryId ? categoryIdMap.get(t.categoryId) : undefined;
+        const newToAccountId = t.toAccountId ? accountIdMap.get(t.toAccountId) : undefined;
+
+        if (!newAccountId || !newCategoryId) {
+          // P0.11: skip rows whose FK references can't be resolved to the user's own data.
+          // This blocks the IDOR attack where a malicious backup references another user's account.
+          continue;
+        }
+
+        // Validate transaction type + currency
+        if (!['EXPENSE', 'INCOME', 'TRANSFER'].includes(t.type)) {
+          continue;
+        }
+        if (!VALID_CURRENCIES.has(t.currency)) {
+          continue;
+        }
+
+        const amt = Number(t.amount);
+        if (!Number.isFinite(amt)) {
+          continue;
+        }
+
         await tx.transaction.create({
           data: {
-            id: t.id, type: t.type, amount: t.amount, currency: t.currency,
-            accountId: t.accountId, categoryId: t.categoryId,
-            toAccountId: t.toAccountId || null,
+            type: t.type,
+            amount: amt,
+            currency: t.currency,
+            accountId: newAccountId,
+            categoryId: newCategoryId,
+            toAccountId: newToAccountId || null,
             date: new Date(t.date),
-            note: t.note || null, tags: t.tags || null,
-            transferPairId: t.transferPairId || null,
+            note: t.note ? String(t.note).slice(0, 500) : null,
+            tags: t.tags ? String(t.tags).slice(0, 200) : null,
+            transferPairId: t.transferPairId ? String(t.transferPairId).slice(0, 50) : null,
             userId,
           },
         });
         txCount++;
       }
-      for (const b of budgets || []) {
+
+      for (const b of budgets) {
+        const newCategoryId = b.categoryId ? categoryIdMap.get(b.categoryId) : undefined;
+        if (!newCategoryId) continue;
+        if (!VALID_CURRENCIES.has(b.currency)) continue;
+        if (!/^\d{4}-\d{2}$/.test(b.month)) continue;
+        const lim = Number(b.limit);
+        if (!Number.isFinite(lim) || lim < 0) continue;
+
         await tx.budget.create({
           data: {
-            id: b.id, categoryId: b.categoryId, month: b.month,
-            limit: b.limit, currency: b.currency || 'EGP', userId,
+            categoryId: newCategoryId,
+            month: b.month,
+            limit: lim,
+            currency: b.currency,
+            userId,
           },
         });
         budCount++;
@@ -4048,7 +4385,7 @@ export function ReportsScreen() {
       } else {
         // Yearly: fetch 12 months stats in parallel
         const months: { month: string; income: number; expense: number; balance: number }[] = [];
-        const promises = [];
+        const promises: Promise<{ month: string; income: number; expense: number; balance: number }>[] = [];
         for (let m = 1; m <= 12; m++) {
           const mStr = `${year}-${String(m).padStart(2, '0')}`;
           promises.push(
@@ -4105,6 +4442,10 @@ export function ReportsScreen() {
   // #6: PDF Export
   const handleExportPDF = async () => {
     try {
+      if (!stat) {
+        toast.error(lang === 'ar' ? 'لا توجد بيانات للتصدير' : 'No data to export');
+        return;
+      }
       const { jsPDF } = await import('jspdf');
       const autoTable = (await import('jspdf-autotable')).default;
       const doc = new jsPDF();

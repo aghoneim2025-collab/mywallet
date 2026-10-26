@@ -2,6 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import {
+  parseMoney, parseString, isCurrency, isAccountType, badRequest,
+} from '@/lib/validate';
+
+// P0.11 fixes:
+//   - Validate balance (NaN/Infinity), currency, account type, name length
+//   - Block currency change on accounts with transactions (prevents silent corruption)
+//   - Wrap default-toggle + update in $transaction (was: 2 writes, race on partial failure)
 
 export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -12,20 +20,57 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     if (!account) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
     const body = await req.json();
-    const { name, type, currency, balance, color, icon, isDefault } = body;
-    if (isDefault) {
-      const old = await db.account.findFirst({ where: { isDefault: true, userId, NOT: { id } } });
-      if (old) await db.account.update({ where: { id: old.id }, data: { isDefault: false } });
+    const { name, type, currency, balance, color, icon, isDefault } = body || {};
+    const data: any = {};
+
+    if (name !== undefined) {
+      const r = parseString(name, 'Name', { min: 1, max: 100 });
+      if (!r.ok) return badRequest(r.error);
+      data.name = r.value;
     }
-    const updated = await db.account.update({ where: { id }, data: {
-      ...(name !== undefined ? { name } : {}),
-      ...(type !== undefined ? { type } : {}),
-      ...(currency !== undefined ? { currency } : {}),
-      ...(balance !== undefined ? { balance: Number(balance) } : {}),
-      ...(color !== undefined ? { color } : {}),
-      ...(icon !== undefined ? { icon } : {}),
-      ...(isDefault !== undefined ? { isDefault } : {}),
-    }});
+    if (type !== undefined) {
+      if (!isAccountType(type)) return badRequest('Invalid account type');
+      data.type = type;
+    }
+    if (currency !== undefined) {
+      if (!isCurrency(currency)) return badRequest('Invalid currency');
+      // P0.11: block currency change on accounts with transactions
+      if (currency !== account.currency) {
+        const cnt = await db.transaction.count({ where: { accountId: id } });
+        if (cnt > 0) {
+          return NextResponse.json(
+            { error: `Cannot change currency on account with ${cnt} existing transactions. Create a new account instead.` },
+            { status: 400 },
+          );
+        }
+      }
+      data.currency = currency;
+    }
+    if (balance !== undefined) {
+      const r = parseMoney(balance, { allowZero: true, allowNegative: true });
+      if (!r.ok) return badRequest(r.error);
+      data.balance = r.value;
+    }
+    if (color !== undefined) {
+      const r = parseString(color, 'Color', { required: false, max: 20 });
+      if (!r.ok) return badRequest(r.error);
+      data.color = r.value;
+    }
+    if (icon !== undefined) {
+      const r = parseString(icon, 'Icon', { required: false, max: 100 });
+      if (!r.ok) return badRequest(r.error);
+      data.icon = r.value;
+    }
+    if (isDefault !== undefined) data.isDefault = Boolean(isDefault);
+
+    // ATOMIC: toggle old default off + update
+    const updated = await db.$transaction(async (tx) => {
+      if (isDefault) {
+        const old = await tx.account.findFirst({ where: { isDefault: true, userId, NOT: { id } } });
+        if (old) await tx.account.update({ where: { id: old.id }, data: { isDefault: false } });
+      }
+      return tx.account.update({ where: { id }, data });
+    });
     return NextResponse.json({ data: updated });
   } catch (err: any) {
     return handleAuthError(err);
@@ -48,7 +93,6 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
       return NextResponse.json({ error: `Cannot delete: ${txCount} transactions linked` }, { status: 400 });
     }
 
-    // Delete budgets linked to categories of this account (fixed: was using categoryId: id incorrectly)
     await db.account.delete({ where: { id } });
     return NextResponse.json({ success: true });
   } catch (err: any) {

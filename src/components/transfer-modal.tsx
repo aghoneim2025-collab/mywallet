@@ -23,6 +23,7 @@ interface Account {
   balance: number;
   color: string;
   icon: string;
+  isDefault?: boolean;
 }
 
 export function TransferModal({

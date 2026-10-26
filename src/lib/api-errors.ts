@@ -4,6 +4,10 @@
 //   - AuthInvalidError → 401 (Unauthorized) — token is invalid/expired/revoked
 //   - Other errors → 500 (Internal Server Error) — unexpected, log for debugging
 //
+// P0.11: NEVER return err.message to the client — it can leak Prisma error
+// details (table names, column names, constraint names). Log server-side only.
+// Client gets a generic "Internal server error" message.
+//
 // Usage in API routes:
 //   try {
 //     const userId = await requireAuthAsync(req);
@@ -18,6 +22,7 @@
 //   - On 500: keep token, show generic error UI
 import { NextResponse } from 'next/server';
 import { DbUnavailableError, AuthInvalidError } from './auth';
+import { badRequest } from './validate';
 
 export function handleAuthError(err: unknown) {
   if (err instanceof DbUnavailableError) {
@@ -34,9 +39,22 @@ export function handleAuthError(err: unknown) {
   if (err instanceof Error && err.message === 'Unauthorized') {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
-  // Unexpected error → 500 (NOT 401, NOT 200). The user's token may be
-  // perfectly valid; an internal bug shouldn't log them out.
-  console.error('Unexpected API error (returning 500):', err);
-  const message = err instanceof Error ? err.message : 'Internal server error';
-  return NextResponse.json({ error: message }, { status: 500 });
+  // P0.11: validation errors thrown with `throw new Error('Some validation message')`
+  // are surfaced to the client as 400 (Bad Request). This is intentional —
+  // the validation message is safe (we wrote it).
+  if (err instanceof Error) {
+    // Heuristic: messages that start with "Invalid" or "must" or "exceeds"
+    // or "is required" are validation messages, safe to surface.
+    const msg = err.message;
+    if (/^(Invalid|Must|Exceeds|.* is required|.* cannot be|.* must be)/i.test(msg)) {
+      return badRequest(msg);
+    }
+  }
+  // P0.11: unexpected error → log full details server-side, return generic to client.
+  // Don't leak Prisma error messages (which include column/table names).
+  console.error('Unexpected API error (returning 500, full err logged server-side):', err);
+  return NextResponse.json(
+    { error: 'Internal server error' },
+    { status: 500 },
+  );
 }

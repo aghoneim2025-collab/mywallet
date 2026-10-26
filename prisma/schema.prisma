@@ -162,71 +162,16 @@ model Budget {
   @@map("budgets")
 }
 
-// ===== Setting (الإعدادات العامة) =====
-model Setting {
-  id        String   @id @default(cuid())
-  key       String   @unique
-  value     String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// ===== Setting (DELETED — was global singleton with no userId, security risk) =====
+// Previously: model Setting { id, key, value } — no userId, accessible to all users.
+// Removed in P0.11 because:
+//   (1) the /api/settings route had no auth (anyone could read/write global config)
+//   (2) the frontend never used it (settings stored in zustand/localStorage)
+// If per-user server-side settings are needed in the future, add a `userId` field.
 
-  @@map("settings")
-}
+// ===== RecurringTransaction (DELETED — was global with no userId) =====
+// Same reason. Removed along with /api/recurring route (was unused + unauthenticated).
 
-// ===== RecurringTransaction (معاملات متكررة - #1) =====
-model RecurringTransaction {
-  id          String   @id @default(cuid())
-  type        String   // EXPENSE | INCOME | TRANSFER
-  amount      Float
-  currency    String
-  accountId   String
-  categoryId  String
-  toAccountId String?  // للتحويلات
-  frequency   String   // daily | weekly | monthly | yearly
-  dayOfMonth  Int?     // يوم التنفيذ (1-31)
-  startDate   DateTime
-  endDate     DateTime?
-  lastRun     DateTime?
-  nextRun     DateTime
-  note        String?
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+// ===== SavingsGoal (DELETED — was global with no userId) =====
 
-  @@map("recurring_transactions")
-}
-
-// ===== SavingsGoal (أهداف ادخارية - #7) =====
-model SavingsGoal {
-  id          String   @id @default(cuid())
-  name        String
-  targetAmount Float
-  currentAmount Float @default(0)
-  currency    String   @default("EGP")
-  targetDate  DateTime?
-  color       String   @default("#10B981")
-  icon        String   @default("piggy-bank")
-  achieved    Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@map("savings_goals")
-}
-
-// ===== BillReminder (تذكير فواتير - #8) =====
-model BillReminder {
-  id          String   @id @default(cuid())
-  name        String
-  amount      Float
-  currency    String   @default("EGP")
-  dueDate     DateTime
-  recurring   Boolean  @default(true)
-  frequency   String   @default("monthly") // daily | weekly | monthly | yearly
-  accountId   String?
-  paid        Boolean  @default(false)
-  remindDays  Int      @default(3) // تذكير قبل كام يوم
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@map("bill_reminders")
-}
+// ===== BillReminder (DELETED — was global with no userId) =====

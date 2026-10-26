@@ -3,6 +3,7 @@ import { db } from '@/lib/db';
 import { convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
 
 export async function GET(req: NextRequest) {
   try {
@@ -20,8 +21,9 @@ export async function GET(req: NextRequest) {
     if (categoryId) where.categoryId = categoryId;
     if (from || to) {
       where.date = {};
-      if (from) where.date.gte = new Date(from);
-      if (to) where.date.lte = new Date(to);
+      // P0.11: explicit UTC parsing to avoid tz-shift on date-only strings
+      if (from) where.date.gte = new Date(`${from}T00:00:00.000Z`);
+      if (to) where.date.lte = new Date(`${to}T23:59:59.999Z`);
     }
     const transactions = await db.transaction.findMany({
       where,
@@ -35,25 +37,44 @@ export async function GET(req: NextRequest) {
   }
 }
 
+// P0.11 fixes:
+//   - Validate type, amount (NaN/Infinity), currency, account/category ownership
+//   - Validate note/tags length limits
+//   - Verify category.type matches transaction type (was: only checked in POST)
 export async function POST(req: NextRequest) {
   try {
     const userId = await requireAuthAsync(req);
     const body = await req.json();
-    const { type, amount, currency, accountId, categoryId, date, note, tags } = body;
+    const { type, amount, currency, accountId, categoryId, date, note, tags } = body || {};
 
-    // Validate input
-    if (!type || !['EXPENSE', 'INCOME'].includes(type)) {
-      return NextResponse.json({ error: 'Type must be EXPENSE or INCOME' }, { status: 400 });
-    }
-    const amt = Number(amount);
-    if (!amt || amt <= 0 || !isFinite(amt)) {
-      return NextResponse.json({ error: 'Amount must be positive number' }, { status: 400 });
-    }
-    if (!accountId || !categoryId) {
-      return NextResponse.json({ error: 'accountId and categoryId required' }, { status: 400 });
+    // Validate type
+    if (type !== 'EXPENSE' && type !== 'INCOME') {
+      return badRequest('Type must be EXPENSE or INCOME');
     }
 
-    // Verify BOTH account AND category ownership
+    // P0.11: use parseMoney (catches NaN, Infinity, negative)
+    const amtResult = parseMoney(amount, { allowZero: false, allowNegative: false });
+    if (!amtResult.ok) return badRequest(amtResult.error);
+    const amt = amtResult.value;
+
+    if (typeof accountId !== 'string' || accountId.length < 10) return badRequest('Invalid accountId');
+    if (typeof categoryId !== 'string' || categoryId.length < 10) return badRequest('Invalid categoryId');
+
+    if (currency !== undefined && !isCurrency(currency)) {
+      return badRequest('Invalid currency (must be EGP, SAR, USD, EUR, or AED)');
+    }
+
+    // P0.11: validate note/tags length
+    if (note !== undefined && note !== null) {
+      const r = parseString(note, 'Note', { required: false, max: 500 });
+      if (!r.ok) return badRequest(r.error);
+    }
+    if (tags !== undefined && tags !== null) {
+      const r = parseString(tags, 'Tags', { required: false, max: 200 });
+      if (!r.ok) return badRequest(r.error);
+    }
+
+    // Verify BOTH account AND category ownership (IDOR defense)
     const [account, category] = await Promise.all([
       db.account.findFirst({ where: { id: accountId, userId } }),
       db.category.findFirst({ where: { id: categoryId, userId } }),
@@ -61,22 +82,30 @@ export async function POST(req: NextRequest) {
     if (!account) return NextResponse.json({ error: 'Account not found' }, { status: 404 });
     if (!category) return NextResponse.json({ error: 'Category not found' }, { status: 404 });
 
-    // Verify category type matches transaction type
+    // P0.11: verify category type matches transaction type (catches mismatched imports)
     if (category.type !== type) {
-      return NextResponse.json({ error: `Category type mismatch: category is ${category.type}, transaction is ${type}` }, { status: 400 });
+      return badRequest(`Category type mismatch: category is ${category.type}, transaction is ${type}`);
     }
 
-    const txCurrency = (currency || account.currency) as Currency;
+    const txCurrency: Currency = currency || account.currency;
     const amountInAccountCurrency = txCurrency === account.currency
-      ? amt : convert(amt, txCurrency, account.currency as Currency);
+      ? amt : convert(amt, txCurrency, account.currency);
     const delta = type === 'INCOME' ? amountInAccountCurrency : -amountInAccountCurrency;
 
-    // ATOMIC
+    // Sanity check on converted amount
+    if (!Number.isFinite(delta)) return badRequest('Currency conversion failed (invalid rate?)');
+
+    // ATOMIC: update balance + create transaction
     const transaction = await db.$transaction(async (tx) => {
       await tx.account.update({ where: { id: accountId }, data: { balance: { increment: delta } } });
       return tx.transaction.create({
-        data: { type, amount: amt, currency: txCurrency, accountId, categoryId, userId,
-          date: date ? new Date(date) : new Date(), note: note || null, tags: tags || null },
+        data: {
+          type, amount: amt, currency: txCurrency,
+          accountId, categoryId, userId,
+          date: date ? new Date(date) : new Date(),
+          note: note ? String(note).slice(0, 500) : null,
+          tags: tags ? String(tags).slice(0, 200) : null,
+        },
         include: { account: true, category: true },
       });
     });

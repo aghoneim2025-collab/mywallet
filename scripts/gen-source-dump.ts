@@ -45,9 +45,9 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.10 Centralized Error Handler + Service UI + Strict ZIP) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.11 Comprehensive Security + Data Integrity Fixes) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.10 (centralized errors + service UI + strict ZIP) ===
+=== VERSION: P0.11 (comprehensive security + data integrity) ===
 === BUILD: ${new Date().toISOString()} ===
 
 URGENT SECURITY NOTE:
