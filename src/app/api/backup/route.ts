@@ -12,7 +12,7 @@ import { handleAuthError } from '@/lib/api-errors';
 //   - Bounded row counts (max 50000 transactions per backup)
 //   - Don't leak err.message to client
 
-const BACKUP_VERSION = 3;
+const BACKUP_VERSION = 4;
 const MAX_ROWS = 50000;
 
 // GET /api/backup?action=export - user-scoped
@@ -84,9 +84,23 @@ export async function POST(req: NextRequest) {
     }
 
     // P0.11: strict version check (was: truthy check that accepted v1, v999, "foo", etc.)
-    if (typeof backup?.version !== 'number' || backup.version !== BACKUP_VERSION) {
+    // P0.20: reject v3 explicitly with a message explaining why.
+    // v3 backups don't include IDs → import silently skips all transactions.
+    if (typeof backup?.version !== 'number') {
       return NextResponse.json(
-        { error: `Unsupported backup version (expected ${BACKUP_VERSION}). Please export a fresh backup first.` },
+        { error: 'Invalid backup file: missing or non-numeric version field.' },
+        { status: 400 },
+      );
+    }
+    if (backup.version !== BACKUP_VERSION) {
+      if (backup.version === 3) {
+        return NextResponse.json(
+          { error: 'Backup version 3 is no longer supported (it lacks transaction IDs, causing silent data loss on restore). Please export a fresh backup from the current app version to get version ' + BACKUP_VERSION + '.' },
+          { status: 400 },
+        );
+      }
+      return NextResponse.json(
+        { error: `Unsupported backup version ${backup.version} (expected ${BACKUP_VERSION}).` },
         { status: 400 },
       );
     }
@@ -95,6 +109,31 @@ export async function POST(req: NextRequest) {
     }
 
     const { accounts = [], categories = [], transactions = [], budgets = [] } = backup.data;
+
+    // P0.20: validate data structure BEFORE deleting user's existing data.
+    // If arrays aren't arrays, or required fields are missing, we reject
+    // the import BEFORE touching the user's current data.
+    if (!Array.isArray(accounts) || !Array.isArray(categories) || !Array.isArray(transactions) || !Array.isArray(budgets)) {
+      return NextResponse.json({ error: 'Invalid backup format: data.accounts/categories/transactions/budgets must be arrays.' }, { status: 400 });
+    }
+    // Verify transactions have the required FK fields (accountId, categoryId)
+    for (const t of transactions) {
+      if (!t.accountId || !t.categoryId) {
+        return NextResponse.json(
+          { error: 'Backup contains transactions missing accountId or categoryId. This looks like a v3 backup. Please export a fresh backup.' },
+          { status: 400 },
+        );
+      }
+    }
+    // Verify budgets have categoryId
+    for (const b of budgets) {
+      if (!b.categoryId) {
+        return NextResponse.json(
+          { error: 'Backup contains budgets missing categoryId. Please export a fresh backup.' },
+          { status: 400 },
+        );
+      }
+    }
 
     // P0.11: row count limits
     if (transactions.length > MAX_ROWS || accounts.length > 1000 || categories.length > 1000 || budgets.length > 1000) {

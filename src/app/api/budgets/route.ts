@@ -18,7 +18,7 @@ export async function GET(req: NextRequest) {
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
     // P0.11: validate month format if provided
-    if (month && !/^\d{4}-\d{2}$/.test(month)) {
+    if (month && !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
       return badRequest('Invalid month format (expected YYYY-MM)');
     }
     const where: any = { userId };
@@ -71,8 +71,12 @@ export async function POST(req: NextRequest) {
       return badRequest('Invalid categoryId');
     }
     // P0.11: validate month format (was: any string)
-    if (typeof month !== 'string' || !/^\d{4}-\d{2}$/.test(month)) {
-      return badRequest('Invalid month format (expected YYYY-MM)');
+    if (typeof month !== 'string') return badRequest('Invalid month format');
+    {
+      const m = month.match(/^\d{4}-\d{2}$/);
+      if (!m) return badRequest('Invalid month format (expected YYYY-MM)');
+      const mon = parseInt(m[2], 10);
+      if (mon < 1 || mon > 12) return badRequest(`Invalid month: ${m[2]} (must be 01-12)`);
     }
     // P0.11: use parseMoney for limit
     const limitResult = parseMoney(limit, { allowZero: false, allowNegative: false });

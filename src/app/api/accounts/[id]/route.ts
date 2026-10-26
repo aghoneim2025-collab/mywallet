@@ -51,7 +51,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       // This prevents detaching the running balance from the transaction ledger.
       // If the user wants to adjust the balance, they should create a reconciliation
       // transaction (or delete all transactions first).
-      const txCount = await db.transaction.count({ where: { accountId: id } });
+      // P0.20: check BOTH accountId AND toAccountId (incoming transfers)
+      const txCount = await db.transaction.count({
+        where: { OR: [{ accountId: id }, { toAccountId: id }] },
+      });
       if (txCount > 0) {
         return NextResponse.json(
           { error: `Cannot change balance directly: account has ${txCount} transaction(s). ` +

@@ -11,7 +11,12 @@ export async function GET(req: NextRequest) {
     const userId = await requireAuthAsync(req);
     const url = new URL(req.url);
     const month = url.searchParams.get('month');
-    if (month && !/^\d{4}-\d{2}$/.test(month)) return badRequest('Invalid month format (expected YYYY-MM)');
+    if (month) {
+      const m = month.match(/^(\d{4})-(\d{2})$/);
+      if (!m) return badRequest('Invalid month format (expected YYYY-MM)');
+      const mon = parseInt(m[2], 10);
+      if (mon < 1 || mon > 12) return badRequest(`Invalid month: ${m[2]} (must be 01-12)`);
+    }
     const baseCurrencyRaw = url.searchParams.get('baseCurrency') || 'EGP';
     if (!isCurrency(baseCurrencyRaw)) return badRequest('Invalid baseCurrency');
     const baseCurrency = baseCurrencyRaw as Currency;
@@ -60,7 +65,7 @@ export async function GET(req: NextRequest) {
 
     // Total assets: exclude LOAN type
     const totalAssets = accounts
-      .filter(a => a.type !== 'LOAN')
+      .filter(a => a.type !== 'LOAN' && a.type !== 'EXTERNAL')
       .reduce((s, a) => s + toBase(a.balance, a.currency), 0);
     const totalLiabilities = accounts
       .filter(a => a.type === 'LOAN' && a.balance < 0)
