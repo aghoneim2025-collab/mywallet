@@ -32,6 +32,20 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     }
     if (type !== undefined) {
       if (!isAccountType(type)) return badRequest('Invalid account type');
+      // P0.22: block type change if account has transactions
+      // (changing LOAN→CASH etc. alters asset/liability classification)
+      if (type !== account.type) {
+        const typeTxCount = await db.transaction.count({
+          where: { OR: [{ accountId: id }, { toAccountId: id }] },
+        });
+        if (typeTxCount > 0) {
+          return NextResponse.json(
+            { error: `Cannot change account type: ${typeTxCount} transaction(s) reference this account. ` +
+              'Changing type would alter historical asset/liability classification. Create a new account instead.' },
+            { status: 400 },
+          );
+        }
+      }
       data.type = type;
     }
     if (currency !== undefined) {

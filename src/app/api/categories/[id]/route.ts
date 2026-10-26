@@ -48,16 +48,28 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       if (!r.ok) return badRequest(r.error);
     }
 
-    const updated = await db.category.update({
-      where: { id },
-      data: {
-        ...(nameAr !== undefined ? { nameAr } : {}),
-        ...(nameEn !== undefined ? { nameEn } : {}),
-        ...(type !== undefined ? { type } : {}),
-        ...(icon !== undefined ? { icon } : {}),
-        ...(color !== undefined ? { color } : {}),
-      },
-    });
+    // P0.22: use the VALIDATED values (result.value), not raw body values.
+    // This ensures trimmed strings + length limits are actually enforced.
+    const data: any = {};
+    if (nameAr !== undefined) {
+      const r = parseString(nameAr, 'nameAr', { min: 1, max: 200 });
+      if (r.ok) data.nameAr = r.value;
+    }
+    if (nameEn !== undefined) {
+      const r = parseString(nameEn, 'nameEn', { min: 1, max: 200 });
+      if (r.ok) data.nameEn = r.value;
+    }
+    if (type !== undefined) data.type = type;
+    if (icon !== undefined) {
+      const r = parseString(icon, 'icon', { required: false, max: 100 });
+      if (r.ok) data.icon = r.value;
+    }
+    if (color !== undefined) {
+      const r = parseString(color, 'color', { required: false, max: 20 });
+      if (r.ok) data.color = r.value;
+    }
+
+    const updated = await db.category.update({ where: { id }, data });
     return NextResponse.json({ data: updated });
   } catch (err: any) {
     return handleAuthError(err);
