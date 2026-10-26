@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
-import { convert, type Currency } from '@/lib/currency';
+import { convertServer as convert, type Currency } from '@/lib/currency';
 import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
 
 // P0.11 fixes:

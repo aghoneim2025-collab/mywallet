@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { convert, type Currency } from '@/lib/currency';
+import { convertServer as convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
 import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { EXCHANGE_RATES, type Currency } from '@/lib/currency';
+import { getServerExchangeRates, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
 
@@ -32,11 +32,14 @@ export async function GET(req: NextRequest) {
 
     const accounts = await db.account.findMany({ where: { userId } });
 
+    // P0.15: use server-side rates (was: EXCHANGE_RATES module-level which
+    // could be polluted by client-side code).
+    const rates = getServerExchangeRates();
     const toBase = (amount: number, from: string) => {
       const fromCur = (from as Currency) || 'EGP';
       if (fromCur === baseCurrency) return amount;
-      const inEgp = amount * EXCHANGE_RATES[fromCur];
-      return inEgp / EXCHANGE_RATES[baseCurrency];
+      const inEgp = amount * rates[fromCur];
+      return inEgp / rates[baseCurrency as Currency];
     };
 
     // Exclude transfers from BOTH expense and income
