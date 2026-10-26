@@ -1,7 +1,7 @@
-=== محفظتي (MyWallet) - Source Code (P0.15 Force-Delete + Server Rates + Snapshot Verify) ===
+=== محفظتي (MyWallet) - Source Code (P0.16 Atomic Balance + Force Scope + Date Validation) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.15 (force-delete + server rates + e2e test) ===
-=== BUILD: 2026-10-26T07:46:43.568Z ===
+=== VERSION: P0.16 (atomic balance + force scope + date validation) ===
+=== BUILD: 2026-10-26T08:29:45.472Z ===
 
 URGENT SECURITY NOTE:
   In P0.5, the source-code ZIP files inadvertently included the .env file
@@ -1865,7 +1865,7 @@ import { db } from '@/lib/db';
 import { convertServer as convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
-import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
+import { parseMoney, isCurrency, parseString, parseDate, badRequest } from '@/lib/validate';
 
 export async function GET(req: NextRequest) {
   try {
@@ -1881,11 +1881,26 @@ export async function GET(req: NextRequest) {
     if (type) where.type = type;
     if (accountId) where.accountId = accountId;
     if (categoryId) where.categoryId = categoryId;
+    // P0.16: validate date inputs explicitly (was: silently producing Invalid Date → wrong query)
     if (from || to) {
       where.date = {};
-      // P0.11: explicit UTC parsing to avoid tz-shift on date-only strings
-      if (from) where.date.gte = new Date(`${from}T00:00:00.000Z`);
-      if (to) where.date.lte = new Date(`${to}T23:59:59.999Z`);
+      if (from) {
+        const r = parseDate(from);
+        if (!r.ok) return badRequest(`Invalid 'from' date: ${r.error}`);
+        where.date.gte = r.value;
+      }
+      if (to) {
+        const r = parseDate(to);
+        if (!r.ok) return badRequest(`Invalid 'to' date: ${r.error}`);
+        // For 'to' as YYYY-MM-DD, the user typically wants "up to end of that day"
+        // so we extend to 23:59:59.999 UTC. parseDate returns midnight UTC
+        // for YYYY-MM-DD, so add 1 day minus 1ms.
+        let end = r.value;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+          end = new Date(r.value.getTime() + 24 * 60 * 60 * 1000 - 1);
+        }
+        where.date.lte = end;
+      }
     }
     const transactions = await db.transaction.findMany({
       where,
@@ -1935,6 +1950,13 @@ export async function POST(req: NextRequest) {
       const r = parseString(tags, 'Tags', { required: false, max: 200 });
       if (!r.ok) return badRequest(r.error);
     }
+    // P0.16: validate date (was: silently producing Invalid Date → 500)
+    let parsedDate: Date | undefined;
+    if (date !== undefined && date !== null && date !== '') {
+      const r = parseDate(date);
+      if (!r.ok) return badRequest(`Invalid date: ${r.error}`);
+      parsedDate = r.value;
+    }
 
     // Verify BOTH account AND category ownership (IDOR defense)
     const [account, category] = await Promise.all([
@@ -1970,7 +1992,7 @@ export async function POST(req: NextRequest) {
         data: {
           type, amount: amt, currency: txCurrency,
           accountId, categoryId, userId,
-          date: date ? new Date(date) : new Date(),
+          date: parsedDate ?? new Date(),
           note: note ? String(note).slice(0, 500) : null,
           tags: tags ? String(tags).slice(0, 200) : null,
           // P0.12: snapshot fields
@@ -1994,8 +2016,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convertServer as convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
-import { handleAuthError } from '@/lib/api-errors';
-import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
+import { handleAuthError, ValidationError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, parseString, parseDate, badRequest } from '@/lib/validate';
 
 export async function POST(req: NextRequest) {
   try {
@@ -2028,6 +2050,14 @@ export async function POST(req: NextRequest) {
       if (!noteResult.ok) return badRequest(noteResult.error);
     }
 
+    // P0.16: validate date (was: silently producing Invalid Date → 500)
+    let parsedDate: Date | undefined;
+    if (date !== undefined && date !== null && date !== '') {
+      const r = parseDate(date);
+      if (!r.ok) return badRequest(`Invalid date: ${r.error}`);
+      parsedDate = r.value;
+    }
+
     // Verify both accounts belong to user (findFirst with userId — IDOR defense)
     const [sourceAccount, destAccount] = await Promise.all([
       db.account.findFirst({ where: { id: fromAccountId, userId } }),
@@ -2047,15 +2077,15 @@ export async function POST(req: NextRequest) {
       return badRequest('Currency conversion failed (invalid rate?)');
     }
 
-    // P0.11: optional overdraft check (skip for LOAN accounts — they're meant to go negative)
-    if (sourceAccount.type !== 'LOAN' && sourceAccount.balance < sourceAmount) {
-      return NextResponse.json(
-        { error: `Insufficient balance in source account (have ${sourceAccount.balance}, need ${sourceAmount})` },
-        { status: 400 },
-      );
-    }
+    // P0.16: REMOVED the outside-transaction balance check.
+    // It was a race condition — concurrent transfers could both pass the
+    // check before either deducts → both succeed → balance goes negative.
+    // Now the balance check is INSIDE the $transaction below, using a
+    // conditional UPDATE (WHERE balance >= sourceAmount) and verifying
+    // exactly 1 row affected.
 
-    // ATOMIC: find-or-create transfer category + update balances + create transaction
+    // ATOMIC: find-or-create transfer category + balance-checked deduction
+    // + credit destination + create transaction
     // P0.11: moved category lookup inside $transaction to close the race
     // (two concurrent transfers could both pass findFirst → both create → duplicate cats)
     const transfer = await db.$transaction(async (tx) => {
@@ -2071,10 +2101,32 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      await tx.account.update({
-        where: { id: fromAccountId },
-        data: { balance: { increment: -sourceAmount } },
-      });
+      // P0.16: atomic balance check + deduction.
+      // Skip overdraft check for LOAN accounts (they're allowed to go negative).
+      if (sourceAccount.type !== 'LOAN') {
+        // Conditional UPDATE: only deduct if balance is sufficient.
+        // If exactly 1 row affected → success. If 0 → insufficient (either
+        // originally OR because a concurrent transfer drained it between
+        // our read and this conditional update).
+        const result = await tx.account.updateMany({
+          where: { id: fromAccountId, userId, balance: { gte: sourceAmount } },
+          data: { balance: { decrement: sourceAmount } },
+        });
+        if (result.count !== 1) {
+          throw new ValidationError(
+            `Insufficient balance in source account. Needed ${sourceAmount}, ` +
+            `but the balance is now lower (possibly due to a concurrent transfer).`
+          );
+        }
+      } else {
+        // LOAN account — just decrement without the balance check
+        await tx.account.update({
+          where: { id: fromAccountId },
+          data: { balance: { decrement: sourceAmount } },
+        });
+      }
+
+      // Credit the destination (no balance check needed for crediting)
       await tx.account.update({
         where: { id: toAccountId },
         data: { balance: { increment: destAmount } },
@@ -2089,7 +2141,7 @@ export async function POST(req: NextRequest) {
           categoryId: transferCat.id,
           toAccountId,
           userId,
-          date: date ? new Date(date) : new Date(),
+          date: parsedDate ?? new Date(),
           note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
           // P0.12: snapshot fields for idempotent reversal
           sourceAmount,

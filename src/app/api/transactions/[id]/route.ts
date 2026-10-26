@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convertServer as convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
-import { handleAuthError } from '@/lib/api-errors';
+import { handleAuthError, ValidationError } from '@/lib/api-errors';
 import { parseMoney, isCurrency, badRequest } from '@/lib/validate';
 
 // P0.12 fixes:
@@ -177,14 +177,13 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
   try {
     const userId = await requireAuthAsync(req);
     const { id } = await params;
-    // P0.15: ?force=true skips the snapshot check + balance reversal.
-    // Use case: user has manually adjusted the account balance (via PUT
-    // /api/accounts/[id]) to undo the transaction's effect, and now just
-    // wants to remove the transaction record without further balance changes.
-    // This is the ONLY safe path for legacy multi-currency transactions
-    // with null snapshots.
+    // P0.15/P0.16: ?force=true skips the snapshot check + balance reversal.
+    // P0.16 fix: force is now SCOPED — only allowed when the transaction
+    // has a missing snapshot that would prevent safe reversal (the legacy
+    // multi-currency case). For normal transactions WITH snapshots, force
+    // is REJECTED — those must go through the proper reversal path.
     const url = new URL(req.url);
-    const force = url.searchParams.get('force') === 'true';
+    const forceRequested = url.searchParams.get('force') === 'true';
 
     // Include account + toAccount so we can check currency mismatch
     const existing = await db.transaction.findFirst({
@@ -193,11 +192,37 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
     });
     if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
+    // Determine if this transaction needs the force path (legacy multi-currency without snapshot)
+    const needsForceForLegacy = (
+      (existing.sourceAmount === null || existing.sourceAmount === undefined) &&
+      existing.account &&
+      existing.currency !== existing.account.currency
+    ) || (
+      existing.toAccountId &&
+      (existing.destAmount === null || existing.destAmount === undefined) &&
+      existing.toAccount &&
+      existing.currency !== existing.toAccount.currency
+    );
+
+    // P0.16: if user requests force but the transaction doesn't need it,
+    // REJECT — force is only for the legacy multi-currency recovery path.
+    if (forceRequested && !needsForceForLegacy) {
+      return NextResponse.json(
+        {
+          error: `?force=true is only allowed for legacy multi-currency transactions ` +
+            `with missing snapshot fields. This transaction (id=${id}) has valid ` +
+            `snapshots and must be deleted through the normal reversal path ` +
+            `(without ?force=true).`,
+        },
+        { status: 400 },
+      );
+    }
+
     // P0.14/P0.15: REJECT deletion of legacy multi-currency transactions
     // without snapshot — UNLESS ?force=true is set (user has manually
     // reconciled the balance).
     if (
-      !force &&
+      !forceRequested &&
       (existing.sourceAmount === null || existing.sourceAmount === undefined) &&
       existing.account &&
       existing.currency !== existing.account.currency
@@ -216,7 +241,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
     }
     // Also check transfer destination
     if (
-      !force &&
+      !forceRequested &&
       existing.toAccountId &&
       (existing.destAmount === null || existing.destAmount === undefined) &&
       existing.toAccount &&
@@ -233,9 +258,9 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
       );
     }
 
-    // If force=true, skip ALL balance reversal — just delete the record.
-    // This is the explicit "user has manually reconciled" path.
-    if (force) {
+    // If force=true (and we've verified above that the transaction needs it),
+    // skip ALL balance reversal — just delete the record.
+    if (forceRequested) {
       await db.transaction.delete({ where: { id } });
       return NextResponse.json({
         success: true,
@@ -246,34 +271,43 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
 
     if (existing.type === 'TRANSFER' as any && existing.toAccountId) {
       // ATOMIC: reverse both accounts using snapshot (or same-currency fallback)
+      // P0.16: if source or dest account is missing, THROW inside the
+      // transaction — don't silently delete the transaction record.
       await db.$transaction(async (tx) => {
         const [src, dst] = await Promise.all([
           tx.account.findFirst({ where: { id: existing.accountId, userId } }),
           tx.account.findFirst({ where: { id: existing.toAccountId!, userId } }),
         ]);
+        // P0.16: missing account → throw, don't silently delete
+        if (!src) {
+          throw new ValidationError(`Cannot delete: source account ${existing.accountId} not found. ` +
+            `The transaction record will NOT be deleted — please reconcile manually.`);
+        }
+        if (!dst) {
+          throw new ValidationError(`Cannot delete: destination account ${existing.toAccountId} not found. ` +
+            `The transaction record will NOT be deleted — please reconcile manually.`);
+        }
         // P0.14: multi-currency null-snapshot case was rejected above (unless ?force=true).
-        // Here we either have a snapshot, OR it's a same-currency txn (snapshot = amount).
         const srcAmount = existing.sourceAmount ?? existing.amount;
         const dstAmount = existing.destAmount ?? existing.amount;
-        if (src) {
-          await tx.account.update({ where: { id: src.id }, data: { balance: { increment: srcAmount } } });
-        }
-        if (dst) {
-          await tx.account.update({ where: { id: dst.id }, data: { balance: { increment: -dstAmount } } });
-        }
+        await tx.account.update({ where: { id: src.id }, data: { balance: { increment: srcAmount } } });
+        await tx.account.update({ where: { id: dst.id }, data: { balance: { increment: -dstAmount } } });
         await tx.transaction.delete({ where: { id } });
       });
       return NextResponse.json({ success: true });
     }
 
     // Normal: ATOMIC reverse (using snapshot, or same-currency fallback) + delete
+    // P0.16: missing account → throw inside $transaction
     await db.$transaction(async (tx) => {
       const acc = await tx.account.findFirst({ where: { id: existing.accountId, userId } });
-      if (acc) {
-        const reverseAmount = existing.sourceAmount ?? existing.amount;
-        const delta = existing.type === 'INCOME' ? -reverseAmount : reverseAmount;
-        await tx.account.update({ where: { id: acc.id }, data: { balance: { increment: delta } } });
+      if (!acc) {
+        throw new ValidationError(`Cannot delete: account ${existing.accountId} not found. ` +
+          `The transaction record will NOT be deleted — please reconcile manually.`);
       }
+      const reverseAmount = existing.sourceAmount ?? existing.amount;
+      const delta = existing.type === 'INCOME' ? -reverseAmount : reverseAmount;
+      await tx.account.update({ where: { id: acc.id }, data: { balance: { increment: delta } } });
       await tx.transaction.delete({ where: { id } });
     });
     return NextResponse.json({ success: true });

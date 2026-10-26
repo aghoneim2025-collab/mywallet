@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { convertServer as convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
-import { handleAuthError } from '@/lib/api-errors';
-import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
+import { handleAuthError, ValidationError } from '@/lib/api-errors';
+import { parseMoney, isCurrency, parseString, parseDate, badRequest } from '@/lib/validate';
 
 export async function POST(req: NextRequest) {
   try {
@@ -36,6 +36,14 @@ export async function POST(req: NextRequest) {
       if (!noteResult.ok) return badRequest(noteResult.error);
     }
 
+    // P0.16: validate date (was: silently producing Invalid Date → 500)
+    let parsedDate: Date | undefined;
+    if (date !== undefined && date !== null && date !== '') {
+      const r = parseDate(date);
+      if (!r.ok) return badRequest(`Invalid date: ${r.error}`);
+      parsedDate = r.value;
+    }
+
     // Verify both accounts belong to user (findFirst with userId — IDOR defense)
     const [sourceAccount, destAccount] = await Promise.all([
       db.account.findFirst({ where: { id: fromAccountId, userId } }),
@@ -55,15 +63,15 @@ export async function POST(req: NextRequest) {
       return badRequest('Currency conversion failed (invalid rate?)');
     }
 
-    // P0.11: optional overdraft check (skip for LOAN accounts — they're meant to go negative)
-    if (sourceAccount.type !== 'LOAN' && sourceAccount.balance < sourceAmount) {
-      return NextResponse.json(
-        { error: `Insufficient balance in source account (have ${sourceAccount.balance}, need ${sourceAmount})` },
-        { status: 400 },
-      );
-    }
+    // P0.16: REMOVED the outside-transaction balance check.
+    // It was a race condition — concurrent transfers could both pass the
+    // check before either deducts → both succeed → balance goes negative.
+    // Now the balance check is INSIDE the $transaction below, using a
+    // conditional UPDATE (WHERE balance >= sourceAmount) and verifying
+    // exactly 1 row affected.
 
-    // ATOMIC: find-or-create transfer category + update balances + create transaction
+    // ATOMIC: find-or-create transfer category + balance-checked deduction
+    // + credit destination + create transaction
     // P0.11: moved category lookup inside $transaction to close the race
     // (two concurrent transfers could both pass findFirst → both create → duplicate cats)
     const transfer = await db.$transaction(async (tx) => {
@@ -79,10 +87,32 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      await tx.account.update({
-        where: { id: fromAccountId },
-        data: { balance: { increment: -sourceAmount } },
-      });
+      // P0.16: atomic balance check + deduction.
+      // Skip overdraft check for LOAN accounts (they're allowed to go negative).
+      if (sourceAccount.type !== 'LOAN') {
+        // Conditional UPDATE: only deduct if balance is sufficient.
+        // If exactly 1 row affected → success. If 0 → insufficient (either
+        // originally OR because a concurrent transfer drained it between
+        // our read and this conditional update).
+        const result = await tx.account.updateMany({
+          where: { id: fromAccountId, userId, balance: { gte: sourceAmount } },
+          data: { balance: { decrement: sourceAmount } },
+        });
+        if (result.count !== 1) {
+          throw new ValidationError(
+            `Insufficient balance in source account. Needed ${sourceAmount}, ` +
+            `but the balance is now lower (possibly due to a concurrent transfer).`
+          );
+        }
+      } else {
+        // LOAN account — just decrement without the balance check
+        await tx.account.update({
+          where: { id: fromAccountId },
+          data: { balance: { decrement: sourceAmount } },
+        });
+      }
+
+      // Credit the destination (no balance check needed for crediting)
       await tx.account.update({
         where: { id: toAccountId },
         data: { balance: { increment: destAmount } },
@@ -97,7 +127,7 @@ export async function POST(req: NextRequest) {
           categoryId: transferCat.id,
           toAccountId,
           userId,
-          date: date ? new Date(date) : new Date(),
+          date: parsedDate ?? new Date(),
           note: note || `تحويل من ${sourceAccount.name} إلى ${destAccount.name}`,
           // P0.12: snapshot fields for idempotent reversal
           sourceAmount,

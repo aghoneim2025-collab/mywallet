@@ -3,7 +3,7 @@ import { db } from '@/lib/db';
 import { convertServer as convert, type Currency } from '@/lib/currency';
 import { requireAuthAsync } from '@/lib/auth';
 import { handleAuthError } from '@/lib/api-errors';
-import { parseMoney, isCurrency, parseString, badRequest } from '@/lib/validate';
+import { parseMoney, isCurrency, parseString, parseDate, badRequest } from '@/lib/validate';
 
 export async function GET(req: NextRequest) {
   try {
@@ -19,11 +19,26 @@ export async function GET(req: NextRequest) {
     if (type) where.type = type;
     if (accountId) where.accountId = accountId;
     if (categoryId) where.categoryId = categoryId;
+    // P0.16: validate date inputs explicitly (was: silently producing Invalid Date → wrong query)
     if (from || to) {
       where.date = {};
-      // P0.11: explicit UTC parsing to avoid tz-shift on date-only strings
-      if (from) where.date.gte = new Date(`${from}T00:00:00.000Z`);
-      if (to) where.date.lte = new Date(`${to}T23:59:59.999Z`);
+      if (from) {
+        const r = parseDate(from);
+        if (!r.ok) return badRequest(`Invalid 'from' date: ${r.error}`);
+        where.date.gte = r.value;
+      }
+      if (to) {
+        const r = parseDate(to);
+        if (!r.ok) return badRequest(`Invalid 'to' date: ${r.error}`);
+        // For 'to' as YYYY-MM-DD, the user typically wants "up to end of that day"
+        // so we extend to 23:59:59.999 UTC. parseDate returns midnight UTC
+        // for YYYY-MM-DD, so add 1 day minus 1ms.
+        let end = r.value;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+          end = new Date(r.value.getTime() + 24 * 60 * 60 * 1000 - 1);
+        }
+        where.date.lte = end;
+      }
     }
     const transactions = await db.transaction.findMany({
       where,
@@ -73,6 +88,13 @@ export async function POST(req: NextRequest) {
       const r = parseString(tags, 'Tags', { required: false, max: 200 });
       if (!r.ok) return badRequest(r.error);
     }
+    // P0.16: validate date (was: silently producing Invalid Date → 500)
+    let parsedDate: Date | undefined;
+    if (date !== undefined && date !== null && date !== '') {
+      const r = parseDate(date);
+      if (!r.ok) return badRequest(`Invalid date: ${r.error}`);
+      parsedDate = r.value;
+    }
 
     // Verify BOTH account AND category ownership (IDOR defense)
     const [account, category] = await Promise.all([
@@ -108,7 +130,7 @@ export async function POST(req: NextRequest) {
         data: {
           type, amount: amt, currency: txCurrency,
           accountId, categoryId, userId,
-          date: date ? new Date(date) : new Date(),
+          date: parsedDate ?? new Date(),
           note: note ? String(note).slice(0, 500) : null,
           tags: tags ? String(tags).slice(0, 200) : null,
           // P0.12: snapshot fields

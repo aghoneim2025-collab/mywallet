@@ -135,3 +135,44 @@ export function tooManyRequests(retryAfterSeconds: number, message?: string) {
     { status: 429, headers: { 'Retry-After': String(retryAfterSeconds) } },
   );
 }
+
+// ===== Date validation =====
+// P0.16: parse and validate date strings. Handles both:
+//   - YYYY-MM-DD (date-only, common in date picker UIs)
+//   - Full ISO 8601 timestamps (e.g., 2024-01-15T10:30:00.000Z)
+// Rejects anything else with a 400 (was: silently producing Invalid Date → 500).
+export function parseDate(input: unknown): { ok: true; value: Date } | { ok: false; error: string } {
+  if (input === null || input === undefined || input === '') {
+    return { ok: false, error: 'Date is required' };
+  }
+  if (input instanceof Date) {
+    if (isNaN(input.getTime())) return { ok: false, error: 'Invalid Date object' };
+    return { ok: true, value: input };
+  }
+  if (typeof input === 'number') {
+    if (!Number.isFinite(input)) return { ok: false, error: 'Invalid date number' };
+    const d = new Date(input);
+    if (isNaN(d.getTime())) return { ok: false, error: 'Invalid date number' };
+    return { ok: true, value: d };
+  }
+  if (typeof input !== 'string') {
+    return { ok: false, error: 'Date must be a string or number' };
+  }
+
+  const dateStr = input.trim();
+  if (!dateStr) return { ok: false, error: 'Date is required' };
+
+  // Pattern 1: YYYY-MM-DD (date-only) → parse as UTC midnight
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    const d = new Date(`${dateStr}T00:00:00.000Z`);
+    if (isNaN(d.getTime())) return { ok: false, error: `Invalid date: ${dateStr}` };
+    return { ok: true, value: d };
+  }
+  // Pattern 2: full ISO 8601 — pass through
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.test(dateStr)) {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return { ok: false, error: `Invalid ISO date: ${dateStr}` };
+    return { ok: true, value: d };
+  }
+  return { ok: false, error: `Unrecognized date format: ${dateStr}. Use YYYY-MM-DD or full ISO 8601.` };
+}
