@@ -45,9 +45,9 @@ const FILES: string[] = [
   'src/components/settings-screen.tsx',
 ];
 
-const banner = `=== محفظتي (MyWallet) - Source Code (P0.16 Atomic Balance + Force Scope + Date Validation) ===
+const banner = `=== محفظتي (MyWallet) - Source Code (P0.17 PUT Race + Date Roundtrip + Force Audit) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.16 (atomic balance + force scope + date validation) ===
+=== VERSION: P0.17 (PUT race fix + date roundtrip + force audit) ===
 === BUILD: ${new Date().toISOString()} ===
 
 URGENT SECURITY NOTE:

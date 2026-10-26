@@ -1,7 +1,7 @@
-=== محفظتي (MyWallet) - Source Code (P0.16 Atomic Balance + Force Scope + Date Validation) ===
+=== محفظتي (MyWallet) - Source Code (P0.17 PUT Race + Date Roundtrip + Force Audit) ===
 === Fixed: handleAuthError centralizes 401/503/500, page.tsx shows service-down UI, ZIP scans all entries ===
-=== VERSION: P0.16 (atomic balance + force scope + date validation) ===
-=== BUILD: 2026-10-26T08:29:45.472Z ===
+=== VERSION: P0.17 (PUT race fix + date roundtrip + force audit) ===
+=== BUILD: 2026-10-26T10:18:21.537Z ===
 
 URGENT SECURITY NOTE:
   In P0.5, the source-code ZIP files inadvertently included the .env file

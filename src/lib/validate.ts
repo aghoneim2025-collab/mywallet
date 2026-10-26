@@ -141,6 +141,10 @@ export function tooManyRequests(retryAfterSeconds: number, message?: string) {
 //   - YYYY-MM-DD (date-only, common in date picker UIs)
 //   - Full ISO 8601 timestamps (e.g., 2024-01-15T10:30:00.000Z)
 // Rejects anything else with a 400 (was: silently producing Invalid Date → 500).
+//
+// P0.17: also verifies that the parsed date's components match the input
+// string. JavaScript's Date constructor normalizes impossible dates
+// (e.g., 2024-02-30 → March 1, 2024). We now reject those.
 export function parseDate(input: unknown): { ok: true; value: Date } | { ok: false; error: string } {
   if (input === null || input === undefined || input === '') {
     return { ok: false, error: 'Date is required' };
@@ -166,12 +170,24 @@ export function parseDate(input: unknown): { ok: true; value: Date } | { ok: fal
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     const d = new Date(`${dateStr}T00:00:00.000Z`);
     if (isNaN(d.getTime())) return { ok: false, error: `Invalid date: ${dateStr}` };
+    // P0.17: verify roundtrip — JavaScript normalizes impossible dates
+    // (e.g., 2024-02-30 → March 1, 2024). Reject those.
+    const [y, m, day] = dateStr.split('-').map(Number);
+    if (d.getUTCFullYear() !== y || d.getUTCMonth() + 1 !== m || d.getUTCDate() !== day) {
+      return { ok: false, error: `Impossible date: ${dateStr} (normalized to ${d.toISOString().slice(0, 10)})` };
+    }
     return { ok: true, value: d };
   }
-  // Pattern 2: full ISO 8601 — pass through
+  // Pattern 2: full ISO 8601 — pass through + roundtrip check
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.test(dateStr)) {
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return { ok: false, error: `Invalid ISO date: ${dateStr}` };
+    // P0.17: roundtrip check for the date portion
+    const datePart = dateStr.slice(0, 10);  // YYYY-MM-DD
+    const [y, m, day] = datePart.split('-').map(Number);
+    if (d.getUTCFullYear() !== y || d.getUTCMonth() + 1 !== m || d.getUTCDate() !== day) {
+      return { ok: false, error: `Impossible date in ISO: ${dateStr}` };
+    }
     return { ok: true, value: d };
   }
   return { ok: false, error: `Unrecognized date format: ${dateStr}. Use YYYY-MM-DD or full ISO 8601.` };

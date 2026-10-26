@@ -855,3 +855,46 @@ Stage Summary:
 - Date validation handles both YYYY-MM-DD and full ISO 8601.
 - DELETE throws inside $transaction when account is missing (no silent delete).
 - ValidationError class surfaces business-logic errors as 400 (not 500).
+
+---
+Task ID: P0.17-put-race-date-roundtrip
+Agent: main
+Task: Address ChatGPT's P0.16 review critical blockers:
+  (1) PUT race condition: read existing OUTSIDE $transaction → concurrent PUTs could both reverse old balance
+  (2) force=true lacks audit log (silent delete)
+  (3) parseDate accepts impossible dates (2024-02-30 → March 1)
+  (4) PUT message for transfer says "delete and recreate" but DELETE may need force path
+  (5) Float precision (acknowledged)
+  (6) Rate limiter per-process (acknowledged)
+
+Work Log:
+- src/lib/validate.ts parseDate():
+  - Added roundtrip verification: after parsing, check that the Date object's
+    year/month/day components match the input string's components.
+  - Catches impossible dates like 2024-02-30 (which JavaScript normalizes
+    to March 1, 2024) and 2024-13-01 (invalid month).
+  - Verified: 2024-02-30 → HTTP 400 "Impossible date: 2024-02-30 (normalized to 2024-03-01)"
+  - Verified: 2024-02-28 → HTTP 200 (valid)
+  - Verified: 2024-13-01 → HTTP 400 "Invalid date"
+- src/app/api/transactions/[id]/route.ts PUT:
+  - ENTIRE PUT is now inside a single $transaction.
+  - Read existing INSIDE the transaction (was: outside → race condition).
+  - Added optimistic locking: capture existing.updatedAt before writes,
+    use `updateMany WHERE id AND updatedAt = ?`, verify count === 1.
+  - If 0 rows updated → concurrent modification → throw → $transaction rolls back.
+  - Updated TRANSFER rejection message: now explicitly tells the user to
+    use DELETE (with ?force=true path for legacy multi-currency transfers)
+    instead of generic "delete and recreate".
+
+Verified:
+  - Build PASSES (ignoreBuildErrors: false)
+  - parseDate: 2024-02-30 → HTTP 400 (impossible) ✅
+  - parseDate: 2024-02-28 → HTTP 200 (valid) ✅
+  - parseDate: 2024-13-01 → HTTP 400 (impossible) ✅
+  - PUT inside $transaction with optimistic locking (code-level fix)
+
+Remaining acknowledged limitations (need bigger architectural work):
+  - force=true lacks audit log (would need AuditLog model)
+  - Float precision (would need BigInt/Decimal migration)
+  - Rate limiter per-process (would need Redis)
+  - Exchange rate divergence (would need DB-backed rate store)
