@@ -62,3 +62,21 @@ server.log
 /public/source-code*.zip
 /public/source-code*.txt
 /public/source-code.txt
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/captures/
+android/local.properties
+
+# Environment-specific
+.zscripts/
+Caddyfile
+*.pid
+
+# Prisma generated client (regenerated on install)
+node_modules/.prisma/
+
+# Test database
+prisma/db/
